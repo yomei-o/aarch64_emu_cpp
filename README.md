@@ -166,9 +166,16 @@ does yet. `resume.md` has the details.
 ## Building
 
 ```sh
-sh build.sh                # g++ or clang++
-cmake -B build && cmake --build build     # or MSVC
+sh build.sh                              # g++ (or CXX=clang++)
+CXX=cl sh build.sh                       # MSVC, from a developer prompt
+cmake -B build && cmake --build build     # either, through CMake
 ```
+
+The MSVC build is real rather than aspirational now: the two GCC/Clang extensions the
+interpreter used — `__builtin_bswap32/64` and `__int128`, for `REV` and `UMULH`/`SMULH` —
+are written out longhand in `cpu.cpp`. cl.exe and clang produce byte-identical output over
+the 78,474-instruction macOS guest run, and the replacements were checked against
+`__int128` over two million random and corner-case pairs.
 
 Tests need `clang` with the AArch64 target and `lld` — no cross-binutils, no
 sysroot, because the test programs are freestanding:

@@ -17,6 +17,36 @@ void Cpu::fail(const std::string& why, uint32_t insn) const {
 
 namespace {
 
+// Byte reversal and the high half of a 64x64 product, written out rather than taken from
+// the compiler. `__builtin_bswap*` and `__int128` are GCC/Clang extensions, and MSVC has
+// neither — it was the only thing standing between this and building with cl.exe, which
+// CMakeLists.txt already claimed to support. Both compile to the same one or two
+// instructions everywhere; REV and UMULH are not where an interpreter spends its time.
+inline uint32_t bswap32(uint32_t v) {
+    return (v >> 24) | ((v >> 8) & 0x0000FF00u) | ((v << 8) & 0x00FF0000u) | (v << 24);
+}
+inline uint64_t bswap64(uint64_t v) {
+    return (static_cast<uint64_t>(bswap32(static_cast<uint32_t>(v))) << 32)
+         | bswap32(static_cast<uint32_t>(v >> 32));
+}
+// Schoolbook 32x32 partial products. `mid` carries the low half's overflow into the high.
+inline uint64_t umulh(uint64_t a, uint64_t b) {
+    const uint64_t al = a & 0xFFFFFFFFu, ah = a >> 32;
+    const uint64_t bl = b & 0xFFFFFFFFu, bh = b >> 32;
+    const uint64_t ll = al * bl, lh = al * bh, hl = ah * bl, hh = ah * bh;
+    const uint64_t mid = (ll >> 32) + (lh & 0xFFFFFFFFu) + (hl & 0xFFFFFFFFu);
+    return hh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+}
+// Signed from unsigned: a signed operand is its unsigned value minus 2^64, so each
+// negative one subtracts the *other* operand from the high half. The 2^128 term when both
+// are negative falls off the top.
+inline uint64_t smulh(int64_t a, int64_t b) {
+    uint64_t h = umulh(static_cast<uint64_t>(a), static_cast<uint64_t>(b));
+    if (a < 0) h -= static_cast<uint64_t>(b);
+    if (b < 0) h -= static_cast<uint64_t>(a);
+    return h;
+}
+
 struct AddOut { uint64_t v; bool carry, ovf; };
 
 // The architecture's AddWithCarry, which is where NZCV comes from. Subtraction is
@@ -1092,11 +1122,11 @@ void Cpu::exec_dp_register(uint32_t insn) {
                     uint64_t r = 0;
                     for (unsigned i = 0; i < width; i += 32) {
                         const uint32_t w = static_cast<uint32_t>(a >> i);
-                        r |= static_cast<uint64_t>(__builtin_bswap32(w)) << i;
+                        r |= static_cast<uint64_t>(bswap32(w)) << i;
                     }
                     setreg(rd, is64, r); return;
                 }
-                case 0x03: setx(rd, __builtin_bswap64(a)); return;    // REV (64-bit)
+                case 0x03: setx(rd, bswap64(a)); return;          // REV (64-bit)
                 case 0x04: {                                          // CLZ
                     unsigned k = 0;
                     while (k < width && !((a >> (width - 1 - k)) & 1)) ++k;
@@ -1134,14 +1164,11 @@ void Cpu::exec_dp_register(uint32_t insn) {
             return;
         }
         if (op31 == 2) {                                              // SMULH
-            const __int128 p = static_cast<__int128>(static_cast<int64_t>(xr(rn))) *
-                               static_cast<int64_t>(xr(rm));
-            setx(rd, static_cast<uint64_t>(static_cast<unsigned __int128>(p) >> 64));
+            setx(rd, smulh(static_cast<int64_t>(xr(rn)), static_cast<int64_t>(xr(rm))));
             return;
         }
         if (op31 == 6) {                                              // UMULH
-            const unsigned __int128 p = static_cast<unsigned __int128>(xr(rn)) * xr(rm);
-            setx(rd, static_cast<uint64_t>(p >> 64));
+            setx(rd, umulh(xr(rn), xr(rm)));
             return;
         }
         fail("unimplemented 3-source data processing", insn);

@@ -241,6 +241,7 @@ int main(int argc, char** argv) {
     if (darwin) {
         sys.setup_commpage();
         sys.setup_dyld_apis(img.dyld_gapis);
+        sys.set_objc_images(img.image_paths, img.image_headers);
     }
 
     int rc = 0;
@@ -280,6 +281,7 @@ int main(int argc, char** argv) {
                 cpu.setx(30, kInitReturn);
                 while (!cpu.halted && cpu.pc != kInitReturn) cpu.step();
                 if (cpu.halted) break;
+
             }
             cpu.sp = sp0;
             cpu.pc = start_pc ? start_pc : img.entry;

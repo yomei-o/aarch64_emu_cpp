@@ -575,10 +575,21 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
     // images were discovered: libsystem_malloc has to be usable before anything that
     // allocates runs, and it is reached last by breadth-first discovery.
     {
-        std::vector<bool> done(images.size(), false);
-        // Emit one image's own initializers, in either encoding.
+        std::vector<bool> done(images.size(), false), emitted(images.size(), false);
+        // Emit one image's own initializers, in either encoding. Guarded separately from
+        // `done`, because libSystem's are emitted ahead of the walk and the walk must
+        // still descend *through* it to reach everything else.
         auto emit = [&](size_t idx) {
+            if (emitted[idx]) return;
+            emitted[idx] = true;
             const MachoImage& im = images[idx];
+            // The image list libobjc's `map_images` receives is built here too, in the
+            // same order, because the order is load-bearing: libobjc registers its own
+            // classes while processing its own image, and an image processed earlier that
+            // references NSObject finds it unknown and aborts *inside* map_images.
+            // Dependency order puts libobjc before libdispatch, which is what dyld does.
+            out->image_paths.push_back(im.guest_path);
+            out->image_headers.push_back(im.load_addr());
             for (const MachoImage::InitSec& sec : im.inits) {
                 const uint64_t at = im.slide + sec.addr;
                 if (sec.offsets) {
@@ -613,11 +624,13 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
         //
         //     Assertion failed: (p), function atexit_register, file atexit.c, line 115
         //
-        // dyld special-cases libSystem for exactly this reason. Marking it done keeps the
-        // walk from emitting it twice while still visiting everything it needs.
+        // dyld special-cases libSystem for exactly this reason. Marking it *emitted*
+        // rather than *done* is the difference between "do not run these twice" and "do
+        // not look past this library" -- the second stops the walk at libSystem and
+        // nothing else's initializers ever run, which shows up as `[init] 1/1`.
         {
             auto it = by_name.find("/usr/lib/libSystem.B.dylib");
-            if (it != by_name.end()) { emit(it->second); done[it->second] = true; }
+            if (it != by_name.end()) emit(it->second);
         }
         visit(0);
     }

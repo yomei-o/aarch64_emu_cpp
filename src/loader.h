@@ -23,6 +23,11 @@ struct LoadedImage {
     // libdyld is among the images. Real dyld constructs that object; having replaced
     // dyld, the host has to stand in for it.
     uint64_t dyld_gapis = 0;
+    // Every loaded image, in load order: the path the guest should see and where its
+    // mach_header landed. libobjc's `map_images` wants exactly these two arrays, and
+    // nothing else in the emulator has the list.
+    std::vector<std::string> image_paths;
+    std::vector<uint64_t> image_headers;
 };
 
 // `base` is where to place an ET_DYN (PIE or shared object) image; ignored for

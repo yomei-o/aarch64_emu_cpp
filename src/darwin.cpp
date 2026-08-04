@@ -174,12 +174,93 @@ void Syscalls::setup_dyld_apis(uint64_t gapis_addr) {
     mem_.write<uint64_t>(gapis_addr, object);
 }
 
+// Call a guest function from the host, from inside a trap handler, and come back.
+//
+// Needed because some of what dyld does is *re-entrant*: libobjc registers its callbacks
+// and dyld calls one of them before the registration returns. Deferring the call until
+// the initializer finishes does not work, because the initializer depends on it having
+// happened.
+//
+// The whole context is saved and restored, so the interrupted instruction can finish
+// afterwards as if nothing happened -- the PC has already advanced past the SVC by the
+// time a handler runs, and restoring it puts that back. The guest's own stack is used,
+// which is right: the frame the call lands on top of is the one dyld would have used.
+void Syscalls::call_guest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2) {
+    constexpr uint64_t kReturnMagic = 0x0000'0000'DEAD'2000ull;
+    const uint64_t insns0 = cpu_.insns;
+    const Cpu::Context saved = cpu_.save_context();
+    cpu_.pc = fn;
+    cpu_.setx(0, a0);
+    cpu_.setx(1, a1);
+    cpu_.setx(2, a2);
+    cpu_.setx(30, kReturnMagic);
+    while (!cpu_.halted && cpu_.pc != kReturnMagic) cpu_.step();
+    const bool died = cpu_.halted;
+    if (trace)
+        std::fprintf(stderr, "[call] %012llX ran %llu instruction(s)%s\n",
+                     static_cast<unsigned long long>(fn),
+                     static_cast<unsigned long long>(cpu_.insns - insns0),
+                     died ? " and did not return" : "");
+    cpu_.load_context(saved);
+    cpu_.halted = died;
+}
+
 // The handler for those stubs. `w16` holds the vtable slot index.
 int64_t Syscalls::dyld_api_stub(uint32_t slot) {
     switch (slot) {
         // _dyld_get_active_platform. PLATFORM_MACOS is 1; returning 0 would be
         // PLATFORM_UNKNOWN, and libSystem branches on it.
         case 66: return 1;
+        // _dyld_objc_register_callbacks. libobjc hands dyld the functions it wants called
+        // when images are mapped -- `map_images` is what registers every class in every
+        // loaded image, so without it the first `objc_msgSend` finds an unknown class:
+        //
+        //     objc[1000]: Attempt to use unknown class 0x1ee40b2e0.
+        //
+        // The struct's shape has changed across releases (there are v1, v2 and v3
+        // layouts), so it is dumped rather than assumed. x1 still holds the pointer: the
+        // stub is three instructions and touches nothing but w16.
+        case 107: {
+            const uint64_t p = cpu_.xr(1);
+            objc_callbacks_ = p;
+            // The struct is { version, map_images, load_images, unmap_image,
+            // patch_root_of_class } -- version 4 on Sequoia. `map_images` takes
+            // (count, paths[], mach_headers[]), which its own prologue confirms by
+            // saving x0, x1 and x2.
+            const uint64_t map_images = mem_.read<uint64_t>(p + 8);
+            if (!map_images || objc_image_paths_.empty()) return 0;
+
+            // Called *here*, inside the registration, because that is where dyld calls
+            // it -- and libobjc depends on that: `_objc_init` goes on to use classes
+            // before it returns, so deferring the call until the initializer finishes
+            // means the initializer never finishes.
+            //
+            //     objc[1000]: Attempt to use unknown class 0x1ee40b2e0.
+            const size_t n = objc_image_paths_.size();
+            const uint64_t paths = kObjcArena, mhdrs = kObjcArena + n * 8;
+            uint64_t strp = mhdrs + n * 8;
+            for (size_t j = 0; j < n; ++j) {
+                const std::string& s = objc_image_paths_[j];
+                mem_.write_bytes(strp, s.c_str(), s.size() + 1);
+                mem_.write<uint64_t>(paths + j * 8, strp);
+                mem_.write<uint64_t>(mhdrs + j * 8, objc_image_headers_[j]);
+                strp += s.size() + 1;
+            }
+            if (trace)
+                std::fprintf(stderr, "[objc] map_images(%zu) at %012llX\n", n,
+                             static_cast<unsigned long long>(map_images));
+            call_guest(map_images, n, paths, mhdrs);
+
+            // Then the `init` callback, once per image, which is the rest of what dyld
+            // does at registration: it runs each image's `+load` methods and finishes
+            // whatever `map_images` deferred. Same order, for the same reason.
+            const uint64_t load_images = mem_.read<uint64_t>(p + 16);
+            if (load_images && !cpu_.halted)
+                for (size_t j = 0; j < n && !cpu_.halted; ++j)
+                    call_guest(load_images, mem_.read<uint64_t>(paths + j * 8),
+                               objc_image_headers_[j], 0);
+            return 0;
+        }
         default:
             // The return address, because the stub is three instructions and says nothing
             // about which API it stands for. x30 names the caller, and the caller's symbol

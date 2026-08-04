@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 #include "cpu.h"
 #include "memory.h"
@@ -37,6 +38,15 @@ public:
     // `_dyld_get_active_platform` and friends through a global vtable that only real
     // dyld fills in, so having replaced dyld this has to fill it in too.
     void setup_dyld_apis(uint64_t gapis_addr);
+    // Non-zero once libobjc has handed over its callbacks. The host then has to call
+    // `map_images` the way dyld does, or no class is ever registered.
+    uint64_t objc_callbacks() const { return objc_callbacks_; }
+    // The loaded-image list, which libobjc's `map_images` needs and which only the
+    // loader has. Handed over before the guest starts.
+    void set_objc_images(std::vector<std::string> paths, std::vector<uint64_t> headers) {
+        objc_image_paths_ = std::move(paths);
+        objc_image_headers_ = std::move(headers);
+    }
     // The address a handler returns to when the guest supplied no restorer.
     static constexpr uint64_t kSigreturnMagic = 0x0000'0000'DEAD'0000ull;
 
@@ -49,6 +59,7 @@ private:
     // Mach IPC, in darwin.cpp: enough of mach_msg2_trap and MIG to answer the kernel
     // RPCs a libSystem startup makes.
     int64_t dyld_api_stub(uint32_t slot);
+    void call_guest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2);
     int64_t mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
                       uint64_t remote_local, uint64_t voucher_id,
                       uint64_t desc_rcvname, uint64_t rcv_size);
@@ -112,6 +123,12 @@ private:
     // guest read three instructions as a function pointer and branched to them.
     static constexpr uint32_t kDyldSlots = 1024;
     uint64_t dyld_vtable_ = 0;
+    // Where libobjc left its callbacks, so the host can call them the way dyld would.
+    uint64_t objc_callbacks_ = 0;
+    std::vector<std::string> objc_image_paths_;
+    std::vector<uint64_t> objc_image_headers_;
+    // Where map_images's two arrays and their path strings go.
+    static constexpr uint64_t kObjcArena = 0x0000'0003'0100'0000ull;
 };
 
 }  // namespace a64

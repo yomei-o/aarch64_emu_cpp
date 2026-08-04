@@ -52,21 +52,32 @@ What works:
 
 ## ⏭ Next, in order
 
-1. **A real macOS binary — 35,424 instructions in, inside the ObjC runtime.** This is
+1. **A real macOS binary — 49,539 instructions in, inside the ObjC runtime.** This is
    the live front, and the guest tree for it is committed:
 
        sh prebuilt/unpack.sh                # 48 files, 85 MB unpacked, 21 MB packed
        ./aarch64emu --root guests/macos guests/macos/hello
 
-   The guest gets through malloc, stdio and libobjc's own startup, and stops with
-   libobjc's own diagnostic:
+   The guest gets through malloc, stdio, and the whole of libobjc's image registration
+   — `map_images` runs for 10,297 instructions over 46 images, `load_images` after it —
+   and then stops with libobjc's own diagnostic:
 
        objc[1000]: Attempt to use unknown class 0x1ee40b2e0.
 
-   which is libdispatch's `_os_object_init` asking `objc_lookUpClass` for `OS_object`.
-   The ObjC runtime normally gets the shared cache's pre-built class tables handed to
-   it by dyld (`_dyld_objc_notify_register`, and the objc optimisation header in the
-   cache); nothing does that here. That is the next frontier and it is a real one.
+   which is `OBJC_METACLASS_$_NSObject`, in libobjc's own `__DATA_DIRTY`, failing
+   `checkIsKnownClass` *after* both callbacks have run. The likely reason is that these
+   are cache libraries and libobjc knows it: for a preoptimized image it trusts the
+   shared cache's own class tables and the `objc::dataSegmentsRanges` fast path instead
+   of adding to `allocatedClasses`, and nothing here supplies the cache's objc
+   optimisation header. Worth checking whether one of the dyld API slots libobjc calls
+   is "is this address in the shared cache" — answering *no* would push it onto the
+   ordinary path, where it registers classes itself. Slots 1, 8, 44, 51, 61, 69, 71 and
+   84 are called and answered with zero; two of them come from `__objc_init` itself
+   (`+456` and `+548`), and those two are the ones to identify first.
+
+   How to get there: `--trace-sys` prints `[init]`, `[objc]` and `[call]` lines;
+   `tools/whichlib.py` turns any address from a trace into a library and the nearest
+   symbol, and `tools/dis_macho.py` disassembles at a cache address.
 
    Everything before that works: 45 libraries map and link, the GOT slots the cache
    leaves null get bound, initializers run in dyld's order, `os_alloc_once` allocates
@@ -175,6 +186,20 @@ instructions past it, and each looked like a different problem than it was.
   libSystem's initializer has not yet brought up. The guest says so itself —
   `Assertion failed: (p), function atexit_register` — which only became visible once
   stdio worked well enough to print it.
+- **Some of what dyld does is re-entrant.** libobjc registers its callbacks from inside
+  its own initializer and dyld calls `map_images` *before the registration returns* --
+  `_objc_init` goes on to use classes, so deferring the call until the initializer
+  finishes means the initializer never finishes. `Syscalls::call_guest` saves the whole
+  context, runs the guest function, and restores it, so the interrupted instruction can
+  complete afterwards.
+- **The image list `map_images` receives has to be in dependency order.** libobjc
+  registers each image's classes as it walks the list, so an image processed before
+  libobjc that references NSObject finds it unknown and aborts *inside* `map_images`.
+  Breadth-first from the executable puts libobjc late; the post-order used for
+  initializers puts it early, which is what dyld passes.
+- **"Emitted" and "visited" are different marks.** Emitting libSystem's initializers
+  ahead of the walk and then marking it *done* stops the walk at libSystem, so nothing
+  else's initializers ever run -- visible only as `[init] 1/1` in the trace.
 - **The syscall number is a 32-bit value.** Reading all of x16 turns `mov w16, #-3`,
   which selects Mach trap 3, into 4294967293 — a positive number that goes down the BSD
   path and reports an absurd syscall.

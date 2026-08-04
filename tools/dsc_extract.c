@@ -1096,9 +1096,31 @@ static int page_is_referenced(uint64_t page) {
 // they read as `_vm_page_size` and `_mach_task_self_`, the walk is right; if they are
 // garbage, it is wrong and obviously so.
 struct patch_target { uint64_t addr; uint64_t value; };
-#define MAX_PATCHES 65536
 static struct patch_target* patches;
-static size_t n_patches;
+static size_t n_patches, cap_patches;
+
+static void patch_add(uint64_t addr, uint64_t value) {
+    if (n_patches == cap_patches) {
+        cap_patches = cap_patches ? cap_patches * 2 : 8192;
+        patches = realloc(patches, cap_patches * sizeof *patches);
+        if (!patches) die("out of memory");
+    }
+    patches[n_patches].addr = addr;
+    patches[n_patches].value = value;
+    n_patches++;
+}
+
+// Is this cache image one of the ones being extracted? The patch table on macOS 15
+// lists 3.65 *million* locations across 3257 images, and all but a handful belong to
+// libraries nobody asked for. A fixed cap on the collection stopped after the first
+// 65536 -- every one of them in libobjc, never reaching libsystem_platform, which is
+// the whole reason the table was being read.
+static int image_is_wanted(uint32_t index) {
+    const char* p = image_path((int)index);
+    if (!p) return 0;
+    for (int i = 0; i < nwant; ++i) if (strcmp(want[i], p) == 0) return 1;
+    return 0;
+}
 
 static void read_patch_table(void) {
     uint64_t info_addr = 0, info_size = 0;
@@ -1140,8 +1162,6 @@ static void read_patch_table(void) {
         return;
     }
 
-    patches = malloc(MAX_PATCHES * sizeof *patches);
-    if (!patches) die("out of memory");
     int shown = 0;
     for (uint64_t im = 0; im < images_n && im < images_count; ++im) {
         uint32_t clients_start, clients_count, exports_start, exports_count;
@@ -1160,6 +1180,9 @@ static void read_patch_table(void) {
             memcpy(&ce_start, clients + ci * 12 + 4, 4);
             memcpy(&ce_count, clients + ci * 12 + 8, 4);
             if (client_index >= images_count) continue;
+            // Only the libraries being written out. Everything else is somebody
+            // else's GOT.
+            if (!image_is_wanted(client_index)) continue;
             const uint64_t client_base = image_addr((int)client_index);
 
             for (uint32_t e = 0; e < ce_count; ++e) {
@@ -1182,14 +1205,12 @@ static void read_patch_table(void) {
                 }
                 for (uint32_t l = 0; l < loc_count; ++l) {
                     const uint64_t li = loc_start + l;
-                    if (li >= locs_n || n_patches >= MAX_PATCHES) break;
+                    if (li >= locs_n) break;
                     uint32_t use_off, bits;
                     memcpy(&use_off, locs + li * 8 + 0, 4);
                     memcpy(&bits, locs + li * 8 + 4, 4);
                     const uint32_t addend = (bits >> 7) & 0x1F;
-                    patches[n_patches].addr = client_base + use_off;
-                    patches[n_patches].value = impl_base + impl_off + addend;
-                    n_patches++;
+                    patch_add(client_base + use_off, impl_base + impl_off + addend);
                 }
             }
         }
@@ -1333,10 +1354,6 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // The patch table before anything is written: a library's own segments can be
-    // patch targets, so the fills have to be known while they are being copied.
-    read_patch_table();
-
     if (i < argc) for (; i < argc; ++i) want_add(argv[i]);
     else want_add("/usr/lib/libSystem.B.dylib");
 
@@ -1356,6 +1373,11 @@ int main(int argc, char** argv) {
     }
 
     if (!outdir) { for (int k = 0; k < nwant; ++k) printf("  %s\n", want[k]); return 0; }
+
+    // After the closure, because the table is filtered to the libraries being written
+    // out -- and before anything is copied, because a library's own segments can be
+    // patch targets too.
+    read_patch_table();
 
     mkdir(outdir, 0755);
     uint64_t total = 0;

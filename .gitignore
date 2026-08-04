@@ -9,7 +9,16 @@ tests/*.native
 tests/*.expected
 tests/*.actual
 tests/*.err
-guests/
+# The guest tree is Apple's libraries and downloaded binaries -- none of it can be
+# committed; `prebuilt/unpack.sh` and the curl lines in resume.md put it there.
+# The two *sources* that live in it are ours and must survive a fresh clone, so
+# they are re-included -- which needs `guests/*` rather than `guests/`, because git
+# cannot re-include a file inside an excluded directory.
+guests/*
+!guests/macos/
+guests/macos/*
+!guests/macos/build.sh
+!guests/macos/threads.c
 tests/*.macho
 tests/*.cerr
 tests/dylib/*.dylib

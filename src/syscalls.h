@@ -25,6 +25,10 @@ public:
     // What /proc/self/exe should report; a libc reads it to find its own prefix.
     std::string exe_path;
     bool trace = false;
+    // Answer dyld API slot 111 (`_dyld_lookup_section_info`) instead of returning nothing.
+    // Off by default, and the reason is in darwin.cpp: the answers are right, and they take
+    // libobjc further than the rest of the emulator can currently follow. --dyld-sections.
+    bool dyld_section_info = false;
     std::function<void(int fd, const char* data, uint64_t len)> output;
     std::function<int64_t(char* dst, uint64_t len)> input;
     std::function<int64_t(int fd, void* dst, uint64_t len, uint64_t off)> file_read;

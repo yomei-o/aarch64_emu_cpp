@@ -34,6 +34,7 @@ int main(int argc, char** argv) {
     using namespace a64;
 
     bool trace_sys = false, stats = false, macho_info = false, strict = false;
+    bool dyld_sections = false;
     uint64_t max_insns = 0, sample = 0, watch_lo = 0, watch_hi = 0, pc_watch = 0;
     // The guest sees this directory as "/". Defaulting to the host cwd means a
     // relative path from the guest lands where a user would expect it to.
@@ -65,6 +66,10 @@ int main(int argc, char** argv) {
         // and `--sample` cannot. Use `tools/whichlib.py` backwards -- `--macho-info` prints
         // a symbol's offset from its header, and the header addresses are in `--trace-sys`.
         else if (a == "--pcwatch" && i + 1 < argc) pc_watch = std::strtoull(argv[++i], nullptr, 16);
+        // --dyld-sections — answer dyld's section-location API instead of making libobjc
+        // walk load commands. See the note in darwin.cpp's slot 111: the answers are right,
+        // and they take the guest somewhere it cannot yet finish, so this is off by default.
+        else if (a == "--dyld-sections") dyld_sections = true;
         else if (a == "--max" && i + 1 < argc) max_insns = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--sample" && i + 1 < argc) sample = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--root" && i + 1 < argc) root = argv[++i];
@@ -125,6 +130,7 @@ int main(int argc, char** argv) {
     cpu.sample_every = sample;
     Syscalls sys(cpu, mem);
     sys.trace = trace_sys;
+    sys.dyld_section_info = dyld_sections;
     if (watch_hi) {
         mem.watch_lo = watch_lo;
         mem.watch_hi = watch_hi;

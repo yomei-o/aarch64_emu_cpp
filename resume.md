@@ -62,6 +62,7 @@ The tools built for this, all of which take addresses straight out of a trace:
     --sample N               print the PC every N instructions
     --watch LO:HI            log every guest access in a range, with the PC
     --pcwatch ADDR           at a guest function's entry, x0..x5 and any string they point at
+    --dyld-sections          answer dyld's section-location API (see item 1; off by default)
     --macho-info FILE [sym…] what a Mach-O contains; look symbols up in its export trie
     tools/whichlib.py        address -> library and nearest symbol
     tools/dis_macho.py       disassemble at a virtual address in a cache-extracted library
@@ -200,8 +201,11 @@ What works:
    - **The dyld API slots still answered with zero** are down to two on this guest, and
      both are deliberate:
 
-     **`_dyld_lookup_section_info` (111), 186 calls — half measured, and the half that is
-     measured is the half that looked impossible.** Pick this up here.
+     ✅ **`_dyld_lookup_section_info` (111), 186 calls — implemented, behind
+     `--dyld-sections`, and this is where to pick the project up.** The frontier moved: with
+     it on the guest gets 86,000 instructions past where the whole run used to end, into
+     libobjc using the cache's preoptimized class layout for real, and stops at a null
+     function pointer nobody has looked at yet.
 
      The blocker was the `_dyld_section_location_kind` enum: kind is a number, a wrong
      mapping returns some *other* section's contents, and nothing about that looks like a
@@ -231,19 +235,39 @@ What works:
      only the measured kinds and returning false for the rest gives up nothing — and
      returning false stays correct, because libobjc then walks the load commands itself.
 
-     **What is still unknown is the argument layout, and the first reading of it was
-     wrong.** x3 is the kind and that is solid. But x1 is `100000000` on most calls — not a
-     mach_header — and x4/x5 are `3000106F0` and `300000378`, which are inside the *host's
-     own* synthesised vtable and stub area (`300000378` is slot 111's own stub, i.e. leftover
-     from the dispatch, not an argument). So this is not
-     `(mh, handle, kind, uint64_t* off, uint64_t* size)` in x1..x5. Do not implement it on
-     that assumption; measure first. `--pcwatch` (below) is the tool: point it at the
-     caller in libobjc and read the arguments it actually sets up.
+     **The argument layout took two readings.** The first was wrong in the usual way: x4
+     and x5 look exactly like `uint64_t* offset, uint64_t* size`, and they are not
+     out-parameters at all. They hold `stubs + 111*16` and `vtable + 111*8` — this slot's
+     own stub and its own vtable entry, left behind by the caller's dispatch on the way in.
+     Which settles the signature by elimination: the caller clobbered x4 and x5 getting
+     here, so **nothing can be passed in them**, and the only arguments are x1 (the
+     mach_header), x2 (a per-image handle dyld precomputes, often 0) and x3 (the kind). The
+     answer therefore comes back as a **16-byte return in x0:x1** — the section's address
+     and its size — and x0 has to be an *address*, because a zero x0 is what has been making
+     libobjc fall back all along. An offset from the header would make zero mean "the
+     header", and no section is there.
 
-     The rest, once the layout is known: find the section by *name* by walking the
-     mach_header's LC_SEGMENT_64 commands in guest memory, ignoring the segment name (these
-     section names are unique, and it avoids the __DATA/__DATA_CONST/__AUTH_CONST question
-     entirely), and hand back the offset from the header plus the size.
+     **It is implemented, and it is behind `--dyld-sections`, off by default.** Run
+
+         ./aarch64emu --dyld-sections --root guests/macos guests/macos/hello
+
+     and this is where to pick the project up. With it on, libobjc stops walking load
+     commands and starts *using* the shared cache's preoptimized class layout for real: the
+     run gets 86,000 instructions further and then branches through a null function pointer
+     — PC 0 at 285,669 instructions, against 199,279 for the whole run with the fallback.
+     That is new territory rather than a regression in this slot, and both compilers agree
+     on the number to the instruction, which is the usual sign the emulator is being
+     deterministic about it. It is a run that does not finish, so it cannot be the default.
+
+     Two things to know before starting. The section addresses it hands back are checkable
+     and were checked — `--trace-sys` prints every one (`[mac] section info: …`), and they
+     land inside the right images with sizes that are multiples of 8. And turning it on
+     immediately uncovered a *missing instruction*: **PACGA**, the generic
+     pointer-authentication MAC, which libobjc uses on its method caches. That is now
+     implemented (see the note in `cpu.cpp`: it is the one PAC instruction the identity
+     treatment does not fit, because there is no pointer to leave alone — what it needs is a
+     deterministic non-zero mix, since a generic MAC is only ever checked by the code that
+     made it).
 
      It costs 16% of the run, which is the only reason to want it, and item 4 is a better
      lever on the same problem.

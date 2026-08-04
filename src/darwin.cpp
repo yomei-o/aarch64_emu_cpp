@@ -39,6 +39,44 @@ int bsd_errno(int64_t linux_errno) {
 
 constexpr int kBsdENOSYS = 78, kBsdEINVAL = 22, kBsdENOENT = 2;
 
+// Find a section by name in a mach_header that is already in guest memory, by walking its
+// load commands the way the guest itself would. Deliberately not by consulting the host's
+// parsed copy: this answers a question *about the guest's address space*, and the segments
+// there are where they actually landed.
+//
+// By section name only, ignoring the segment. These names are unique within an image, and
+// matching on the segment as well would need the right answer to a question with several
+// plausible ones -- `__objc_selrefs` lives in `__DATA` on one OS, `__DATA_CONST` on
+// another and `__AUTH_CONST` on a third.
+bool guest_find_section(Memory& mem, uint64_t mh, const char* name,
+                        uint64_t* addr, uint64_t* size) {
+    if (!mh || mem.read<uint32_t>(mh) != 0xFEEDFACFu) return false;   // MH_MAGIC_64
+    const uint32_t ncmds = mem.read<uint32_t>(mh + 16);
+    uint64_t lc = mh + 32;
+    // A cap, because a header that is not one -- or one whose ncmds is garbage -- must not
+    // walk the whole address space. No real image has thousands.
+    for (uint32_t i = 0; i < ncmds && i < 4096; ++i) {
+        const uint32_t cmd = mem.read<uint32_t>(lc);
+        const uint32_t cmdsize = mem.read<uint32_t>(lc + 4);
+        if (cmdsize < 8) return false;
+        if (cmd == 0x19) {                                           // LC_SEGMENT_64
+            const uint32_t nsects = mem.read<uint32_t>(lc + 64);
+            for (uint32_t s = 0; s < nsects; ++s) {
+                const uint64_t sec = lc + 72 + s * 80;
+                char sn[17];
+                for (unsigned k = 0; k < 16; ++k) sn[k] = static_cast<char>(mem.read<uint8_t>(sec + k));
+                sn[16] = 0;                    // the field is not NUL-terminated when full
+                if (std::strncmp(sn, name, 16) != 0) continue;
+                *addr = mem.read<uint64_t>(sec + 32);
+                *size = mem.read<uint64_t>(sec + 40);
+                return true;
+            }
+        }
+        lc += cmdsize;
+    }
+    return false;
+}
+
 // Darwin's `struct stat64` is 144 bytes and laid out nothing like Linux's, so the
 // Linux buffer `Files` fills is translated rather than copied. Only the fields a
 // program actually branches on are carried across: the type bits, the permission
@@ -255,6 +293,75 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // `getsectiondata(mh, "__DATA", "__os_assumes_log", &size)`. Answering zero made
         // that a `getsectiondata(NULL, …)`, which `--strict` reported as a read of address
         // 0x10 — benign in permissive mode, which is exactly why it needed --strict to see.
+        // `_dyld_lookup_section_info`: where a well-known ObjC or Swift section is in an
+        // image. dyld precomputes these so libobjc need not walk load commands, and it is
+        // the hottest slot in the run -- 186 calls, and the fallback costs 16% of it.
+        //
+        // Three things had to be measured rather than recalled, and the third is the one
+        // that would have gone wrong quietly.
+        //
+        // 1. **x3 is the `_dyld_section_location_kind`.** A number, and a wrong mapping
+        //    returns some *other* section's contents, which looks like nothing at all. It
+        //    is measured because **the caller names the kind**: libobjc has a separate
+        //    method per section, so x30 through `tools/whichlib.py` reads the name out of a
+        //    trace. Seven are pinned down below, each with what proved it, and they
+        //    cross-check -- 13 arrives from two unrelated callers, and the Swift one turns
+        //    up as a template argument in its own mangled name.
+        // 2. **Only three arguments.** x4 and x5 look like out-parameters and are not:
+        //    they hold this slot's own stub and vtable-entry addresses, left by the
+        //    caller's dispatch (`stubs + 111*16` and `vtable + 111*8`). The caller
+        //    clobbered them getting here, so nothing can be passed in them.
+        // 3. **So the answer is a 16-byte return in x0:x1** -- the section's address and
+        //    its size -- and an address is what x0 must be, because a *zero* x0 is what
+        //    made libobjc fall back for the whole of this project's history. An offset
+        //    from the header would make zero mean "the header", and there is no section
+        //    there.
+        case 111: {
+            // Off unless asked for -- see the note at the end of this case.
+            if (!dyld_section_info) return 0;
+            static const struct { unsigned kind; const char* sect; } kKinds[] = {
+                { 3, "__swift5_replace"},  // libswiftCore addImageCallback2Sections<…,Li3E,…>
+                { 6, "__objc_imageinfo"},  // _map_images_nolock, for every image
+                { 7, "__objc_selrefs"},    // header_info::selrefs
+                {12, "__objc_classlist"},  // header_info::classlist
+                {13, "__objc_nlclslist"},  // header_info::nlclslist, and _load_images+76
+                {17, "__objc_nlcatlist"},  // _load_images+104, after the non-lazy classes
+                {18, "__objc_protolist"},  // header_info::protocollist
+            };
+            const uint64_t mh = cpu_.xr(1), kind = cpu_.xr(3);
+            const char* want = nullptr;
+            for (const auto& k : kKinds)
+                if (k.kind == kind) { want = k.sect; break; }
+            // An unmeasured kind gets the honest answer, which is also a *correct* one:
+            // libobjc walks the image itself when this returns nothing. Guessing at the
+            // rest of the enum to save a walk is how a wrong section gets read silently.
+            if (!want) {
+                if (trace)
+                    std::fprintf(stderr, "[mac] section info: kind %llu is not one of the "
+                                         "measured ones, falling back\n",
+                                 static_cast<unsigned long long>(kind));
+                return 0;
+            }
+            uint64_t addr = 0, size = 0;
+            if (!guest_find_section(mem_, mh, want, &addr, &size)) return 0;
+            if (trace)
+                std::fprintf(stderr, "[mac] section info: %012llX %s -> %012llX + %llu\n",
+                             static_cast<unsigned long long>(mh), want,
+                             static_cast<unsigned long long>(addr),
+                             static_cast<unsigned long long>(size));
+            cpu_.setx(1, size);            // x0 is written by the caller from the return
+            return static_cast<int64_t>(addr);
+            // Why this is behind a flag, since the answers above are demonstrably right:
+            // with it on, libobjc stops falling back and starts *using* the shared cache's
+            // preoptimized class layout for real -- and gets 86,000 instructions further
+            // before branching through a null function pointer (PC 0 at 285,669
+            // instructions, where the whole run is 199,279 with the fallback). That is
+            // progress into new territory, not a regression in this slot, but it is a run
+            // that does not finish, so it cannot be the default. It also uncovered PACGA,
+            // which libobjc uses on its method caches and which is now implemented.
+            //
+            // Next session: run with --dyld-sections and find what the null pointer is.
+        }
         case 12: {
             const uint64_t addr = cpu_.xr(1);          // x0 is `this`
             uint64_t hdr = 0;

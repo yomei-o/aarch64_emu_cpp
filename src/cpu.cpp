@@ -1071,6 +1071,25 @@ void Cpu::exec_dp_register(uint32_t insn) {
                 case 0x09: setreg(rd, is64, shift_reg(a, 1, b & (is64 ? 63 : 31), is64)); return;   // LSRV
                 case 0x0A: setreg(rd, is64, shift_reg(a, 2, b & (is64 ? 63 : 31), is64)); return;   // ASRV
                 case 0x0B: setreg(rd, is64, shift_reg(a, 3, b & (is64 ? 63 : 31), is64)); return;   // RORV
+                // PACGA — a *generic* pointer-authentication code: a 32-bit MAC of Rn
+                // keyed by Rm, placed in bits 63:32 with the low half zero. It is the one
+                // PAC instruction the identity treatment does not fit, because there is no
+                // pointer to leave alone: the code is a value the guest computes now and
+                // compares to one it computed earlier (libobjc uses it on its method
+                // caches). What it needs is therefore not the *right* MAC but a
+                // *deterministic* one -- the same inputs giving the same answer twice --
+                // and it must be non-zero, since a MAC that is always zero is
+                // indistinguishable from an uninitialised field.
+                //
+                // So: a fixed 64-bit mix, kept to the top half. Not Apple's function, and
+                // nothing that crosses a process boundary could accept it; nothing does,
+                // because a generic MAC is only ever checked by the code that made it.
+                case 0x0C: {
+                    if (!is64) break;
+                    const uint64_t mix = (a ^ b) * 0x9E3779B97F4A7C15ull;
+                    setx(rd, ((mix ^ (mix >> 32)) | 1) << 32);
+                    return;
+                }
                 default: break;
             }
         } else if (rm == 1) {

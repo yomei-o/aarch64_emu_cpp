@@ -392,13 +392,26 @@ void Cpu::exec_branch(uint32_t insn) {
                       op0, op1, crn, crm, op2, l ? "read" : "write");
         fail(buf, insn);
     }
-    if (((insn >> 25) & 0x7F) == 0x6B) {                              // BR / BLR / RET
+    if (((insn >> 25) & 0x7F) == 0x6B) {                              // BR / BLR / RET (+ auth)
         const unsigned opc = (insn >> 21) & 0xF, rn = (insn >> 5) & 0x1F;
-        const uint64_t target = xr(rn);
-        if (opc == 1) setx(30, cur_pc_ + 4);                          // BLR
-        if (opc > 2) fail("unimplemented indirect branch", insn);
-        pc = target;
-        return;
+        const unsigned op3 = (insn >> 10) & 0x3F;
+        // op3 is 000000 for the plain forms and 000010/000011 for the
+        // pointer-authenticating ones — BRAA/BRAAZ, BLRAA/BLRAAZ, RETAA/RETAB.
+        // Authentication is the identity here (see the PAC family above), so each
+        // behaves as its plain counterpart; only the target register differs.
+        const bool authed = op3 == 2 || op3 == 3;
+        if (!authed && op3 != 0) fail("unimplemented indirect branch", insn);
+        switch (opc) {
+            case 0: pc = xr(rn); return;                              // BR / BRAAZ / BRABZ
+            case 1: setx(30, cur_pc_ + 4); pc = xr(rn); return;       // BLR / BLRAAZ / BLRABZ
+            // RET takes its target from Rn; RETAA/RETAB encode Rn as 11111 and use
+            // X30 unconditionally. Reading Rn there would read XZR and branch to 0.
+            case 2: pc = authed ? xr(30) : xr(rn); return;
+            case 8: if (!authed) break; pc = xr(rn); return;          // BRAA / BRAB
+            case 9: if (!authed) break; setx(30, cur_pc_ + 4); pc = xr(rn); return;   // BLRAA/AB
+            default: break;
+        }
+        fail("unimplemented indirect branch", insn);
     }
     fail("unimplemented branch/system instruction", insn);
 }
@@ -870,6 +883,38 @@ void Cpu::exec_dp_register(uint32_t insn) {
                 case 0x0B: setreg(rd, is64, shift_reg(a, 3, b & (is64 ? 63 : 31), is64)); return;   // RORV
                 default: break;
             }
+        } else if (rm == 1) {
+            // ---- pointer authentication (arm64e) ----------------------------
+            //
+            // In this group the Rm field is really `opcode2`, and 00001 selects the
+            // PAC family: PACIA/PACIB/PACDA/PACDB, their Z forms, the matching
+            // AUTxx, and XPACI/XPACD. Nothing here looked at opcode2 before, so
+            // `pacia x0, x1` decoded as RBIT and silently reversed the bits of a
+            // return address.
+            //
+            // PAC is implemented as the *identity*: signing leaves the pointer
+            // alone and authenticating accepts it. That is not a stub — it is
+            // exactly what an ARMv8.3 CPU does when pointer authentication is
+            // disabled, which is a real configuration and the one this emulator
+            // presents. The consequence is honest and worth knowing: a guest that
+            // corrupts a signed pointer will not fault here, because there is no
+            // signature to fail. Everything Apple's own code does — sign on entry,
+            // authenticate on return, strip before printing — round-trips
+            // correctly, which is what running arm64e libSystem needs.
+            // Every one of these reads *and writes* Rd — the pointer — and takes the
+            // modifier in Rn: `X[d] = AddPAC(X[d], X[n])`. So the identity is a
+            // genuine no-op, and writing anything (the first version copied Rn into
+            // Rd) replaces the pointer with the salt.
+            //
+            // A no-op is normally the wrong answer in this emulator, and it is worth
+            // being clear about why this one is not: PAC-disabled hardware really
+            // does nothing here, and the round-trip in tests/pac.c holds on both,
+            // so the behaviour is checkable rather than merely convenient.
+            if (!is64) fail("pointer authentication needs a 64-bit form", insn);
+            if (opcode <= 0x11) return;
+            fail("unimplemented pointer-authentication instruction", insn);
+        } else if (rm != 0) {
+            fail("unimplemented 1-source data processing (opcode2 != 0)", insn);
         } else {
             const uint64_t a = reg(rn, is64);
             const unsigned width = is64 ? 64 : 32;

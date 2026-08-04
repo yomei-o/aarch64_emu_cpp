@@ -44,6 +44,7 @@ No dependencies beyond a C++17 standard library.
 | **A stock CPython 3.13 for ARM64 Linux** | ✅ |
 | **Mach-O loading and Darwin syscalls** (Apple Silicon guests) | ✅ |
 | **Dynamic linking on Darwin** — chained fixups and export tries, done by the emulator | ✅ |
+| **Pointer authentication** (arm64e): the PAC family, RETAA/BRAA/BLRAA | ✅ identity |
 | **Threads** — `clone`, `futex`, a scheduler, a real exclusive monitor | ✅ |
 | **WebAssembly** — the same guests, in a browser tab | ✅ |
 | A real macOS binary against libSystem (needs the dyld shared cache) | ❌ planned |
@@ -63,8 +64,9 @@ ok   file
 ok   fp_fixed
 ok   hello
 ok   mem
+ok   pac
 ok   thread_linux
-7 passed, 0 failed
+8 passed, 0 failed
 ```
 
 The **same sources** are then built a third time, as arm64 **Mach-O**, and run
@@ -79,8 +81,9 @@ ok   macho file
 ok   macho fp_fixed
 ok   macho hello
 ok   macho mem
+ok   macho pac
 ok   macho dylib (bind + rebase)
-7 passed, 0 failed
+8 passed, 0 failed
 ```
 
 And a second suite runs a **real** guest — Alpine's static aarch64-musl busybox, a

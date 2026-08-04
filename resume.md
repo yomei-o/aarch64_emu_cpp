@@ -14,8 +14,8 @@ Everything below is ordered by what that needs.
 Four suites, all differential — the oracle is always the host, never a recorded
 file:
 
-    sh tests/run_tests.sh      7 passed   freestanding C, built twice and diffed
-    sh tests/run_macho.sh      7 passed   the same sources as arm64 Mach-O, plus a dylib
+    sh tests/run_tests.sh      8 passed   freestanding C, built twice and diffed
+    sh tests/run_macho.sh      8 passed   the same sources as arm64 Mach-O, plus a dylib
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
     node web/test_node.mjs     8 passed   the same guests under WebAssembly
@@ -152,6 +152,20 @@ What works:
   load and produced a rebased pointer that had never been rebased — pointing at a
   zero byte, so the test printed an empty string instead of crashing. It is refused
   loudly now.
+- **PAC is the identity here, and that is a decision, not a stub.** An ARMv8.3 CPU
+  with pointer authentication *disabled* does nothing for `pacia`/`autia` either, so
+  the round-trip in `tests/pac.c` — sign then authenticate, sign then strip — holds
+  on both real hardware and here, and is checkable. What does not hold: a guest that
+  corrupts a signed pointer will not fault, because there is no signature to fail.
+  Two encoding traps behind it:
+  - In the 1-source data-processing group the **Rm field is `opcode2`**, and nothing
+    looked at it, so `pacia x0, x1` decoded as **RBIT** and reversed the bits of a
+    return address. Anything with `opcode2 != 0` now fails loudly.
+  - `PACIA Xd, Xn` reads *and writes* **Xd** — the pointer — and takes the modifier
+    in Xn. Writing `Xd = Xn` (the obvious-looking version) replaces the pointer with
+    the salt; the identity means writing nothing at all.
+  - `RETAA`/`RETAB` encode Rn as `11111` but use **X30**. Reading Rn there gives XZR
+    and branches to zero.
 - MSYS rewrites a command-line argument that starts with `/` into a Windows path
   before clang sees it, so `-install_name,/libfoo.dylib` becomes
   `C:/Program Files/Git/libfoo.dylib`. The tests use `@executable_path/…`.

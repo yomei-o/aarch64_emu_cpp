@@ -204,18 +204,37 @@ What works:
      at all. In a shared cache that is normal: the builder merges a class's methods — and its
      categories — into a preoptimized `class_rw_t`, and the image keeps nothing.
 
-   So the missing `dealloc` is not missing from a list that is being misread; it is in the
-   cache's preoptimized class data, which is reached through `headeropt_rw`. That table is in
-   the extracted libobjc (segment `__OBJC_RW`, 0x1EE1B4000, version 0x0AEF, count 8) and
-   **slot 117 now returns it** instead of the zeroed 1 MiB the host used to invent. It is
-   called, it gets the real address, and the wall has not moved — so the next question is
-   what libobjc does with it: `objc::headeropt_rw` is indexed by header, and if the header
-   index libobjc computes for libxpc does not match the one the cache recorded, it will read
-   the wrong entry or none. The `headeropt_ro` table (0x1FAFEF4A8, 24 headers) is the map
-   between the two, and `_dyld_lookup_section_info` (slot 111) is what libobjc would normally
-   use to find a header — it is still answered with zero, which makes libobjc fall back to
-   walking load commands. That fallback works for sections; it may not produce the same
-   *index*.
+   So the missing `dealloc` is not missing from a list that is being misread. Where it is
+   was settled by four more measurements, and the answer is that **it is nowhere in the
+   image**:
+
+   - `OS_xpc_bundle`'s `ro->baseMethods` is 0, as above.
+   - libxpc has **no `__objc_catlist` at all**, so it is not in a category either.
+   - `OPTIMIZED_BY_DYLD` is **set** in all eight ObjC images (this file said it was cleared;
+     it is not). Clearing it in all eight changes nothing — same instruction count, same
+     message — so libobjc is not gated on it here. Nor is `IsProduction`: the `objc_opt_t`
+     flags are 6 (NoMissingWeakSuperclasses | LargeSharedCache) and setting bit 0 changes
+     nothing either.
+   - `headeropt_ro` is right and complete: **2,799 entries**, entry 0 being libobjc at
+     0x180078000 — the same addresses the loader uses, so the cache's header table covers
+     these images exactly.
+   - **`headeropt_rw` is read, 178 times, and returns zeros.** Those zeros are correct: the
+     file has the header (count 0x0AEF, entsize 8) and nothing else, because the rw half is a
+     region **dyld populates at launch** rather than something the cache ships.
+
+   So the remaining work is not another dyld answer. It is the one thing real dyld does for
+   ObjC that this host does not: **build the preoptimized `class_rw_t` entries**. The inputs
+   are extracted and their addresses are known —
+   `largeSharedCachesClassOffset` → 0x1FE753FF8, `largeSharedCachesProtocolOffset` →
+   0x1FEBBE4C8, `selopt` → 0x1FDA53BD8, and the selector pool the host already walks. A class
+   whose methods the builder merged away has them there, keyed by name, and `dealloc` on
+   `OS_xpc_bundle` is exactly such a class.
+
+   That is a real piece of work rather than a slot to fill, and it is the honest end of this
+   line: everything cheaper has been tried and measured. The alternative remains the one this
+   file has always named — make the images ordinary rather than cache ones, which means
+   rewriting class metadata at extraction time in `dsc_extract`, and which has the same
+   inputs.
 
    ### The old section, wrong in its conclusion, still right in its measurements
 

@@ -1225,7 +1225,15 @@ static void read_patch_table(void) {
                     const uint64_t use_from_cache = cache_base + use_off;
                     const uint64_t val_from_dylib = impl_base + impl_off + addend;
                     const uint64_t val_from_cache = cache_base + impl_off + addend;
-                    if (patch_sym && strcmp(patch_sym, sym) == 0 && n_shown_sym < 12) {
+                    // Matches either the symbol name or the client library's path, so
+                    // one flag answers both "where does this symbol get patched" and
+                    // "what gets patched into this library" -- and the second is the
+                    // more useful question when the first turns up nothing.
+                    const char* cp = image_path((int)client_index);
+                    const int wanted_line =
+                        patch_sym && (strcmp(patch_sym, sym) == 0 ||
+                                      (cp && strstr(cp, patch_sym) != NULL));
+                    if (wanted_line && n_shown_sym < 24) {
                         printf("    %s in %s:\n"
                            "        use  dylib-relative %012llX   cache-relative %012llX\n"
                            "        impl dylib-relative %012llX   cache-relative %012llX\n",

@@ -154,14 +154,18 @@ packed, out of a 4.9 GB dyld shared cache, extracted by `tools/dsc_extract.c` on
 ```console
 $ sh prebuilt/unpack.sh
 $ ./aarch64emu --root guests/macos guests/macos/hello
-objc[1000]: Attempt to use unknown class 0x1ee40b2e0.
+objc[1000]: -[OS_xpc_bundle dealloc]: unrecognized selector sent to instance 0x7f40001040a0
 ```
 
-Not finished, and the message is the guest's own: 35,424 instructions of Apple's code
+Not finished, and the message is the guest's own: **122,334 instructions** of Apple's code
 run — the libraries link, dyld's job is done by `src/macho_dyld.cpp`, initializers run in
-dyld's order, malloc and stdio come up over Mach IPC and the commpage — and then libobjc
-wants the shared cache's pre-built class tables, which real dyld hands it and nothing here
-does yet. `resume.md` has the details.
+dyld's order, malloc and stdio come up over Mach IPC and the commpage, libobjc registers
+its images and realizes its classes, libxpc initialises, and real Objective-C objects are
+created and messaged. What stops it is one thing the extraction left behind: the shared
+cache's **selector table**. libobjc reads the cache's preoptimized metadata, so it expects
+the cache's uniqued selectors — and every table in libobjc's `objc_opt_t` header points
+into cache regions `dsc_extract` does not copy out. `resume.md` has the measurement and
+what to do about it.
 
 ## Building
 

@@ -296,6 +296,26 @@ static void ob_pad(struct outbuf* b, size_t align) {
     while (b->len % align) { const uint8_t z = 0; ob_put(b, &z, 1); }
 }
 
+// No blob belonging to one library is this big. The first version of this tool
+// copied LC_SYMTAB's strsize -- which in a shared cache spans the string pool of
+// *every* library -- and produced 434 MB dylibs without complaining once. A ceiling
+// that reports what it dropped is the difference between a bug found in a minute and
+// a bug found by wondering why the output is enormous.
+#define MAX_BLOB (64u << 20)
+
+static uint32_t put_blob(struct outbuf* b, const uint8_t* d, uint32_t size,
+                         const char* what, const char* path, uint32_t* out_size) {
+    if (!d || !size) { *out_size = 0; return 0; }
+    if (size > MAX_BLOB) {
+        fprintf(stderr, "  ! %s: %s is %u bytes -- too large to belong to one "
+                        "library; dropped\n", path, what, size);
+        *out_size = 0;
+        return 0;
+    }
+    *out_size = size;
+    return (uint32_t)ob_put(b, d, size);
+}
+
 // Rebuild one cache dylib as a standalone Mach-O file.
 static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes) {
     const int idx = find_image(path);
@@ -379,19 +399,49 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
         struct load_command lc;
         memcpy(&lc, mh + o, sizeof lc);
         switch (lc.cmd) {
+            // The symbol table needs rebuilding, not copying. In a shared cache the
+            // *string pool is shared by every library*: each dylib's LC_SYMTAB has
+            // its own symoff/nsyms but its stroff points into one common pool and
+            // strsize covers the whole thing -- hundreds of megabytes. Copying
+            // strsize bytes per library is what made the first version emit 434 MB
+            // dylibs. So each symbol's name is looked up individually and a private
+            // string table is built from just those.
             case LC_SYMTAB: {
                 struct symtab_command sc;
                 memcpy(&sc, mh + o, sizeof sc);
                 struct symtab_command* dst = (struct symtab_command*)(ob.p + o);
                 const uint8_t* syms = at_linkedit(le_vmaddr, le_fileoff, sc.symoff,
-                                                  sc.nsyms * 16);
-                const uint8_t* strs = at_linkedit(le_vmaddr, le_fileoff, sc.stroff, sc.strsize);
-                if (syms && strs) {
-                    dst->symoff = (uint32_t)ob_put(&ob, syms, sc.nsyms * 16);
-                    dst->stroff = (uint32_t)ob_put(&ob, strs, sc.strsize);
-                } else {
+                                                  (uint64_t)sc.nsyms * 16);
+                if (!syms || !sc.nsyms) {
                     dst->symoff = dst->nsyms = dst->stroff = dst->strsize = 0;
+                    break;
                 }
+                struct outbuf nl = {0}, st = {0};
+                const uint8_t zero = 0;
+                ob_put(&st, &zero, 1);              // index 0 is the empty name
+                for (uint32_t s = 0; s < sc.nsyms; ++s) {
+                    uint8_t ent[16];
+                    memcpy(ent, syms + (size_t)s * 16, 16);
+                    uint32_t strx;
+                    memcpy(&strx, ent, 4);
+                    uint32_t new_strx = 0;
+                    if (strx && strx < sc.strsize) {
+                        const uint8_t* nm = at_linkedit(le_vmaddr, le_fileoff,
+                                                        sc.stroff + strx, 1);
+                        if (nm) {
+                            const size_t len = strnlen((const char*)nm, 4096);
+                            new_strx = (uint32_t)st.len;
+                            ob_put(&st, nm, len + 1);
+                        }
+                    }
+                    memcpy(ent, &new_strx, 4);
+                    ob_put(&nl, ent, 16);
+                }
+                dst->symoff = (uint32_t)ob_put(&ob, nl.p, nl.len);
+                dst->stroff = (uint32_t)ob_put(&ob, st.p, st.len);
+                dst->strsize = (uint32_t)st.len;
+                free(nl.p);
+                free(st.p);
                 break;
             }
             case LC_DYLD_INFO_ONLY: {
@@ -406,8 +456,8 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
                 dst->lazy_bind_off = dst->lazy_bind_size = 0;
                 const uint8_t* ex = at_linkedit(le_vmaddr, le_fileoff, dc.export_off,
                                                 dc.export_size);
-                if (ex) dst->export_off = (uint32_t)ob_put(&ob, ex, dc.export_size);
-                else { dst->export_off = 0; dst->export_size = 0; }
+                dst->export_off = put_blob(&ob, ex, dc.export_size, "export trie", path,
+                                           &dst->export_size);
                 break;
             }
             // LC_DYLD_CHAINED_FIXUPS belongs here even though a cache dylib is
@@ -423,8 +473,8 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
                 memcpy(&dc, mh + o, sizeof dc);
                 struct linkedit_data_command* dst = (struct linkedit_data_command*)(ob.p + o);
                 const uint8_t* d = at_linkedit(le_vmaddr, le_fileoff, dc.dataoff, dc.datasize);
-                if (d) dst->dataoff = (uint32_t)ob_put(&ob, d, dc.datasize);
-                else { dst->dataoff = 0; dst->datasize = 0; }
+                dst->dataoff = put_blob(&ob, d, dc.datasize, "a LINKEDIT blob", path,
+                                        &dst->datasize);
                 break;
             }
             // A code signature covers file offsets that no longer exist, and a
@@ -474,7 +524,10 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
     if (!f) die("cannot write %s: %s", full, strerror(errno));
     fwrite(ob.p, 1, ob.len, f);
     fclose(f);
-    printf("  %-56s %8.1f KiB\n", path, ob.len / 1024.0);
+    // Segments and LINKEDIT reported separately: a total alone does not say which
+    // half is unreasonable, and it was the LINKEDIT half that went wrong.
+    printf("  %-48s %8.1f KiB  (code+data %.0f, linkedit %.0f)\n", path, ob.len / 1024.0,
+           le_start / 1024.0, (ob.len - le_start) / 1024.0);
     *out_bytes += ob.len;
     free(ob.p);
     return 1;

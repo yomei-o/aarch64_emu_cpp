@@ -52,32 +52,41 @@ What works:
 
 ## ⏭ Next, in order
 
-1. **A real macOS binary — 49,539 instructions in, inside the ObjC runtime.** This is
+1. **A real macOS binary — 75,035 instructions in, inside the ObjC runtime.** This is
    the live front, and the guest tree for it is committed:
 
        sh prebuilt/unpack.sh                # 48 files, 85 MB unpacked, 21 MB packed
        ./aarch64emu --root guests/macos guests/macos/hello
 
-   The guest gets through malloc, stdio, and the whole of libobjc's image registration
-   — `map_images` runs for 10,297 instructions over 46 images, `load_images` after it —
-   and then stops with libobjc's own diagnostic:
+   The guest gets through malloc, stdio, and libobjc's image registration --
+   `map_images` runs for **35,793 instructions** over 46 images, `load_images` after it
+   for each -- and then stops with libobjc's own diagnostic:
 
        objc[1000]: Attempt to use unknown class 0x1ee40b2e0.
 
    which is `OBJC_METACLASS_$_NSObject`, in libobjc's own `__DATA_DIRTY`, failing
-   `checkIsKnownClass` *after* both callbacks have run. The likely reason is that these
-   are cache libraries and libobjc knows it: for a preoptimized image it trusts the
-   shared cache's own class tables and the `objc::dataSegmentsRanges` fast path instead
-   of adding to `allocatedClasses`, and nothing here supplies the cache's objc
-   optimisation header. Worth checking whether one of the dyld API slots libobjc calls
-   is "is this address in the shared cache" — answering *no* would push it onto the
-   ordinary path, where it registers classes itself. Slots 1, 8, 44, 51, 61, 69, 71 and
-   84 are called and answered with zero; two of them come from `__objc_init` itself
-   (`+456` and `+548`), and those two are the ones to identify first.
+   `checkIsKnownClass`.
 
-   How to get there: `--trace-sys` prints `[init]`, `[objc]` and `[call]` lines;
-   `tools/whichlib.py` turns any address from a trace into a library and the nearest
-   symbol, and `tools/dis_macho.py` disassembles at a cache address.
+   What is known: `map_images` is being called correctly now (the struct-array form; see
+   below), the `OPTIMIZED_BY_DYLD` bit is cleared in every image's `__objc_imageinfo` so
+   libobjc should read the classlists itself, and 35,793 instructions of real work happen
+   inside it. What is *not* known is why the registration does not take. Two threads to
+   pull, in order:
+
+   - **No image's `__objc_imageinfo` is ever read** (`--watch 1E7FF18F8:1E7FF1900` shows
+     only the emulator's own accesses). Either libobjc locates the section some other
+     way, or it is still skipping `addHeader`. Finding out what those 35,793 instructions
+     *do* is the direct route: `--sample 1` and `tools/whichlib.py` over the window
+     between the two `[call]` lines.
+   - The third field of `_dyld_objc_notify_mapped_info` is passed as zero because nothing
+     reads it either way. If libobjc turns out to locate sections through it, that is the
+     answer.
+
+   `tools/dyld_slots.py` now names 98 of the vtable slots by scanning libdyld for the
+   dispatch shape, so any unimplemented one is a name rather than a number. The ones
+   answered with zero and worth a second look are `dyld_sdk_at_least` (69),
+   `dyld_program_sdk_at_least` (71) -- answering *false* enables libobjc's legacy paths --
+   and `_dyld_get_objc_selector` (84), `_dyld_is_memory_immutable` (61).
 
    Everything before that works: 45 libraries map and link, the GOT slots the cache
    leaves null get bound, initializers run in dyld's order, `os_alloc_once` allocates
@@ -200,6 +209,17 @@ instructions past it, and each looked like a different problem than it was.
 - **"Emitted" and "visited" are different marks.** Emitting libSystem's initializers
   ahead of the walk and then marking it *done* stops the walk at libSystem, so nothing
   else's initializers ever run -- visible only as `[init] 1/1` in the trace.
+- **A callbacks struct at version 4 means the modern `mapped` shape**: `(count, infos[])`
+  with 32-byte entries, not `(count, paths[], mach_headers[])`. Passing the two-array form
+  makes libobjc read a *path pointer* where a mach_header belongs, fail its magic check,
+  and skip every image -- which looks exactly like success: the call runs, returns, and
+  registers nothing. Getting it right took `map_images` from 11,271 instructions to 35,793.
+- **A cache dylib's `__objc_imageinfo` has `OPTIMIZED_BY_DYLD` set**, which tells libobjc
+  its classes are already in the shared cache's tables and its classlist need not be read.
+  True on a Mac, a dead end here, so the bit is cleared at load time.
+- **`tools/dyld_slots.py` names 98 of the dyld API vtable slots** by scanning libdyld for
+  the dispatch shape. The destination register of the vtable load varies -- x1 as often as
+  x8 -- and requiring x8 found five slots out of a hundred and thirty.
 - **The syscall number is a 32-bit value.** Reading all of x16 turns `mov w16, #-3`,
   which selects Mach trap 3, into 4294967293 — a positive number that goes down the BSD
   path and reports an absurd syscall.

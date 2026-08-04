@@ -224,9 +224,7 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
             const uint64_t p = cpu_.xr(1);
             objc_callbacks_ = p;
             // The struct is { version, map_images, load_images, unmap_image,
-            // patch_root_of_class } -- version 4 on Sequoia. `map_images` takes
-            // (count, paths[], mach_headers[]), which its own prologue confirms by
-            // saving x0, x1 and x2.
+            // patch_root_of_class } -- version 4 on Sequoia.
             const uint64_t map_images = mem_.read<uint64_t>(p + 8);
             if (!map_images || objc_image_paths_.empty()) return 0;
 
@@ -236,20 +234,35 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
             // means the initializer never finishes.
             //
             //     objc[1000]: Attempt to use unknown class 0x1ee40b2e0.
+            //
+            // A callbacks struct at version 4 means the modern `mapped` shape,
+            // (count, infos[]), rather than the older (count, paths[], mach_headers[]).
+            // Passing the two-array form makes libobjc read a *path pointer* where a
+            // mach_header belongs, fail its magic check, and skip every image -- which
+            // looks like success: the call runs, returns, and registers nothing. The
+            // giveaway is that no image's `__objc_imageinfo` is ever read.
+            //
+            //     struct _dyld_objc_notify_mapped_info {
+            //         const mach_header* mh; const char* path;
+            //         const void* sectionsBase; uint32_t refsOffset, unused;
+            //     };   // 32 bytes
+            constexpr uint64_t kInfoSize = 32;
             const size_t n = objc_image_paths_.size();
-            const uint64_t paths = kObjcArena, mhdrs = kObjcArena + n * 8;
-            uint64_t strp = mhdrs + n * 8;
+            const uint64_t infos = kObjcArena;
+            uint64_t strp = infos + n * kInfoSize;
             for (size_t j = 0; j < n; ++j) {
                 const std::string& s = objc_image_paths_[j];
                 mem_.write_bytes(strp, s.c_str(), s.size() + 1);
-                mem_.write<uint64_t>(paths + j * 8, strp);
-                mem_.write<uint64_t>(mhdrs + j * 8, objc_image_headers_[j]);
+                mem_.write<uint64_t>(infos + j * kInfoSize + 0, objc_image_headers_[j]);
+                mem_.write<uint64_t>(infos + j * kInfoSize + 8, strp);
+                mem_.write<uint64_t>(infos + j * kInfoSize + 16, 0);   // sectionsBase: unread
+                mem_.write<uint64_t>(infos + j * kInfoSize + 24, 0);
                 strp += s.size() + 1;
             }
             if (trace)
                 std::fprintf(stderr, "[objc] map_images(%zu) at %012llX\n", n,
                              static_cast<unsigned long long>(map_images));
-            call_guest(map_images, n, paths, mhdrs);
+            call_guest(map_images, n, infos, 0);
 
             // Then the `init` callback, once per image, which is the rest of what dyld
             // does at registration: it runs each image's `+load` methods and finishes
@@ -257,8 +270,7 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
             const uint64_t load_images = mem_.read<uint64_t>(p + 16);
             if (load_images && !cpu_.halted)
                 for (size_t j = 0; j < n && !cpu_.halted; ++j)
-                    call_guest(load_images, mem_.read<uint64_t>(paths + j * 8),
-                               objc_image_headers_[j], 0);
+                    call_guest(load_images, infos + j * kInfoSize, 0, 0);
             return 0;
         }
         default:

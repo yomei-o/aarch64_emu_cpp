@@ -112,6 +112,9 @@ bool macho_parse(const std::vector<uint8_t>& f, MachoImage* out, std::string* er
                     // S_NON_LAZY_SYMBOL_POINTERS / S_LAZY_SYMBOL_POINTERS: the __got
                     // and __auth_got tables. reserved1 is where this section's run of
                     // indirect symbols starts.
+                    else if (std::memcmp(f.data() + so, "__objc_imageinfo", 16) == 0) {
+                        out->objc_imageinfo.push_back(addr);
+                    }
                     else if (type == 0x06 || type == 0x07) {
                         uint32_t reserved1 = 0;
                         std::memcpy(&reserved1, f.data() + so + 68, 4);

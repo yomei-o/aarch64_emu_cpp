@@ -388,6 +388,26 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
         if (end > high) high = end;
     }
 
+    // Tell libobjc these images are *not* preoptimized.
+    //
+    // Every cache dylib's `__objc_imageinfo` has OPTIMIZED_BY_DYLD set, which is libobjc's
+    // signal that the image's classes are already registered in the shared cache's tables
+    // and its `__objc_classlist` need not be read. That is true on a Mac and a dead end
+    // here: there is no cache, so nothing registers the classes and the first use of
+    // NSObject's metaclass fails `checkIsKnownClass` -- after `map_images` has apparently
+    // run fine, because skipping the classlist is not an error.
+    //
+    // Clearing the bit puts libobjc on the ordinary path, where it reads the classlist
+    // itself. The alternative is synthesising the cache's objc optimisation tables, which
+    // is a great deal more work for the same answer.
+    for (const MachoImage& img : images) {
+        for (uint64_t addr : img.objc_imageinfo) {
+            const uint64_t at = img.slide + addr + 4;        // flags follow the version
+            const uint32_t flags = mem.read<uint32_t>(at);
+            mem.write<uint32_t>(at, flags & ~0x88u);         // OPTIMIZED_BY_DYLD, and _CLOSED
+        }
+    }
+
     // A guest assembled out of a dyld shared cache needs one thing no dependency names.
     // The cache coalesces GOT entries into pages that belong to no dylib, so
     // tools/dsc_extract collects those pages into /usr/lib/dsc_extras.dylib. Nothing

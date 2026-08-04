@@ -109,6 +109,10 @@ struct MachoImage {
     uint32_t indirect_off = 0, indirect_count = 0;
     struct GotSec { uint64_t addr = 0, size = 0; uint32_t first_indirect = 0; };
     std::vector<GotSec> got_secs;
+    // Every __objc_imageinfo section. A cache dylib's has OPTIMIZED_BY_DYLD set, which
+    // tells libobjc its classes are already in the shared cache's tables and it need not
+    // read the classlist -- true on a Mac, and a dead end here.
+    std::vector<uint64_t> objc_imageinfo;
 
     // Where the mach_header actually landed. Chained rebases in the OFFSET format
     // are measured from here, not from the slide.

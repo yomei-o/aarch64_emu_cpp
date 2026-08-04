@@ -582,6 +582,15 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
                 // that turns a library that loads into a library that runs.
                 pt->slid += apply_slide(ob.p + new_off, sc.vmaddr, sc.filesize);
                 if (strncmp(sc.segname, "__TEXT", 6) != 0) pt->data_bytes += sc.filesize;
+                // Patch this segment's fileoff, and every section's offset with it.
+                // Taken after the appends above, never before: see patch32.
+                const uint64_t delta_from = sc.fileoff;
+                struct segment_command_64* dst = (struct segment_command_64*)(ob.p + o);
+                dst->fileoff = new_off;
+                struct section_64* sect = (struct section_64*)(ob.p + o + sizeof sc);
+                for (uint32_t s = 0; s < sc.nsects; ++s)
+                    if (sect[s].offset)
+                        sect[s].offset = (uint32_t)(new_off + (sect[s].offset - delta_from));
             }
         }
         o += lc.cmdsize;

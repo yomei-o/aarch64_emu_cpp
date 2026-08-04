@@ -26,7 +26,8 @@ No dependencies beyond a C++17 standard library.
 | System registers a userland guest touches (TPIDR_EL0, FPCR/FPSR, NZCV, CTR_EL0) | ✅ |
 | Static ELF64 loading with a Linux-shaped initial stack and auxiliary vector | ✅ |
 | Linux syscalls: write, writev, read, brk, mmap, exit, uname, clock_gettime, getrandom … | ✅ |
-| FP and Advanced SIMD | partial — grown on demand, see below |
+| FP and Advanced SIMD | scalar double/single arithmetic, compare, convert; DUP/INS/UMOV, the logical and compare vector ops, MOVI, shifts, CNT, across-lanes, LD1/ST1 |
+| A real guest: **Alpine's static aarch64-musl busybox** | ✅ |
 | Dynamic linking (`ld-linux-aarch64.so`) | ❌ next |
 | Mach-O and Darwin syscalls (Apple Silicon guests) | ❌ planned |
 | WebAssembly build | ❌ planned |
@@ -46,6 +47,27 @@ ok   hello
 ok   mem
 4 passed, 0 failed
 ```
+
+And a second suite runs a **real** guest — Alpine's static aarch64-musl busybox, a
+binary that has never heard of this emulator — against the *host's* own tools:
+
+```console
+$ sh tests/run_busybox.sh
+ok   busybox md5sum
+ok   busybox sha1sum
+ok   busybox sha256sum
+ok   busybox wc -l
+ok   busybox uname
+ok   busybox expr
+ok   busybox seq
+ok   busybox sort -u
+ok   busybox od
+9 passed, 0 failed
+```
+
+A digest is the strongest single check available: every byte of the file travels
+through the emulated CPU, and one wrong bit anywhere in a million instructions
+changes the answer.
 
 That is the whole quality argument, and it earns its keep. `lsl x0, x0, #7` came
 out as a rotate on the first run — the number looked entirely reasonable, and only

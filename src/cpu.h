@@ -54,6 +54,9 @@ public:
     int exit_code = 0;
     uint64_t insns = 0;
     uint64_t max_insns = 0;     // 0 = unlimited; a runaway guard for tests
+    // Print PC every N instructions. A guest that stops making progress looks
+    // exactly like one doing a lot of work; sampling tells them apart in seconds.
+    uint64_t sample_every = 0, sample_left = 0;
 
     // Register 31 as zero (XZR): the common case.
     uint64_t xr(unsigned i) const { return i == 31 ? 0 : x[i]; }

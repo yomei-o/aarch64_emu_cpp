@@ -144,8 +144,17 @@ bool Cpu::cond_holds(unsigned cond) const {
 
 void Cpu::step() {
     ++insns;
-    if (max_insns && insns > max_insns)
-        throw CpuError{"instruction limit exceeded (runaway guest?)", pc, 0};
+    if (max_insns && insns > max_insns) {
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "instruction limit exceeded at PC %016llX",
+                      static_cast<unsigned long long>(pc));
+        throw CpuError{buf, pc, 0};
+    }
+    if (sample_every && !sample_left--) {
+        sample_left = sample_every;
+        std::printf("[pc] %016llX after %llu\n", static_cast<unsigned long long>(pc),
+                    static_cast<unsigned long long>(insns));
+    }
 
     cur_pc_ = pc;
     const uint32_t insn = mem_.read<uint32_t>(pc);
@@ -330,6 +339,18 @@ void Cpu::exec_branch(uint32_t insn) {
         // The system registers a user-mode guest actually touches. TPIDR_EL0 is the
         // thread pointer: every TLS access in a libc goes through it, so a guest that
         // cannot read it does not get as far as main().
+        // op0 == 1 is a system *instruction* (DC/IC/AT/TLBI), not a register access.
+        // There are no caches or TLBs to maintain here, so almost all of them are
+        // genuinely nothing — except DC ZVA, which is not a hint: it zeroes a block
+        // and musl's memset relies on it doing so. Reporting a block size through
+        // DCZID_EL0 and then not zeroing would corrupt memory silently.
+        if (op0 == 1) {
+            if (crn == 7 && crm == 4 && op2 == 1) {           // DC ZVA
+                const uint64_t base = xr(rt) & ~63ull;        // 64 bytes, per our DCZID
+                for (unsigned k = 0; k < 64; k += 8) mem_.write<uint64_t>(base + k, 0);
+            }
+            return;
+        }
         const unsigned sysreg = (op0 << 16) | (op1 << 12) | (crn << 8) | (crm << 4) | op2;
         constexpr unsigned kTPIDR_EL0 = (3 << 16) | (3 << 12) | (13 << 8) | (0 << 4) | 2;
         constexpr unsigned kTPIDRRO   = (3 << 16) | (3 << 12) | (13 << 8) | (0 << 4) | 3;
@@ -433,8 +454,13 @@ void Cpu::exec_loadstore(uint32_t insn) {
         const unsigned mode = (insn >> 23) & 3;   // 1=post, 2=offset, 3=pre
         const unsigned l = (insn >> 22) & 1;
         const unsigned rt2 = (insn >> 10) & 0x1F, rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
-        const unsigned scale = simd ? (2 + opc) : (opc == 2 || opc == 0 ? (opc == 0 ? 2 : 2) : 3);
-        const unsigned sz = simd ? (1u << scale) : (opc == 0 ? 4 : 8);
+        // The immediate is scaled by the size of *one* transfer, and LDPSW is the
+        // trap: opc=01 moves two 4-byte values (sign-extended to 64 bits), so it
+        // scales by 4 even though the destinations are X registers. Scaling it by 8
+        // made `ldpsw x2, x8, [x19, #8]` read from +16, and musl's syscall wrapper
+        // got its syscall number out of the wrong slot — an invalid number, from a
+        // load that looked perfectly ordinary.
+        const unsigned sz = simd ? (4u << opc) : (opc == 2 ? 8u : 4u);
         const int64_t imm = static_cast<int64_t>(sign_extend((insn >> 15) & 0x7F, 7)) * sz;
         uint64_t base = xsp(rn);
         const uint64_t addr = (mode == 1) ? base : base + imm;        // post-index uses the old base
@@ -540,6 +566,42 @@ void Cpu::exec_loadstore(uint32_t insn) {
         return;
     }
 
+    // ---- Advanced SIMD load/store, multiple structures -------------------------
+    // LD1/ST1 over one to four consecutive V registers. musl's string functions and
+    // anything the compiler vectorises reach these immediately.
+    if ((insn & 0xBFBF0000u) == 0x0C000000u ||                        // no offset
+        (insn & 0xBFA00000u) == 0x0C800000u) {                        // post-index
+        const bool q = (insn >> 30) & 1, load = (insn >> 22) & 1;
+        const bool post = (insn >> 23) & 1;
+        const unsigned opcode = (insn >> 12) & 0xF, rm = (insn >> 16) & 0x1F;
+        const unsigned rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
+        unsigned count;
+        switch (opcode) {
+            case 0x7: count = 1; break;
+            case 0xA: count = 2; break;
+            case 0x6: count = 3; break;
+            case 0x2: count = 4; break;
+            default: fail("unimplemented SIMD structure load/store", insn);
+        }
+        const unsigned bytes = q ? 16u : 8u;
+        uint64_t addr = xsp(rn);
+        for (unsigned k = 0; k < count; ++k) {
+            const unsigned r = (rt + k) & 31;
+            if (load) {
+                vreg[r].lo = mem_.read<uint64_t>(addr);
+                vreg[r].hi = q ? mem_.read<uint64_t>(addr + 8) : 0;
+            } else {
+                mem_.write<uint64_t>(addr, vreg[r].lo);
+                if (q) mem_.write<uint64_t>(addr + 8, vreg[r].hi);
+            }
+            addr += bytes;
+        }
+        // Post-index: Rm == 31 means "advance by the transfer size", otherwise the
+        // register holds the increment.
+        if (post) setxsp(rn, xsp(rn) + (rm == 31 ? count * bytes : xr(rm)));
+        return;
+    }
+
     fail("unimplemented load/store", insn);
 }
 
@@ -603,7 +665,7 @@ void Cpu::exec_dp_register(uint32_t insn) {
         return;
     }
 
-    if (((insn >> 21) & 0xFF) == 0xD2 && ((insn >> 10) & 3) == 2) {   // conditional compare, register
+    if (((insn >> 21) & 0xFF) == 0xD2 && ((insn >> 10) & 3) == 0) {   // conditional compare, register
         const bool sub = (insn >> 30) & 1;
         const unsigned rm = (insn >> 16) & 0x1F, cond = (insn >> 12) & 0xF;
         const unsigned rn = (insn >> 5) & 0x1F, nzcv_imm = insn & 0xF;
@@ -617,7 +679,7 @@ void Cpu::exec_dp_register(uint32_t insn) {
         }
         return;
     }
-    if (((insn >> 21) & 0xFF) == 0xD2 && ((insn >> 10) & 3) == 0) {   // conditional compare, immediate
+    if (((insn >> 21) & 0xFF) == 0xD2 && ((insn >> 10) & 3) == 2) {   // conditional compare, immediate
         const bool sub = (insn >> 30) & 1;
         const unsigned imm = (insn >> 16) & 0x1F, cond = (insn >> 12) & 0xF;
         const unsigned rn = (insn >> 5) & 0x1F, nzcv_imm = insn & 0xF;

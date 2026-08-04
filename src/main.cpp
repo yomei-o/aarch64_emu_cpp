@@ -34,13 +34,18 @@ int main(int argc, char** argv) {
     using namespace a64;
 
     bool trace_sys = false, stats = false;
-    uint64_t max_insns = 0;
+    uint64_t max_insns = 0, sample = 0;
+    // The guest sees this directory as "/". Defaulting to the host cwd means a
+    // relative path from the guest lands where a user would expect it to.
+    std::string root = ".";
     int i = 1;
     for (; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--trace-sys") trace_sys = true;
         else if (a == "--stats") stats = true;
         else if (a == "--max" && i + 1 < argc) max_insns = std::strtoull(argv[++i], nullptr, 0);
+        else if (a == "--sample" && i + 1 < argc) sample = std::strtoull(argv[++i], nullptr, 0);
+        else if (a == "--root" && i + 1 < argc) root = argv[++i];
         else break;
     }
     if (i >= argc) {
@@ -54,6 +59,7 @@ int main(int argc, char** argv) {
     Memory mem;
     Cpu cpu(mem);
     cpu.max_insns = max_insns;
+    cpu.sample_every = sample;
     Syscalls sys(cpu, mem);
     sys.trace = trace_sys;
 
@@ -83,6 +89,8 @@ int main(int argc, char** argv) {
     cpu.sp = build_stack(mem, kStackTop, img, guest_argv, guest_env);
     cpu.pc = img.entry;
     sys.set_brk(img.brk);
+    sys.exe_path = argv[i];
+    sys.files.set_root(root);
 
     int rc = 0;
     try {

@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <string>
 
 #ifdef _WIN32
 #include <io.h>
@@ -52,6 +53,7 @@ bool Syscalls::svc(uint32_t imm) {
         case 64: r = sys_write(static_cast<int>(a0), a1, a2); break;
         case 63: r = sys_read(static_cast<int>(a0), a1, a2); break;
         case 66: r = sys_writev(static_cast<int>(a0), a1, a2); break;
+        case 65: r = sys_readv(static_cast<int>(a0), a1, a2); break;
         case 93: case 94:                                      // exit, exit_group
             cpu_.exit_code = static_cast<int>(a0 & 0xFF);
             cpu_.halted = true;
@@ -73,6 +75,67 @@ bool Syscalls::svc(uint32_t imm) {
             const uint64_t ns = host_nanos();
             mem_.write<uint64_t>(a1, ns / 1000000000ull);
             mem_.write<uint64_t>(a1 + 8, ns % 1000000000ull);
+            r = 0;
+            break;
+        }
+        // ---- files -----------------------------------------------------------
+        // AArch64 has no plain open(2): everything is openat with AT_FDCWD, which
+        // is why a guest that "never opens anything" is really just calling 56.
+        case 56: r = files.open(guest_str(a1), static_cast<int>(a2), static_cast<int>(a3)); break;
+        case 57: r = files.close(static_cast<int>(a0)); break;
+        case 62: r = files.lseek(static_cast<int>(a0), static_cast<int64_t>(a1),
+                                 static_cast<int>(a2)); break;
+        case 80: {                                             // fstat
+            uint8_t st[128];
+            r = files.fstat(static_cast<int>(a0), st);
+            if (r == 0) mem_.write_bytes(a1, st, sizeof st);
+            break;
+        }
+        case 79: {                                             // newfstatat
+            uint8_t st[128];
+            r = files.stat_path(guest_str(a1), st);
+            if (r == 0) mem_.write_bytes(a2, st, sizeof st);
+            break;
+        }
+        case 48: r = files.access(guest_str(a1)); break;        // faccessat
+        case 17: {                                             // getcwd
+            const std::string& d = files.cwd;
+            if (a1 < d.size() + 1) { r = -34; break; }         // ERANGE
+            mem_.write_bytes(a0, d.c_str(), d.size() + 1);
+            r = static_cast<int64_t>(d.size() + 1);
+            break;
+        }
+        case 78: {                                             // readlinkat
+            const std::string path = guest_str(a1);
+            if (path == "/proc/self/exe") {
+                const std::string& e = exe_path;
+                const uint64_t n = e.size() < a3 ? e.size() : a3;
+                mem_.write_bytes(a2, e.c_str(), n);
+                r = static_cast<int64_t>(n);
+            } else r = -22;                                    // EINVAL: not a symlink
+            break;
+        }
+        // ---- signals, threads, and other things a program sets up and forgets --
+        // These must *succeed*. Refusing rt_sigprocmask is not neutral: musl's
+        // startup treats the failure as fatal-ish and busybox's applet dispatch
+        // came apart a few instructions later, ending up executing data.
+        case 134: case 135: case 132: case 133: r = 0; break;  // rt_sigaction/procmask/altstack
+        case 129: case 130: case 131: r = 0; break;            // kill / tkill / tgkill
+        case 178: r = 1000; break;                             // gettid
+        // The set*id family. busybox drops privileges before dispatching an applet,
+        // so refusing these stops it before it does anything at all.
+        case 144: case 146: case 147: case 149: case 151: case 152: r = 0; break;
+        case 154: case 155: case 156: case 157: case 158: r = 0; break;   // setpgid/getpgid/...
+        case 179: r = 0; break;                                // sysinfo: zeroed is fine
+        case 233: r = 0; break;                                // madvise
+        case 29: r = -25; break;                               // ioctl: ENOTTY, we are not a tty
+        case 23: case 24: r = static_cast<int64_t>(a0); break;  // dup / dup3: same fd back
+        case 25: r = (a1 == 1 /*F_GETFD*/ || a1 == 3 /*F_GETFL*/) ? 0 : 0; break;   // fcntl
+        case 101: r = 0; break;                                // nanosleep: return immediately
+        case 169: {                                            // gettimeofday
+            const uint64_t ns = host_nanos();
+            mem_.write<uint64_t>(a0, ns / 1000000000ull);
+            mem_.write<uint64_t>(a0 + 8, (ns % 1000000000ull) / 1000);
             r = 0;
             break;
         }
@@ -106,6 +169,7 @@ int64_t Syscalls::sys_write(int fd, uint64_t buf, uint64_t len) {
     if (len == 0) return 0;
     std::vector<uint8_t> tmp(len);
     mem_.read_bytes(buf, tmp.data(), len);
+    if (fd > 2) return files.write(fd, tmp.data(), len);
     if (output) { output(fd, reinterpret_cast<const char*>(tmp.data()), len); return static_cast<int64_t>(len); }
     if (fd == 1 || fd == 2) {
         std::FILE* f = fd == 2 ? stderr : stdout;
@@ -117,6 +181,12 @@ int64_t Syscalls::sys_write(int fd, uint64_t buf, uint64_t len) {
 }
 
 int64_t Syscalls::sys_read(int fd, uint64_t buf, uint64_t len) {
+    if (fd > 2) {
+        std::vector<uint8_t> tmp(len);
+        const int64_t got = files.read(fd, tmp.data(), len);
+        if (got > 0) mem_.write_bytes(buf, tmp.data(), static_cast<uint64_t>(got));
+        return got;
+    }
     if (fd != 0) return kEBADF;
     if (!input) return 0;                                      // EOF
     std::vector<char> tmp(len);
@@ -143,6 +213,22 @@ int64_t Syscalls::sys_writev(int fd, uint64_t iov, uint64_t cnt) {
 // brk(0) reports the break; brk(x) moves it. Memory is allocated on touch, so
 // there is nothing to map — the only job is to answer consistently, because a
 // libc computes its heap size from the difference between two calls.
+// readv, the mirror of writev. A libc that reads through an iovec looks like a
+// program that reads nothing at all without it.
+int64_t Syscalls::sys_readv(int fd, uint64_t iov, uint64_t cnt) {
+    int64_t total = 0;
+    for (uint64_t i = 0; i < cnt; ++i) {
+        const uint64_t base = mem_.read<uint64_t>(iov + i * 16);
+        const uint64_t len = mem_.read<uint64_t>(iov + i * 16 + 8);
+        if (!len) continue;
+        const int64_t got = sys_read(fd, base, len);
+        if (got < 0) return total ? total : got;
+        total += got;
+        if (static_cast<uint64_t>(got) < len) break;     // short read ends the vector
+    }
+    return total;
+}
+
 int64_t Syscalls::sys_brk(uint64_t addr) {
     if (addr && addr >= brk_start_) brk_ = addr;
     return static_cast<int64_t>(brk_);

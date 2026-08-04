@@ -55,6 +55,23 @@ void Cpu::exec_fp_simd(uint32_t insn) {
         if (opcode == 7 && rmode == 1 && sf && type == 2) { vreg[rd].hi = xr(rn); return; }
     }
 
+    // ---- DUP (scalar element), also written MOV Bd, Vn.B[i] --------------------
+    // The scalar sibling of DUP (element): one lane out of Vn into the bottom of Vd
+    // with the rest of the register zeroed, which is what "scalar" means here. Same
+    // imm5 encoding, different group — bits 28..24 are 11110 rather than 01110, so the
+    // vector pattern below correctly does not match it and it needs saying separately.
+    // libcorecrypto's AES key expansion reaches it immediately after AESE.
+    if ((insn & 0xFFE0FC00u) == 0x5E000400u) {
+        const unsigned imm5 = (insn >> 16) & 0x1F;
+        const unsigned rn = (insn >> 5) & 0x1F, rd = insn & 0x1F;
+        unsigned size = 0;
+        while (size < 4 && !((imm5 >> size) & 1)) ++size;
+        if (size >= 4) fail("reserved imm5 in scalar DUP", insn);
+        const unsigned esize = 1u << size, index = imm5 >> (size + 1);
+        vreg[rd] = {velem(vreg[rn], esize, index), 0};
+        return;
+    }
+
     // ---- DUP / INS / UMOV / SMOV ----------------------------------------------
     // imm5 encodes the element size *and* the index together: the lowest set bit
     // says which size, the bits above it are the index.

@@ -45,10 +45,120 @@ V128 make(uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
     return v;
 }
 
+// ---- AES ------------------------------------------------------------------
+//
+// The S-box is *computed* from its definition rather than written out: the
+// multiplicative inverse in GF(2^8) modulo x^8+x^4+x^3+x+1, then the affine map
+// b = s ^ rol(s,1) ^ rol(s,2) ^ rol(s,3) ^ rol(s,4) ^ 0x63. Two hundred and fifty-six
+// hex bytes copied by hand is exactly the kind of table that is wrong in one place and
+// produces ciphertext that looks like ciphertext. Generated, it can also be checked
+// against the four values everyone knows — S[0]=0x63, S[1]=0x7C, S[0x10]=0xCA,
+// S[0xFF]=0x16 — and against the round trip inv[S[x]] == x for all 256.
+
+uint8_t gmul(uint8_t a, uint8_t b) {          // GF(2^8) multiply, AES polynomial
+    uint8_t p = 0;
+    for (int i = 0; i < 8; ++i) {
+        if (b & 1) p ^= a;
+        const bool hi = (a & 0x80) != 0;
+        a = static_cast<uint8_t>(a << 1);
+        if (hi) a ^= 0x1B;
+        b = static_cast<uint8_t>(b >> 1);
+    }
+    return p;
+}
+
+struct AesTables {
+    uint8_t sbox[256] = {0}, inv_sbox[256] = {0};
+    AesTables() {
+        uint8_t inverse[256] = {0};
+        for (int x = 1; x < 256; ++x)
+            for (int y = 1; y < 256; ++y)
+                if (gmul(static_cast<uint8_t>(x), static_cast<uint8_t>(y)) == 1) {
+                    inverse[x] = static_cast<uint8_t>(y);
+                    break;
+                }
+        for (int x = 0; x < 256; ++x) {
+            const uint8_t s = inverse[x];           // inverse[0] stays 0, as AES defines
+            uint8_t b = s;
+            for (int r = 1; r <= 4; ++r)
+                b ^= static_cast<uint8_t>((s << r) | (s >> (8 - r)));
+            sbox[x] = static_cast<uint8_t>(b ^ 0x63);
+        }
+        for (int x = 0; x < 256; ++x) inv_sbox[sbox[x]] = static_cast<uint8_t>(x);
+    }
+};
+const AesTables& aes() { static const AesTables t; return t; }
+
+// The state is 16 bytes, column-major: byte i is row i%4 of column i/4. ShiftRows
+// rotates row r left by r columns, which as a byte permutation is this; the inverse
+// rotates right.
+constexpr uint8_t kShift[16]    = {0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11};
+constexpr uint8_t kInvShift[16] = {0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3};
+
+void get_bytes(const V128& v, uint8_t* out) {
+    for (int i = 0; i < 8; ++i) out[i] = static_cast<uint8_t>(v.lo >> (i * 8));
+    for (int i = 0; i < 8; ++i) out[8 + i] = static_cast<uint8_t>(v.hi >> (i * 8));
+}
+V128 put_bytes(const uint8_t* b) {
+    V128 v{};
+    for (int i = 0; i < 8; ++i) v.lo |= static_cast<uint64_t>(b[i]) << (i * 8);
+    for (int i = 0; i < 8; ++i) v.hi |= static_cast<uint64_t>(b[8 + i]) << (i * 8);
+    return v;
+}
+
+// MixColumns and its inverse, per column, with the standard coefficients.
+void mix_columns(uint8_t* s, bool inverse) {
+    for (int c = 0; c < 4; ++c) {
+        uint8_t* p = s + c * 4;
+        const uint8_t a0 = p[0], a1 = p[1], a2 = p[2], a3 = p[3];
+        if (!inverse) {
+            p[0] = gmul(a0, 2) ^ gmul(a1, 3) ^ a2 ^ a3;
+            p[1] = a0 ^ gmul(a1, 2) ^ gmul(a2, 3) ^ a3;
+            p[2] = a0 ^ a1 ^ gmul(a2, 2) ^ gmul(a3, 3);
+            p[3] = gmul(a0, 3) ^ a1 ^ a2 ^ gmul(a3, 2);
+        } else {
+            p[0] = gmul(a0, 14) ^ gmul(a1, 11) ^ gmul(a2, 13) ^ gmul(a3, 9);
+            p[1] = gmul(a0, 9) ^ gmul(a1, 14) ^ gmul(a2, 11) ^ gmul(a3, 13);
+            p[2] = gmul(a0, 13) ^ gmul(a1, 9) ^ gmul(a2, 14) ^ gmul(a3, 11);
+            p[3] = gmul(a0, 11) ^ gmul(a1, 13) ^ gmul(a2, 9) ^ gmul(a3, 14);
+        }
+    }
+}
+
 }  // namespace
 
 bool Cpu::exec_crypto(uint32_t insn) {
     const unsigned rm = (insn >> 16) & 0x1F, rn = (insn >> 5) & 0x1F, rd = insn & 0x1F;
+
+    // ---- Cryptographic AES: 0100 1110 00 10100 opcode 10 Rn Rd ---------------
+    //
+    // Four instructions that are *fragments* of a round, which is why no AES library
+    // could stand in for them: AESE is AddRoundKey + ShiftRows + SubBytes with the key
+    // in Vd, AESMC is MixColumns alone, and the round is composed by the caller. Note
+    // the order in the ARM pseudocode — the EOR happens first, and both AESE and AESD
+    // read *and* write Vd.
+    //
+    // libcorecrypto's `ccaes_arm_encrypt_key256` is what asked, 178,729 instructions
+    // into the macOS guest.
+    if ((insn & 0xFF3E0C00u) == 0x4E280800u) {
+        const unsigned opcode = (insn >> 12) & 0x1F;
+        if (opcode < 4 || opcode > 7) return false;
+        uint8_t st[16];
+        if (opcode == 4 || opcode == 5) {                    // AESE / AESD
+            uint8_t d[16], n[16];
+            get_bytes(vreg[rd], d);
+            get_bytes(vreg[rn], n);
+            for (int i = 0; i < 16; ++i) d[i] = static_cast<uint8_t>(d[i] ^ n[i]);
+            const uint8_t* perm = (opcode == 4) ? kShift : kInvShift;
+            const uint8_t* box  = (opcode == 4) ? aes().sbox : aes().inv_sbox;
+            for (int i = 0; i < 16; ++i) st[i] = box[d[perm[i]]];
+        } else {                                             // AESMC / AESIMC
+            get_bytes(vreg[rn], st);
+            mix_columns(st, opcode == 7);
+        }
+        vreg[rd] = put_bytes(st);
+        return true;
+    }
 
     // ---- Cryptographic two-register SHA: 0101 1110 size 10100 opcode 10 Rn Rd --
     if ((insn & 0xFF3E0C00u) == 0x5E280800u) {

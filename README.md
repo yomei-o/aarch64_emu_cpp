@@ -12,6 +12,9 @@ hello from aarch64
 $ ./aarch64emu --root guests/sysroot guests/sysroot/opt/python/bin/python3.13       -c "import sys, platform, hashlib; print(sys.version.split()[0], platform.machine());           print(hashlib.sha256(b'aarch64_emu_cpp').hexdigest())"
 3.13.14 aarch64
 bffb6fd92e8571ee9842b4be91c59556fa99d85a203350610620d876755b4110
+
+$ ./aarch64emu --root guests/macos guests/macos/hello
+hello from real macOS
 ```
 
 That is a stock CPython built for `aarch64-unknown-linux-musl`, **dynamically
@@ -154,18 +157,21 @@ packed, out of a 4.9 GB dyld shared cache, extracted by `tools/dsc_extract.c` on
 ```console
 $ sh prebuilt/unpack.sh
 $ ./aarch64emu --root guests/macos guests/macos/hello
-objc[1000]: -[OS_xpc_bundle dealloc]: unrecognized selector sent to instance 0x7f40001040a0
+hello from real macOS
 ```
 
-Not finished, and the message is the guest's own: **122,334 instructions** of Apple's code
-run — the libraries link, dyld's job is done by `src/macho_dyld.cpp`, initializers run in
-dyld's order, malloc and stdio come up over Mach IPC and the commpage, libobjc registers
-its images and realizes its classes, libxpc initialises, and real Objective-C objects are
-created and messaged. What stops it is one thing the extraction left behind: the shared
-cache's **selector table**. libobjc reads the cache's preoptimized metadata, so it expects
-the cache's uniqued selectors — and every table in libobjc's `objc_opt_t` header points
-into cache regions `dsc_extract` does not copy out. `resume.md` has the measurement and
-what to do about it.
+**That works.** 195,417 instructions of Apple's own arm64 code: 48 libraries from a real
+Mac's dyld shared cache map and link, the emulator does dyld's job
+(`src/macho_dyld.cpp`), initializers run in dyld's order, libSystem comes up over Mach IPC
+and the commpage, **libobjc registers its images and realizes its classes out of the
+cache's preoptimized tables**, libxpc initialises over a bootstrap port, libcorecrypto
+runs AES on the emulated crypto instructions, stdio decides whether stdout is a terminal —
+and then `main` returns and the host calls the guest's own `exit`, which is what flushes
+that line out.
+
+Nothing Apple ships is included: `prebuilt/` is the 48 libraries a hello world needs,
+extracted from a Mac's cache by `tools/dsc_extract.c`. What is *emulated* is everything
+between them and the kernel.
 
 ## Building
 

@@ -365,7 +365,28 @@ int main(int argc, char** argv) {
             cpu.sp = sp0;
             cpu.pc = start_pc ? start_pc : img.entry;
         }
-        cpu.run();
+        // An LC_MAIN entry point is `main`, and dyld's start calls `exit(main(...))`. The
+        // host is standing in for that start, so it has to do the same: give `main` a
+        // return address it can be recognised by, and when it comes back, call the guest's
+        // own `exit` with the result.
+        //
+        // Skipping it is not just a wrong status code. `exit` is what flushes stdio, so a
+        // guest that printed and returned normally produced **no output at all** — and the
+        // symptom was the emulator stopping at the *initializer* sentinel, because x30 still
+        // held whatever the last initializer ran with. That looked like a control-flow bug in
+        // the host and was really "main returned and nobody was there to catch it".
+        constexpr uint64_t kMainReturn = 0x0000'0000'DEAD'3000ull;
+        if (darwin) cpu.setx(30, kMainReturn);
+        while (!cpu.halted && cpu.pc != kMainReturn) cpu.step();
+        if (!cpu.halted && cpu.pc == kMainReturn && img.exit_fn) {
+            if (trace_sys)
+                std::fprintf(stderr, "[main] returned %d; calling exit at %012llX\n",
+                             static_cast<int>(cpu.xr(0)),
+                             static_cast<unsigned long long>(img.exit_fn));
+            cpu.pc = img.exit_fn;
+            cpu.setx(30, kMainReturn);          // exit does not return; if it does, stop
+            while (!cpu.halted && cpu.pc != kMainReturn) cpu.step();
+        }
         rc = cpu.exit_code;
     } catch (const CpuError& e) {
         std::fflush(stdout);

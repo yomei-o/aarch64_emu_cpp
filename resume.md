@@ -12,13 +12,16 @@ Working notes for picking the project back up. The README says what the emulator
     sh prebuilt/unpack.sh                # 48 macOS libraries, 21 MB packed
     ./aarch64emu --root guests/macos guests/macos/hello
 
-That runs **122,334 instructions of Apple's own arm64 code** and stops on an Objective-C
-message send. Everything up to that point works: the libraries load and link, the emulator
-does dyld's job, initializers run in dyld's order, malloc and stdio come up, libobjc
-registers its images and realizes its classes, and libxpc initialises. The open problem is
-the shared cache's **selector table**, which is not in the extracted libraries — item 1
-below has the measurement, and the conclusion is that the next move belongs in
-`dsc_extract` rather than in another dyld API slot.
+**That prints `hello from real macOS`.** 195,417 instructions of Apple's own arm64 code, from
+a real Mac's shared cache, on an x86 host. The libraries load and link, the emulator does
+dyld's job, initializers run in dyld's order, libSystem comes up over Mach IPC and the
+commpage, libobjc realizes its classes out of the cache's preoptimized tables, libxpc
+initialises over a bootstrap port, libcorecrypto runs AES on the emulated crypto
+instructions, and `main` returns to the host, which calls the guest's `exit` — the thing
+that flushes stdio, and without which the program printed nothing at all.
+
+The macOS milestone is **met**. What is left on that side is breadth rather than a wall:
+see "What to pick up".
 
 Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agree byte for
 byte over the whole macOS run, which is the best differential oracle here for anyone
@@ -101,8 +104,12 @@ What works:
 - FP and Advanced SIMD: scalar arithmetic/compare/convert/round/FMADD; the vector
   three-same, three-different, two-misc, across-lanes, permute and shift groups;
   DUP/INS/UMOV/SMOV, EXT, TBL/TBX, MOVI, XTN, REV, PMULL; LD1-LD4 including
-  de-interleaving, LD1R and the single-lane forms. SHA1 and SHA256 are implemented
-  exactly, in `crypto.cpp`, because hashlib uses them for real.
+  de-interleaving, LD1R and the single-lane forms; the narrowing right shifts and the
+  accumulate/round/insert shifts; MUL/PMUL, MLA/MLS, SABA, and the saturating and halving
+  add/subtract. **SHA1, SHA256 and AES** are implemented exactly, in `crypto.cpp`, because
+  hashlib and libcorecrypto use them for real — the AES S-box is *generated* from its
+  definition rather than transcribed, and the primitives are checked by composing them into
+  AES-128 and comparing against the FIPS-197 vector.
 - **Dynamic linking** by running the guest's own `ld.so`: map the program, map the
   interpreter, start at the interpreter's entry with AT_BASE/AT_ENTRY set. This
   needed a real mmap — MAP_FIXED honoured, file mappings at their offset, zero-fill
@@ -126,190 +133,23 @@ What works:
 
 ## ⏭ Next, in order
 
-1. **A real macOS binary — 122,334 instructions in, and the wall is now a message send.**
-   This is the live front, and the guest tree for it is committed:
+1. ✅ **A real macOS binary runs.** `hello from real macOS`, 195,417 instructions, exit 0.
+   The account of how the last walls fell is in "How the macOS milestone was reached" below,
+   because every one of them was a case of the host telling the guest something almost true.
 
-       sh prebuilt/unpack.sh                # 48 files, 85 MB unpacked, 21 MB packed
-       ./aarch64emu --root guests/macos guests/macos/hello
+   What is left on that side is breadth, not a wall:
 
-   The guest gets through malloc, stdio, libobjc's image registration *and libxpc's
-   initializer*, creates real Objective-C objects, and stops on:
+   - **A guest that does more than print.** This one is a C hello world. The next
+     interesting ones are a program that uses Foundation (needs CoreFoundation and
+     Foundation extracted, which `dsc_extract` can do), and one that spawns a thread on
+     Darwin (`bsdthread_create` is not implemented; the Linux side's scheduler is).
+   - **`--strict` still finds one thing on this guest**: an unmapped read at address 0x10,
+     141,988 instructions in — benign in permissive mode, so it is a real question about
+     which structure is missing a pointer rather than something that stops the run.
+   - **The dyld API slots still answered with zero** are listed further down. Most are
+     honest zeros now; `_dyld_lookup_section_info` (111) is called constantly and makes
+     libobjc fall back to walking load commands, which works but costs 16% of the run.
 
-       objc[1000]: -[OS_xpc_bundle dealloc]: unrecognized selector sent to instance ...
-
-   **What got it here, and what each answer was worth.** Both were cases of the guest
-   being told nothing where something true was available:
-
-   - `_dyld_get_shared_cache_range` (slot 63) → **78,474 to 87,374**, and
-     `Attempt to use unknown class 0x1ee40b2e0` is gone. Answering zero had said "no
-     shared cache" while slot 118 handed libobjc the cache's own optimisation header and
-     the class objects it reads are in cache form; libobjc checks whether an address is in
-     the cache before it will read the data there that way. `objc::SafeRanges::add` is the
-     first thing it does with the answer. The range is measured from the images (they keep
-     the addresses the cache gave them), excluding the main executable at 0x100000000 —
-     0x180078000..0x288CF0000 here.
-   - MIG **3409** `task_get_special_port` → **87,374 to 122,334**. libxpc's initializer
-     wants TASK_BOOTSTRAP_PORT and traps without it, in `_libxpc_initializer.cold.1`, with
-     no output: the message is in the library, at the ADRP/ADD two instructions before the
-     BRK — `Kernel bug: Could not obtain task bootstrap port.`
-
-   **And a trap worth knowing about: these slots are C++ virtual methods.** x0 is `this`
-   and the arguments start at x1. Writing slot 63's out-parameter through x0 overwrote the
-   dyld API object's own vtable pointer, and the next dispatch branched to PC 0 — reported
-   as an unimplemented FP/SIMD instruction 60,000 instructions before the mistake. Slot
-   107 already read x1 for this reason; slot 118 takes no arguments and hid it.
-
-   ### Correction: the cache's ObjC tables *are* extracted, in `__OBJC_RO`
-
-   **The section below is wrong and is kept because the mistake is instructive.** It
-   concluded that the ObjC optimisation tables are outside the extracted libraries and that
-   the next move needs a Mac. It reached that by checking whether each offset in the
-   `objc_opt_t` header lands inside the 16 KiB `__TEXT,__objc_opt_ro` *section* — which none
-   of them do — and stopping there. They land in libobjc's `__OBJC_RO` and `__OBJC_RW`
-   *segments*, which `dsc_extract` copies out like any other, and which are right there in
-   the file:
-
-       segment __OBJC_RO   0x1FAFEF4A8..0x1FED531B8   (~50 MB)
-       segment __OBJC_RW   0x1EE1B4000..0x1EE40B240
-
-       selopt             0x1FDA53BD8  __OBJC_RO  a hash table header
-       headeropt_ro       0x1FAFEF4A8  __OBJC_RO  version 0x0AEF, 24 headers
-       headeropt_rw       0x1EE1B4000  __OBJC_RW
-       relMethodSelBase   0x1FB005290  __OBJC_RO  "…\0_isDeallocating\0isFault\0_ob…"
-
-   That last one settles it: the address `relativeMethodSelectorBaseAddress` points at holds
-   **the coalesced selector strings** — the pool every small method list in the cache names
-   its selectors as offsets into. Nothing is missing and no Mac is needed.
-
-   The lesson is the one this file already states twice, applied to itself: *measure the
-   thing, not a proxy for it.* "Is the offset inside this section" was a proxy for "is the
-   table in the file", and it answered no while the answer was yes.
-
-   **Slot 84 is implemented now, and it did not move the wall.** It answers from a name →
-   address map built by walking the pool, which is verified correct — `alloc` comes back as
-   0x1FB005316, the same address the file says. What it revealed is where the mismatch is
-   *not*: libobjc asks for exactly **18** selectors, all of them its own built-ins
-   (`_isDeallocating`, `alloc`, `release`, `retain`, `.cxx_construct`, …), and **`dealloc` is
-   not among them**. So `sel_registerName` is not the path that produces the wrong SEL, and
-   the disagreement is in how libobjc reads a *method list*, not in how it uniques a name.
-
-   That measurement has now been made, and it says the send side is right and the class side
-   is empty:
-
-   - libxpc's selref for `dealloc`, at 0x1E7FEF020, holds **0x1FB0052CB** — the pool address,
-     the same one slot 84 returns. The send is using the correct SEL.
-   - `--watch` on 0x1FB0052CB shows the string being read only byte-by-byte by `strcmp`,
-     from the error path. Nothing compares it as a selector.
-   - **`OS_xpc_bundle`'s `ro->baseMethods` is 0.** The class has no method list in the image
-     at all. In a shared cache that is normal: the builder merges a class's methods — and its
-     categories — into a preoptimized `class_rw_t`, and the image keeps nothing.
-
-   So the missing `dealloc` is not missing from a list that is being misread. Where it is
-   was settled by four more measurements, and the answer is that **it is nowhere in the
-   image**:
-
-   - `OS_xpc_bundle`'s `ro->baseMethods` is 0, as above.
-   - libxpc has **no `__objc_catlist` at all**, so it is not in a category either.
-   - `OPTIMIZED_BY_DYLD` is **set** in all eight ObjC images (this file said it was cleared;
-     it is not). Clearing it in all eight changes nothing — same instruction count, same
-     message — so libobjc is not gated on it here. Nor is `IsProduction`: the `objc_opt_t`
-     flags are 6 (NoMissingWeakSuperclasses | LargeSharedCache) and setting bit 0 changes
-     nothing either.
-   - `headeropt_ro` is right and complete: **2,799 entries**, entry 0 being libobjc at
-     0x180078000 — the same addresses the loader uses, so the cache's header table covers
-     these images exactly.
-   - **`headeropt_rw` is read, 178 times, and returns zeros.** Those zeros are correct: the
-     file has the header (count 0x0AEF, entsize 8) and nothing else, because the rw half is a
-     region **dyld populates at launch** rather than something the cache ships.
-
-   So the remaining work is not another dyld answer. It is the one thing real dyld does for
-   ObjC that this host does not: **build the preoptimized `class_rw_t` entries**. The inputs
-   are extracted and their addresses are known —
-   `largeSharedCachesClassOffset` → 0x1FE753FF8, `largeSharedCachesProtocolOffset` →
-   0x1FEBBE4C8, `selopt` → 0x1FDA53BD8, and the selector pool the host already walks. A class
-   whose methods the builder merged away has them there, keyed by name, and `dealloc` on
-   `OS_xpc_bundle` is exactly such a class.
-
-   That is a real piece of work rather than a slot to fill, and it is the honest end of this
-   line: everything cheaper has been tried and measured. The alternative remains the one this
-   file has always named — make the images ordinary rather than cache ones, which means
-   rewriting class metadata at extraction time in `dsc_extract`, and which has the same
-   inputs.
-
-   ### The old section, wrong in its conclusion, still right in its measurements
-
-   `unrecognized selector` is the *other* half of claiming a shared cache. libobjc now
-   reads the cache's preoptimized metadata, which means it expects the cache's **uniqued
-   selectors**, which it asks dyld for through `_dyld_get_objc_selector` (slot 84). That
-   cannot be answered from what is extracted, and here is the measurement rather than the
-   argument. libobjc's `objc_opt_t` header, in `__TEXT,__objc_opt_ro` at 0x1800BFAE0
-   (16 KiB), reads:
-
-       version                        0x10 (16)
-       flags                          0x6   = NoMissingWeakSuperclasses | LargeSharedCache
-       selopt_offset                  -> 0x1FDA53BD8   OUTSIDE the section
-       headeropt_ro_offset            -> 0x1FAFEF4A8   OUTSIDE
-       headeropt_rw_offset            -> 0x1EE1B4000   OUTSIDE
-       largeSharedCachesClassOffset   -> 0x1FE753FF8   OUTSIDE
-       largeSharedCachesProtocolOffset-> 0x1FEBBE4C8   OUTSIDE
-       relativeMethodSelectorBase     -> 0x1FB005290   OUTSIDE
-
-   So the earlier note in this file — "that table is not lost, it lives inside libobjc" —
-   is true only of the **header**. Every table it points at is in the cache's shared
-   read-only region, which `dsc_extract` does not extract; and `LargeSharedCache` being set
-   means small method lists name their selectors as offsets from
-   `relativeMethodSelectorBaseAddress`, which is one of the missing regions.
-
-   A name→address scan cannot substitute for the table: selector strings are **not**
-   coalesced across the extracted set. `dealloc` exists at five addresses
-   (0x1800CB40C, 0x1801B655B, 0x1801D1EF7, 0x1803001CE, 0x1921AF348), and only the cache's
-   selopt says which one the method lists mean.
-
-   **So the next move is `dsc_extract`, and it needs a Mac again** (or a copy of a cache):
-   extract the regions those six offsets point into, and map them at their cache addresses
-   like everything else. That is the same trick that already works for the libraries — the
-   addresses are absolute, so keeping them is enough — and it would let slots 84/85/96/97
-   be answered from the real tables instead of guessed at.
-
-   The alternative is still the opposite direction: stop claiming a cache and make libobjc
-   unique the selectors itself. That needs the class `bits` fields *and* the small method
-   lists rewritten into non-cache form at extraction time, which is a bigger job than
-   extracting six regions, and also lands in `dsc_extract`.
-
-   **The dyld API slots still answered with zero**, with what is now known about each
-   (`tools/dyld_slots.py guests/macos/usr/lib/system/libdyld.dylib` names them):
-
-       44  _dyld_get_image_slide          0 is correct: cache addresses, no slide
-       51  dyld_process_is_restricted     0 is correct
-       61  _dyld_is_memory_immutable      0 is conservative; called from libobjc's addMethod
-       69  dyld_sdk_at_least              0 = false, which enables libobjc's legacy paths
-       71  dyld_program_sdk_at_least      0 = false, same
-       84  _dyld_get_objc_selector        needs the cache's selopt -- see above
-       85  _dyld_for_each_objc_class      same table
-       88  _dyld_is_objc_constant         same
-       96  _dyld_visit_objc_classes       same
-       97  _dyld_objc_class_count         0 is consistent: no preoptimized class table, so
-                                          libobjc realizes classes itself, which it does
-       111 _dyld_lookup_section_info      0 makes libobjc fall back to getsegmentdata,
-                                          which works -- 16% of the run is spent there
-       117 _dyld_for_objc_header_opt_rw   answered with a zeroed 1 MiB region; not called
-
-   Everything before that works: 45 libraries map and link, the GOT slots the cache
-   leaves null get bound, initializers run in dyld's order, `os_alloc_once` allocates
-   through a real `mach_vm_map`, libpthread gets its host info over Mach IPC and its
-   cookies out of `apple[]`, and malloc and stdio both initialise — the guest's own
-   `assert` reached the terminal through the emulated `write`, which is how the
-   initializer ordering bug announced itself.
-
-   Answered so far, each found by the guest naming it: MIG `host_info`
-   (HOST_BASIC_INFO, HOST_PRIORITY_INFO), `_host_page_size`, `host_get_clock_service`,
-   `semaphore_create`/`_destroy`, `task_restartable_ranges_register`; Mach traps for VM
-   and ports and `mach_msg2`; syscalls `sigaction`, `sigprocmask`, `__pthread_sigmask`,
-   `__pthread_kill`, `bsdthread_ctl`, `bsdthread_register` (which must return xnu's real
-   feature word — zero is fatal), `__semwait_signal`, `__sysctl`; and dyld API vtable
-   slot 66 (`_dyld_get_active_platform`). Slots 1, 8, 44, 51, 61, 69, 71 and 84 are
-   called and answered with zero, from malloc's and stdio's initialisers -- worth
-   identifying if something downstream looks wrong.
 2. **arm64e chained pointers.** Only `DYLD_CHAINED_PTR_64` and `_64_OFFSET` are
    implemented. Cache libraries do not use them (they are pre-linked), so this has
    not yet bitten; a third-party arm64e dylib would. The emulator can ignore the
@@ -332,7 +172,7 @@ What works:
    makes no wild accesses at all. Only *guest* accesses are checked; `Memory::map()` is how
    the host declares the regions it synthesises.
 
-## What running a real macOS binary needed, in the order it was needed
+## How the macOS milestone was reached, in the order it was needed
 
 Kept because every one of these was invisible until the guest was several hundred
 instructions past it, and each looked like a different problem than it was.

@@ -24,6 +24,10 @@ struct LoadedImage {
     // dyld, the host has to stand in for it.
     uint64_t dyld_gapis = 0;
     uint64_t objc_opt_ro = 0;
+    // The guest's own `exit`, for when an LC_MAIN entry point returns — see the note in
+    // macho_dyld.cpp. Without calling it, a program that printed and returned prints
+    // nothing, because `exit` is what flushes stdio.
+    uint64_t exit_fn = 0;
     // The span the cache-derived libraries occupy, for `_dyld_get_shared_cache_range`.
     // They keep the addresses the cache assigned them, so this really is where the cache
     // was mapped — measured from the images rather than written down, because a different

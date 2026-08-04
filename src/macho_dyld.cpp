@@ -560,6 +560,17 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
         }
     }
 
+    // `exit`, because the host has to stand in for the rest of dyld's start: an
+    // `LC_MAIN` entry point is `main`, and what calls it is expected to call `exit` with
+    // whatever it returned. That matters for more than the status — `exit` is what flushes
+    // stdio, so a guest that printed and returned normally produces *no output at all*
+    // without this. Resolved through the same re-export-following lookup as any bind,
+    // because `_exit` lives in libsystem_c and reaches the program through libSystem.
+    for (const MachoImage& img : images) {
+        const uint64_t a = lookup_in(img, "_exit", 0);
+        if (a) { out->exit_fn = a; break; }
+    }
+
     // An absent library is a warning, not a failure. dyld would have loaded it, but
     // what matters here is whether anything actually *binds* to it -- and a guest
     // extracted from a shared cache will always be missing libraries it never calls.

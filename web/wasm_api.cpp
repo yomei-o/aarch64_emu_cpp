@@ -78,12 +78,22 @@ EMSCRIPTEN_KEEPALIVE int emu_run(const char* path, const char* argz, const char*
     constexpr uint64_t kMmapBase = 0x0000'7F40'0000'0000ull;
     constexpr uint64_t kStackTop = 0x0000'7FFF'FFFF'F000ull;
 
+    // ELF or Mach-O, decided by what the bytes are. The Darwin guest then takes a
+    // different loader and a different initial stack; the CPU underneath is the same.
+    const bool darwin = is_macho(file);
+
     LoadedImage img;
     std::string err;
-    if (!load_elf(file, mem, kPieBase, &img, &err)) { g_error = err; return -1; }
+    if (darwin) {
+        if (!load_macho(file, mem, 0, &img, &err)) { g_error = err; return -1; }
+        if (!img.interp.empty()) {
+            g_error = "dynamically linked Mach-O needs Apple's dyld, which is not supplied";
+            return -1;
+        }
+    } else if (!load_elf(file, mem, kPieBase, &img, &err)) { g_error = err; return -1; }
 
     uint64_t interp_base = 0, start_pc = 0;
-    if (!img.interp.empty()) {
+    if (!darwin && !img.interp.empty()) {
         std::string ip = img.interp;
         if (root && *root && ip[0] == '/') ip = std::string(root) + ip;
         const std::vector<uint8_t> ifile = read_file(ip);
@@ -103,7 +113,8 @@ EMSCRIPTEN_KEEPALIVE int emu_run(const char* path, const char* argz, const char*
     };
 
     mem.set(kStackTop - (1u << 20), 0, 1u << 20);
-    cpu.sp = build_stack(mem, kStackTop, img, interp_base, argv, env);
+    cpu.sp = darwin ? build_stack_darwin(mem, kStackTop, argv[0], argv, env)
+                    : build_stack(mem, kStackTop, img, interp_base, argv, env);
     cpu.pc = start_pc ? start_pc : img.entry;
     sys.set_brk(img.brk);
     sys.set_mmap_base(kMmapBase);
@@ -112,7 +123,7 @@ EMSCRIPTEN_KEEPALIVE int emu_run(const char* path, const char* argz, const char*
 
     {
         char buf[160];
-        std::snprintf(buf, sizeof buf, "entry %llX%s",
+        std::snprintf(buf, sizeof buf, "%s entry %llX%s", darwin ? "Mach-O" : "ELF",
                       static_cast<unsigned long long>(cpu.pc),
                       img.interp.empty() ? " (static)" : " (via the dynamic loader)");
         js_log(buf);

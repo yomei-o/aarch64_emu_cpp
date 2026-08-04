@@ -41,8 +41,10 @@ No dependencies beyond a C++17 standard library.
 | **Dynamic linking** — the real `ld-musl-aarch64.so.1` loads and relocates | ✅ |
 | Signal delivery (SIGILL frames, `rt_sigreturn`) | ✅ |
 | **A stock CPython 3.13 for ARM64 Linux** | ✅ |
-| Mach-O and Darwin syscalls (Apple Silicon guests) | ❌ planned |
+| **Mach-O loading and Darwin syscalls** (Apple Silicon guests) | ✅ static binaries |
 | **WebAssembly** — the same guests, in a browser tab | ✅ |
+| Threads (`clone`) | ❌ planned |
+| Dynamically linked Mach-O (needs Apple's `dyld`) | ❌ planned |
 
 ## Correctness is a diff, not an opinion
 
@@ -55,9 +57,24 @@ byte.
 $ sh tests/run_tests.sh
 ok   arith
 ok   control
+ok   file
 ok   hello
 ok   mem
-4 passed, 0 failed
+5 passed, 0 failed
+```
+
+The **same sources** are then built a third time, as arm64 **Mach-O**, and run
+against the same host oracle — so the Darwin personality is held to the Linux one's
+answers rather than to its own:
+
+```console
+$ sh tests/run_macho.sh
+ok   macho arith
+ok   macho control
+ok   macho file
+ok   macho hello
+ok   macho mem
+5 passed, 0 failed
 ```
 
 And a second suite runs a **real** guest — Alpine's static aarch64-musl busybox, a
@@ -98,11 +115,12 @@ dynamically linked one runs too, because the guest's own `ld.so` does the linkin
 $ sh web/build.sh          # needs emscripten
 $ node web/test_node.mjs
 ok   wasm: hello.elf
+ok   wasm: hello.macho (Darwin)
 ok   wasm: busybox echo
 ok   wasm: busybox uname
 ok   wasm: busybox sha256sum
 ok   wasm: cpython
-5 passed, 0 failed
+6 passed, 0 failed
 ```
 
 That last line is CPython 3.13 for ARM64 Linux, dynamically linked, running inside
@@ -138,6 +156,31 @@ sh tests/run_tests.sh
   new program: argv, envp, and the auxiliary vector a libc reads before `main`.
 - `src/syscalls.cpp` — the kernel interface, AArch64's "generic" numbering (write
   is 64, not 1).
+- `src/macho_loader.cpp`, `src/darwin.cpp` — the second personality. Not a fork of
+  the first: the same CPU, the same memory, the same file layer, reached through
+  `svc #0x80` instead of `svc #0`.
+
+## Two kernels, one build
+
+An ELF guest traps with `svc #0`; a Mach-O guest traps with `svc #0x80`. That is
+the whole personality switch — the immediate itself selects which kernel answers,
+so both guests run in the same binary with no mode flag anywhere.
+
+Darwin then differs in three ways that all matter:
+
+- the syscall number is in **x16**, not x8, and it is BSD numbering (write is 4);
+- **negative** numbers in x16 are Mach traps, an entirely separate table;
+- errors come back in the **carry flag** — C set, positive errno in x0 — where
+  Linux returns a negative errno. This is the dangerous one: get it wrong and a
+  failed `open` returns a small positive number, which reads as a perfectly good
+  file descriptor. `tests/file.c` opens something that is not there for exactly
+  this reason, and the guest-side wrapper reads the flag back with `cset`.
+
+`LC_LOAD_DYLINKER` is present on every Mach-O executable, including one linked
+`-nostdlib` that imports nothing, so it cannot be the test for "needs a loader".
+The loader instead asks whether there is anything for dyld to *do* — any dylib,
+any bind opcode, any chained fixup — and runs the entry point directly when there
+is not, which is where dyld would arrive anyway.
 
 ## Two things about A64 that bite
 

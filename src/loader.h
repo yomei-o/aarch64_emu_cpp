@@ -31,4 +31,20 @@ uint64_t build_stack(Memory& mem, uint64_t stack_top, const LoadedImage& img,
                      const std::vector<std::string>& argv,
                      const std::vector<std::string>& envp);
 
+// ---- Mach-O, for Apple Silicon guests (macho_loader.cpp) --------------------
+
+bool is_macho(const std::vector<uint8_t>& f);
+
+// `slide` is where to place a position-independent image (MH_PIE); a fixed-address
+// executable says where it wants to live and the slide is ignored for it in
+// practice, because its __TEXT vmaddr is absolute.
+bool load_macho(const std::vector<uint8_t>& f, Memory& mem, uint64_t slide,
+                LoadedImage* out, std::string* err);
+
+// Darwin's initial stack: argc, argv[], NULL, envp[], NULL, apple[], NULL. The
+// `apple` vector replaces Linux's auxiliary vector and carries the executable path.
+uint64_t build_stack_darwin(Memory& mem, uint64_t stack_top, const std::string& exe_path,
+                            const std::vector<std::string>& argv,
+                            const std::vector<std::string>& envp);
+
 }  // namespace a64

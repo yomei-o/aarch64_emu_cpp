@@ -14,10 +14,11 @@ Everything below is ordered by what that needs.
 Four suites, all differential — the oracle is always the host, never a recorded
 file:
 
-    sh tests/run_tests.sh      4 passed   freestanding C, built twice and diffed
+    sh tests/run_tests.sh      5 passed   freestanding C, built twice and diffed
+    sh tests/run_macho.sh      5 passed   the same sources as arm64 Mach-O
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     5 passed   CPython 3.13, dynamically linked
-    node web/test_node.mjs     5 passed   the same guests under WebAssembly
+    node web/test_node.mjs     6 passed   the same guests under WebAssembly
 
 What works:
 
@@ -36,15 +37,27 @@ What works:
   instruction or system register, and `rt_sigreturn`.
 - A file layer with directory descriptors and `getdents64`, and the syscalls
   busybox and CPython need.
+- **Mach-O and Darwin, for static binaries.** `macho_loader.cpp` handles
+  `LC_SEGMENT_64` / `LC_MAIN` / `LC_UNIXTHREAD` and skips `__PAGEZERO`;
+  `darwin.cpp` is the BSD syscall table plus the cheap Mach traps, reached through
+  `svc #0x80`. Both run under WebAssembly too.
 - **WebAssembly** (`web/`), running all of the above.
 
 ## ⏭ Next, in order
 
-1. **Mach-O and Darwin** — Apple Silicon guests. Mach-O arm64 loading (`LC_SEGMENT_64`,
-   `LC_MAIN`, chained fixups), `svc #0x80` with the BSD syscall numbering, the commpage
-   and `mach_absolute_time`. A second personality *alongside* the Linux one in
-   `syscalls.cpp`, selected by the image format — not a fork of it. The CPU is done;
-   this is all kernel interface.
+1. **Dynamically linked Mach-O.** The hard half of the Darwin milestone is still
+   open, and it is hard for a reason that is not technical: a real macOS binary
+   links against `/usr/lib/dyld` and the dylibs in the shared cache, and neither is
+   a file you can obtain without a Mac. Two ways forward, and the second is
+   probably right:
+   - map the real dyld and the real dyld shared cache from a Mac (needs
+     `LC_DYLD_CHAINED_FIXUPS`, `shared_region_check_np`, and a lot of Mach);
+   - or *be* the loader for chained fixups only, and stub the handful of libSystem
+     entry points a plain program actually calls. Much less faithful, but it does
+     not need a Mac in the loop.
+   Either way the next concrete step is a **static** Mach-O built against a real
+   libc, which is `clang -static` on a Mac — worth getting one binary of that to
+   test against before touching dyld at all.
 2. **Threads.** `clone` is unimplemented, so anything that starts one stops. CPython
    only needs it once you `import threading`; the sibling x86 project has the shape to
    copy (per-thread stacks, a scheduler that runs one at a time).
@@ -83,3 +96,20 @@ What works:
   fixed-width types only — otherwise a diff means nothing.
 - Load/store exclusive is a plain load/store and always succeeds. Single-threaded,
   so nothing observes the difference; a threaded guest would need a real monitor.
+- **Darwin reports errors in the carry flag**, not as a negative return. Forgetting
+  it is not a failed syscall, it is a *wrong answer*: `open` of a missing file comes
+  back as 2, which is a valid file descriptor. `tests/file.c` exists to catch this,
+  and the guest wrapper in `harness.h` reads the flag with `cset` rather than
+  trusting the sign.
+- **`LC_LOAD_DYLINKER` is on every Mach-O executable**, even `-nostdlib` ones with
+  no imports at all, so it cannot mean "needs dyld". The loader tests for actual
+  work instead: an `LC_LOAD_DYLIB`, a non-zero bind size in `LC_DYLD_INFO_ONLY`, or
+  a non-empty `LC_DYLD_CHAINED_FIXUPS`.
+- **Darwin's `struct stat64` is 144 bytes and shares no offsets with Linux's**, so
+  `darwin.cpp` translates the buffer `Files` fills rather than copying it. Only
+  mode, nlink, size, blocks and blksize are carried across; if a guest ever branches
+  on a timestamp, that is where to add it.
+- **Darwin's open flags are not Linux's** above `O_ACCMODE`: `O_CREAT` is 0x0200,
+  not 0x40. Passing them through unchanged silently asks for something else.
+- The Mach-O test build needs `-fno-stack-protector` — the Darwin target turns it
+  on by default and there is no libc here to supply `__stack_chk_guard`.

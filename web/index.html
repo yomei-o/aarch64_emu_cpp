@@ -41,7 +41,7 @@
   <div id="status">loading the emulator…</div>
 
   <div class="drop" id="drop">
-    <b>Drop an AArch64 Linux ELF here</b> or click to choose<br>
+    <b>Drop an AArch64 Linux ELF, or an arm64 macOS Mach-O, here</b> or click to choose<br>
     <span style="font-size:12.5px">Static binaries need nothing else. A dynamically linked one also
     needs its loader and libraries — drop those too and they go into the same virtual filesystem.</span>
     <input type="file" id="file" multiple hidden>
@@ -101,9 +101,20 @@ function isElf(bytes) {
 }
 // EM_AARCH64 is 183, at offset 18 of the header.
 function isAarch64(bytes) { return isElf(bytes) && (bytes[18] | (bytes[19] << 8)) === 183; }
+// MH_MAGIC_64 is FEEDFACF little-endian; cputype CPU_TYPE_ARM64 is 0x0100000C at
+// offset 4, and filetype MH_EXECUTE is 2 at offset 12.
+function isMachoArm64(bytes) {
+  if (bytes.length < 32) return false;
+  // >>> 0 because the shifts above produce a *signed* 32-bit value, and 0xfeedfacf
+  // is negative in that reading -- the comparison would silently never match.
+  const u32 = o => (bytes[o] | (bytes[o+1] << 8) | (bytes[o+2] << 16) | (bytes[o+3] << 24)) >>> 0;
+  return u32(0) === 0xfeedfacf && u32(4) === 0x0100000c && u32(12) === 2;
+}
 // ET_EXEC (2) or ET_DYN (3) with an entry point: a PIE library has type 3 too, so
 // the distinction that matters for "can I run this" is made by the loader.
-function looksRunnable(bytes) { return isAarch64(bytes) && (bytes[16] === 2 || bytes[16] === 3); }
+function looksRunnable(bytes) {
+  return (isAarch64(bytes) && (bytes[16] === 2 || bytes[16] === 3)) || isMachoArm64(bytes);
+}
 
 async function addFiles(list) {
   for (const f of list) {

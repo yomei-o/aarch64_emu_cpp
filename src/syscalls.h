@@ -34,6 +34,10 @@ public:
 
 private:
     bool svc(uint32_t imm);
+    // The Darwin personality, in darwin.cpp. Reached through `svc #0x80`, which is
+    // how a Mach-O guest traps -- so the two kernels coexist in one build and are
+    // told apart at the instruction rather than by a mode flag.
+    bool svc_darwin();
     int64_t sys_write(int fd, uint64_t buf, uint64_t len);
     int64_t sys_read(int fd, uint64_t buf, uint64_t len);
     int64_t sys_writev(int fd, uint64_t iov, uint64_t cnt);

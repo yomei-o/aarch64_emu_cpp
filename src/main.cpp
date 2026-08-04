@@ -77,9 +77,19 @@ int main(int argc, char** argv) {
     // mmap that caused it.
     constexpr uint64_t kMmapBase = 0x0000'7F40'0000'0000ull;
 
+    // Two guest personalities, chosen by what the file actually is. A Mach-O takes
+    // the Darwin path from here on: a different loader, a different initial stack,
+    // and `svc #0x80` instead of `svc #0` at run time.
+    const bool darwin = is_macho(file);
+
     LoadedImage img;
     std::string err;
-    if (!load_elf(file, mem, kPieBase, &img, &err)) {
+    if (darwin) {
+        if (!load_macho(file, mem, 0, &img, &err)) {
+            std::fprintf(stderr, "aarch64emu: %s\n", err.c_str());
+            return 1;
+        }
+    } else if (!load_elf(file, mem, kPieBase, &img, &err)) {
         std::fprintf(stderr, "aarch64emu: %s\n", err.c_str());
         return 1;
     }
@@ -92,7 +102,18 @@ int main(int argc, char** argv) {
     // model wrong in some new way; running the real one is both less work and more
     // faithful.
     uint64_t start_pc = 0, interp_base = 0;
-    if (!img.interp.empty()) {
+    if (darwin && !img.interp.empty()) {
+        // A Mach-O naming /usr/lib/dyld wants Apple's loader, and dyld is not a
+        // file you can supply from outside a Mac. Say so plainly rather than
+        // starting and failing somewhere unrecognisable.
+        std::fprintf(stderr,
+                     "aarch64emu: %s is dynamically linked against %s.\n"
+                     "            Only statically linked Mach-O is supported so far;\n"
+                     "            build with -static or -nostdlib.\n",
+                     argv[i], img.interp.c_str());
+        return 1;
+    }
+    if (!darwin && !img.interp.empty()) {
         std::string ipath = img.interp;
         if (!root.empty() && root != "." && !ipath.empty() && ipath[0] == '/') ipath = root + ipath;
         const std::vector<uint8_t> ifile = read_file(ipath.c_str());
@@ -140,7 +161,8 @@ int main(int argc, char** argv) {
     // address; it only has to be far from the image and the mmap arena.
     constexpr uint64_t kStackTop = 0x0000'7FFF'FFFF'F000ull;
     mem.set(kStackTop - (1u << 20), 0, 1u << 20);           // touch a MiB so it is there
-    cpu.sp = build_stack(mem, kStackTop, img, interp_base, guest_argv, guest_env);
+    cpu.sp = darwin ? build_stack_darwin(mem, kStackTop, guest_exe, guest_argv, guest_env)
+                    : build_stack(mem, kStackTop, img, interp_base, guest_argv, guest_env);
     cpu.pc = start_pc ? start_pc : img.entry;
     sys.set_brk(img.brk);
     sys.exe_path = guest_exe;

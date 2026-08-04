@@ -34,7 +34,10 @@ Syscalls::Syscalls(Cpu& cpu, Memory& mem) : cpu_(cpu), mem_(mem) {
 }
 
 bool Syscalls::svc(uint32_t imm) {
-    if (imm != 0) {   // Linux uses svc #0; anything else is a different personality
+    // Linux traps with `svc #0`, Darwin with `svc #0x80`. The immediate is the
+    // personality selector, so a Mach-O guest and an ELF guest need no mode flag.
+    if (imm == 0x80) return svc_darwin();
+    if (imm != 0) {
         cpu_.setx(0, static_cast<uint64_t>(kENOSYS));
         return true;
     }

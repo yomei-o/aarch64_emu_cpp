@@ -63,6 +63,16 @@ const check = (name, want, got) => {
 put('/hello.elf', path.join(root, 'tests/hello.elf'));
 check('wasm: hello.elf', 'hello from aarch64\n', run('/hello.elf', []).out);
 
+// ---- the same program as an arm64 Mach-O, which exercises the Darwin personality:
+// a different loader, a different initial stack, and `svc #0x80` with BSD numbering.
+const macho = path.join(root, 'tests/hello.macho');
+if (fs.existsSync(macho)) {
+  put('/hello.macho', macho);
+  check('wasm: hello.macho (Darwin)', 'hello from aarch64\n', run('/hello.macho', []).out);
+} else {
+  console.log('skip mach-o (run tests/run_macho.sh first)');
+}
+
 // ---- busybox, if it has been fetched
 const bb = path.join(root, 'guests/busybox');
 if (fs.existsSync(bb)) {

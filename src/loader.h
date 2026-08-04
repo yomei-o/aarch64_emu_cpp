@@ -38,6 +38,13 @@ struct LoadedImage {
     // nothing else in the emulator has the list.
     std::vector<std::string> image_paths;
     std::vector<uint64_t> image_headers;
+    // Every mapped segment, with the image it belongs to, so an address can be attributed
+    // to the image containing it. Segments and not [header, end): a cache-extracted library
+    // keeps the cache's addresses, and those are *scattered* — libobjc's __TEXT is at
+    // 0x180078000 and its __LINKEDIT at 0x1FED6C000, so a range from the header to the
+    // highest segment swallows half the address space and every other library in it.
+    struct ImageSeg { uint64_t lo = 0, hi = 0, header = 0; };
+    std::vector<ImageSeg> image_segs;
 };
 
 // `base` is where to place an ET_DYN (PIE or shared object) image; ignored for

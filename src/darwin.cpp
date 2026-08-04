@@ -217,9 +217,33 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // PLATFORM_UNKNOWN, and libSystem branches on it.
         case 66: return 1;
         // _dyld_get_prog_image_header: the main executable's mach_header. Zero is simply
-        // wrong -- it is the one image whose address is never in doubt.
-        case 94:
-            return static_cast<int64_t>(objc_image_headers_.empty() ? 0 : prog_header_);
+        // wrong -- it is the one image whose address is never in doubt. (Nothing in this
+        // guest calls it; the slot below is what libsystem_c uses instead.)
+        case 94: return static_cast<int64_t>(prog_header_);
+        // The mach_header of the image *containing an address*, which is how libsystem_c's
+        // `_os_log_redirect` finds out whether its caller's image defines a
+        // `__DATA,__os_assumes_log` section. `tools/dyld_slots.py` does not name this slot,
+        // so it was identified by what it is handed and what happens to the answer: an
+        // address inside libxpc or libsystem_trace goes in, and the result goes straight to
+        // `getsectiondata(mh, "__DATA", "__os_assumes_log", &size)`. Answering zero made
+        // that a `getsectiondata(NULL, …)`, which `--strict` reported as a read of address
+        // 0x10 — benign in permissive mode, which is exactly why it needed --strict to see.
+        case 12: {
+            const uint64_t addr = cpu_.xr(1);          // x0 is `this`
+            uint64_t hdr = 0;
+            for (const LoadedImage::ImageSeg& sg : image_segs_)
+                if (addr >= sg.lo && addr < sg.hi) { hdr = sg.header; break; }
+            // Not in a library: the main executable, or genuinely nowhere.
+            if (!hdr && addr && prog_header_ && addr >= prog_header_) hdr = prog_header_;
+            if (trace)
+                std::fprintf(stderr, "[mac] image containing %012llX -> %012llX"
+                             " (x2=%llX lr=%llX)\n",
+                             static_cast<unsigned long long>(addr),
+                             static_cast<unsigned long long>(hdr),
+                             static_cast<unsigned long long>(cpu_.xr(2)),
+                             static_cast<unsigned long long>(cpu_.xr(30)));
+            return static_cast<int64_t>(hdr);
+        }
         // _dyld_for_objc_header_opt_ro. On this OS the shared cache's ObjC optimisation
         // header lives inside libobjc itself, in `__TEXT,__objc_opt_ro` -- so unlike the
         // rest of the cache's tables, it is *present* in an extracted library and only
@@ -440,10 +464,16 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
             // The return address, because the stub is three instructions and says nothing
             // about which API it stands for. x30 names the caller, and the caller's symbol
             // names the method.
+            // x1 and x2, not x0: these are virtual methods, so x0 is `this` and the
+            // arguments start one along. Printing them is what identifies a slot whose name
+            // `tools/dyld_slots.py` did not find — an unnamed slot handed an address is a
+            // different question from one handed nothing.
             std::fprintf(stderr,
                          "[mac] dyld API vtable slot %u (+0x%X) is not implemented, "
-                         "returning 0; called from %012llX\n",
-                         slot, slot * 8, static_cast<unsigned long long>(cpu_.xr(30)));
+                         "returning 0; called from %012llX (x1=%llX x2=%llX)\n",
+                         slot, slot * 8, static_cast<unsigned long long>(cpu_.xr(30)),
+                         static_cast<unsigned long long>(cpu_.xr(1)),
+                         static_cast<unsigned long long>(cpu_.xr(2)));
             return 0;
     }
 }

@@ -8,6 +8,7 @@
 #include "cpu.h"
 #include "memory.h"
 #include "files.h"
+#include "loader.h"
 
 namespace a64 {
 
@@ -56,6 +57,10 @@ public:
         objc_image_paths_ = std::move(paths);
         objc_image_headers_ = std::move(headers);
     }
+    // Every mapped segment and the image it belongs to, for the "which image contains this
+    // address" API. A flat list scanned linearly: there are a few hundred of them and it is
+    // asked a handful of times.
+    void set_image_segs(std::vector<LoadedImage::ImageSeg> segs) { image_segs_ = std::move(segs); }
     // The address a handler returns to when the guest supplied no restorer.
     static constexpr uint64_t kSigreturnMagic = 0x0000'0000'DEAD'0000ull;
 
@@ -147,6 +152,7 @@ private:
     static constexpr uint64_t kObjcOptRwSize = 1u << 20;
     std::vector<std::string> objc_image_paths_;
     std::vector<uint64_t> objc_image_headers_;
+    std::vector<LoadedImage::ImageSeg> image_segs_;
     // Where map_images's two arrays and their path strings go.
     static constexpr uint64_t kObjcArena = 0x0000'0003'0100'0000ull;
 };

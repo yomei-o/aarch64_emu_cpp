@@ -1,0 +1,12 @@
+aarch64emu
+aarch64emu.exe
+build/
+*.o
+*.obj
+*.exe
+tests/*.elf
+tests/*.native
+tests/*.expected
+tests/*.actual
+tests/*.err
+guests/

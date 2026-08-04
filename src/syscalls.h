@@ -3,6 +3,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include "cpu.h"
 #include "memory.h"
@@ -138,6 +139,10 @@ private:
     uint64_t objc_callbacks_ = 0;
     uint64_t objc_opt_ro_ = 0, objc_opt_rw_ = 0, prog_header_ = 0;
     uint64_t cache_lo_ = 0, cache_hi_ = 0;
+    // The shared cache's coalesced selector strings, name -> address, for slot 84. Built
+    // once by walking the pool; empty until something asks.
+    bool sel_pool_built_ = false;
+    std::unordered_map<std::string, uint64_t> sel_map_;
     static constexpr uint64_t kObjcOptRw = 0x0000'0003'0200'0000ull;
     static constexpr uint64_t kObjcOptRwSize = 1u << 20;
     std::vector<std::string> objc_image_paths_;

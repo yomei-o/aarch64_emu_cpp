@@ -228,6 +228,72 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // decodes to nonsense read as an ordinary pointer, and only four slots in the
         // whole of libobjc's data have the top bit set, so it is not an unpacked pointer.
         case 118: return static_cast<int64_t>(objc_opt_ro_);
+        // _dyld_get_objc_selector(const char* name) -> SEL, or 0 if the cache has no such
+        // selector. This is how libobjc uniques a selector when it believes it is running
+        // against a shared cache — and having told it that (slot 63), the host owes it a
+        // real answer: the method lists in these libraries name their selectors as offsets
+        // into the cache's own coalesced string pool, so a selector libobjc registers for
+        // itself is a *different pointer* for the same name, and a message send comparing
+        // the two finds nothing. That is what `unrecognized selector` was.
+        //
+        // The pool is right there. `objc_opt_t`'s last member,
+        // relativeMethodSelectorBaseAddress at offset 40, points into libobjc's `__OBJC_RO`
+        // segment at the start of it — 57,221 strings, 1.58 MiB, ending well before selopt.
+        // So the map is built by walking the pool rather than by reimplementing Apple's
+        // perfect hash over selopt: the addresses the pool contains are, by construction,
+        // exactly the ones the method lists mean, and a walk cannot be subtly wrong about
+        // the hash function.
+        //
+        // Note x1: these slots are virtual methods, so x0 is `this`.
+        case 84: {
+            if (!objc_opt_ro_) return 0;
+            if (!sel_pool_built_) {
+                sel_pool_built_ = true;                 // once, even if it comes up empty
+                const int64_t off = static_cast<int64_t>(mem_.read<uint64_t>(objc_opt_ro_ + 40));
+                const uint64_t pool = objc_opt_ro_ + static_cast<uint64_t>(off);
+                // Walk it in chunks. The end is a run of NULs: the pool is one string after
+                // another, and what follows is a different table entirely.
+                constexpr uint64_t kChunk = 64 * 1024, kLimit = 32ull << 20;
+                std::vector<uint8_t> buf(kChunk);
+                std::string cur;
+                uint64_t at = pool, run = 0;
+                bool done = false;
+                for (uint64_t base = pool; !done && base < pool + kLimit; base += kChunk) {
+                    mem_.read_bytes(base, buf.data(), kChunk);
+                    for (uint64_t k = 0; k < kChunk; ++k) {
+                        const uint8_t c = buf[k];
+                        // A selector is printable — an ObjC method name cannot contain a
+                        // control character — and the pool's first entry is a UTF-8 marker,
+                        // so "printable" has to mean 0x20 and up rather than plain ASCII.
+                        // Without that test the walk runs off the end of the pool into the
+                        // next table and reports a million "names" instead of 57,221.
+                        // ...and it is short. What follows the pool inside `__OBJC_RO` is
+                        // more tables, many of which are also printable and NUL-separated,
+                        // so a NUL run is not what ends the pool: 62 MB of segment gave a
+                        // million "names". A "name" past a thousand characters is not one.
+                        if (c && c < 0x20) { done = true; break; }
+                        if (cur.size() > 1000) { done = true; break; }   // Swift-mangled names get long
+                        if (c) {
+                            if (cur.empty()) at = base + k;
+                            cur += static_cast<char>(c);
+                            run = 0;
+                            continue;
+                        }
+                        if (!cur.empty()) { sel_map_.emplace(cur, at); cur.clear(); run = 1; }
+                        else if (++run >= 8) { done = true; break; }
+                    }
+                }
+                if (trace)
+                    std::fprintf(stderr, "[objc] selector pool at %012llX: %zu names\n",
+                                 static_cast<unsigned long long>(pool), sel_map_.size());
+            }
+            const std::string name = mem_.read_cstr(cpu_.xr(1));
+            const auto it = sel_map_.find(name);
+            if (trace)
+                std::fprintf(stderr, "[objc] selector \"%s\" -> %012llX\n", name.c_str(),
+                             static_cast<unsigned long long>(it == sel_map_.end() ? 0 : it->second));
+            return it == sel_map_.end() ? 0 : static_cast<int64_t>(it->second);
+        }
         // _dyld_get_shared_cache_range(size_t* length) -> const void* base.
         //
         // Answering zero here said "this process has no shared cache" while slot 118 was

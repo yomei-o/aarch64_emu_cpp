@@ -163,10 +163,21 @@ What works:
    thing, not a proxy for it.* "Is the offset inside this section" was a proxy for "is the
    table in the file", and it answered no while the answer was yes.
 
-   **So the next move is `_dyld_get_objc_selector` (slot 84) after all**, and it does not
-   need Apple's perfect hash reimplemented: build a name → address map by walking the
-   selector pool at `relMethodSelBase`, and answer from it. The addresses that pool contains
-   are, by construction, the ones the method lists mean.
+   **Slot 84 is implemented now, and it did not move the wall.** It answers from a name →
+   address map built by walking the pool, which is verified correct — `alloc` comes back as
+   0x1FB005316, the same address the file says. What it revealed is where the mismatch is
+   *not*: libobjc asks for exactly **18** selectors, all of them its own built-ins
+   (`_isDeallocating`, `alloc`, `release`, `retain`, `.cxx_construct`, …), and **`dealloc` is
+   not among them**. So `sel_registerName` is not the path that produces the wrong SEL, and
+   the disagreement is in how libobjc reads a *method list*, not in how it uniques a name.
+
+   That narrows the next measurement to one question, and it can be answered without a Mac:
+   **for a class whose `dealloc` is not found, what SEL does its method list yield, and what
+   SEL does the send use?** `--watch` on the selector pool address of `dealloc`
+   (0x1FB0052CB) shows every reader of it, and the method list entries are at fixed offsets
+   from the class's `ro`. The `LargeSharedCache` flag is set, so a small method list names
+   its selector as a 32-bit offset from `relMethodSelBase` — if libobjc is instead treating
+   it as a direct pointer or as a selref, the two SELs will differ by a recognisable amount.
 
    ### The old section, wrong in its conclusion, still right in its measurements
 

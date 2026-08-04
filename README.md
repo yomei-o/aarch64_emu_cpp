@@ -160,7 +160,7 @@ $ ./aarch64emu --root guests/macos guests/macos/hello
 hello from real macOS
 ```
 
-**That works.** 195,417 instructions of Apple's own arm64 code: 48 libraries from a real
+**That works.** 199,279 instructions of Apple's own arm64 code: 48 libraries from a real
 Mac's dyld shared cache map and link, the emulator does dyld's job
 (`src/macho_dyld.cpp`), initializers run in dyld's order, libSystem comes up over Mach IPC
 and the commpage, **libobjc registers its images and realizes its classes out of the

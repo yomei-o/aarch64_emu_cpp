@@ -12,7 +12,7 @@ Working notes for picking the project back up. The README says what the emulator
     sh prebuilt/unpack.sh                # 48 macOS libraries, 21 MB packed
     ./aarch64emu --root guests/macos guests/macos/hello
 
-**That prints `hello from real macOS`.** 195,417 instructions of Apple's own arm64 code, from
+**That prints `hello from real macOS`.** 199,279 instructions of Apple's own arm64 code, from
 a real Mac's shared cache, on an x86 host. The libraries load and link, the emulator does
 dyld's job, initializers run in dyld's order, libSystem comes up over Mach IPC and the
 commpage, libobjc realizes its classes out of the cache's preoptimized tables, libxpc

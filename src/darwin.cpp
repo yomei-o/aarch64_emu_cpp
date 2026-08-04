@@ -155,10 +155,23 @@ void Syscalls::setup_dyld_apis(uint64_t gapis_addr) {
         mem_.write<uint32_t>(stub + 8, 0xD65F03C0u);        // ret
         mem_.write<uint32_t>(stub + 12, 0xD503201Fu);       // nop, to pad the slot
     }
-    // The object's first word is its vtable pointer. Nothing else about the object is
-    // touched, because nothing that reads a field can be answered without knowing which
-    // field it is -- and a slot that is read announces itself the same way a method does.
-    mem_.write<uint64_t>(gapis_addr, dyld_vtable_);
+    // `gAPIs` is a *pointer to* the object, not the object. So there are three levels,
+    // and the first version collapsed two of them:
+    //
+    //     gAPIs        -> the object
+    //     object[0]    -> the vtable
+    //     vtable[slot] -> the method
+    //
+    // Writing the vtable address into gAPIs made the guest read vtable[0] as the object's
+    // vtable pointer, add the method offset to *that*, and land in the stubs -- where it
+    // read three instructions as a function pointer and branched to them. The symptom
+    // named neither the missing level nor the object.
+    const uint64_t object = kDyldStubBase + 0x8000;
+    mem_.write<uint64_t>(object, dyld_vtable_);
+    // Nothing else about the object is filled in, because nothing that reads a field can
+    // be answered without knowing which field it is -- and a field that is read shows up
+    // as a read of zero, which `--watch` finds the same way it found this.
+    mem_.write<uint64_t>(gapis_addr, object);
 }
 
 // The handler for those stubs. `w16` holds the vtable slot index.
@@ -168,10 +181,13 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // PLATFORM_UNKNOWN, and libSystem branches on it.
         case 66: return 1;
         default:
+            // The return address, because the stub is three instructions and says nothing
+            // about which API it stands for. x30 names the caller, and the caller's symbol
+            // names the method.
             std::fprintf(stderr,
                          "[mac] dyld API vtable slot %u (+0x%X) is not implemented, "
-                         "returning 0, at PC %016llX\n",
-                         slot, slot * 8, static_cast<unsigned long long>(cpu_.pc - 4));
+                         "returning 0; called from %012llX\n",
+                         slot, slot * 8, static_cast<unsigned long long>(cpu_.xr(30)));
             return 0;
     }
 }

@@ -518,6 +518,7 @@ static void patch32(struct outbuf* b, size_t cmd_off, size_t field, uint32_t v) 
 // Defined further down with the rest of the patch-table machinery; needed here
 // because a library's own segments can be patch targets.
 static uint64_t apply_patches(uint8_t* dst, uint64_t lo, uint64_t size);
+static void note_pointer(uint64_t v);
 
 // Rebuild one cache dylib as a standalone Mach-O file.
 static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes) {
@@ -588,6 +589,14 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
                 // A library's own GOT slots can be patch targets too, so the same fill
                 // applies here and not only to the islands.
                 apply_patches(ob.p + new_off, sc.vmaddr, sc.filesize);
+                // Attribute every pointer-shaped word, so a library that was left out
+                // shows up here rather than as a branch into nothing later.
+                if (strncmp(sc.segname, "__TEXT", 6) != 0)
+                    for (uint64_t k = 0; k + 8 <= sc.filesize; k += 8) {
+                        uint64_t v;
+                        memcpy(&v, ob.p + new_off + k, 8);
+                        note_pointer(v & 0x00FFFFFFFFFFFFFFull);
+                    }
                 if (strncmp(sc.segname, "__TEXT", 6) != 0) pt->data_bytes += sc.filesize;
                 // Patch this segment's fileoff, and every section's offset with it.
                 // Taken after the appends above, never before: see patch32.
@@ -1263,6 +1272,96 @@ static uint64_t apply_patches(uint8_t* dst, uint64_t lo, uint64_t size) {
     return n;
 }
 
+// ---- which libraries the extracted set actually points into ------------------
+//
+// "No unresolved symbols" does not mean "no missing libraries" when the libraries are
+// pre-linked. The cache has already written the addresses, so a library that was left
+// out is not a link error -- it is a pointer into unmapped memory, and the guest
+// discovers it by branching there. libdispatch's initializer calls libobjc exactly that
+// way, twenty-four thousand instructions in, with nothing before it to suggest a library
+// was missing.
+//
+// So after the copy, every pointer-shaped word in the extracted data is attributed to
+// the cache image that owns it, and any image that is *not* being extracted is reported
+// with a count. That is the check the emulator cannot make, because it does not know
+// where the libraries it does not have would have been.
+struct owner { uint64_t lo, hi; uint32_t image; };
+static struct owner* all_ranges;
+static size_t n_all_ranges;
+static uint32_t* pointed_at;          // per image, how many pointers land inside it
+
+static int owner_cmp(const void* a, const void* b) {
+    const uint64_t x = ((const struct owner*)a)->lo, y = ((const struct owner*)b)->lo;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static void build_all_ranges(void) {
+    size_t cap = 16384;
+    all_ranges = malloc(cap * sizeof *all_ranges);
+    pointed_at = calloc(images_count, sizeof *pointed_at);
+    if (!all_ranges || !pointed_at) die("out of memory");
+    for (uint32_t k = 0; k < images_count; ++k) {
+        const uint8_t* mh = at(image_addr((int)k), sizeof(struct mach_header_64));
+        if (!mh) continue;
+        struct mach_header_64 h;
+        memcpy(&h, mh, sizeof h);
+        size_t o = sizeof h;
+        for (uint32_t i = 0; i < h.ncmds; ++i) {
+            struct load_command lc;
+            memcpy(&lc, mh + o, sizeof lc);
+            if (lc.cmd == LC_SEGMENT_64) {
+                struct segment_command_64 sc;
+                memcpy(&sc, mh + o, sizeof sc);
+                if (sc.vmsize && strncmp(sc.segname, "__LINKEDIT", 16) != 0) {
+                    if (n_all_ranges == cap) {
+                        cap *= 2;
+                        all_ranges = realloc(all_ranges, cap * sizeof *all_ranges);
+                        if (!all_ranges) die("out of memory");
+                    }
+                    all_ranges[n_all_ranges].lo = sc.vmaddr;
+                    all_ranges[n_all_ranges].hi = sc.vmaddr + sc.vmsize;
+                    all_ranges[n_all_ranges].image = k;
+                    n_all_ranges++;
+                }
+            }
+            o += lc.cmdsize;
+        }
+    }
+    qsort(all_ranges, n_all_ranges, sizeof *all_ranges, owner_cmp);
+}
+
+static void note_pointer(uint64_t v) {
+    if (!all_ranges) return;
+    size_t lo = 0, hi = n_all_ranges;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (all_ranges[mid].lo <= v) lo = mid + 1; else hi = mid;
+    }
+    if (!lo) return;
+    const struct owner* o = &all_ranges[lo - 1];
+    if (v < o->hi) pointed_at[o->image]++;
+}
+
+static void report_pointed_at(void) {
+    if (!pointed_at) return;
+    int shown = 0;
+    for (uint32_t k = 0; k < images_count; ++k) {
+        if (!pointed_at[k] || image_is_wanted(k)) continue;
+        if (!shown)
+            printf("\nthe extracted libraries hold pointers into libraries that are NOT\n"
+                   "being extracted. Those are not link errors -- the cache already wrote\n"
+                   "the addresses -- so the guest will branch into unmapped memory:\n");
+        if (shown < 12)
+            printf("  %7u pointer(s) -> %s\n", pointed_at[k], image_path((int)k));
+        shown++;
+    }
+    if (shown > 12) printf("  ... and %d more\n", shown - 12);
+    if (shown)
+        printf("Add them to the command line to pull them in.\n");
+    else if (all_ranges)
+        printf("every pointer in the extracted data lands inside the extracted set\n");
+}
+
 // Walk the slide information and collect every rebased page that no image owns.
 static void collect_extras(void) {
     build_owned_ranges();
@@ -1496,6 +1595,7 @@ int main(int argc, char** argv) {
             if (idx >= 0) queue_deps(image_addr(idx));
         }
         read_patch_table();
+    build_all_ranges();
         dump_address(dump_addr);
         return 0;
     }
@@ -1540,6 +1640,7 @@ int main(int argc, char** argv) {
     printf("\n%d of %d written, %.1f MiB total, into %s\n",
            done, nwant, total / 1048576.0, outdir);
     printf("slide info: %d mapping(s), version %d\n", C.nslides, slide_version_seen);
+    report_pointed_at();
     // Counted, not guessed -- and this is the single most useful line in the output.
     // A heuristic scan cannot find an unpacked slot: an authenticated one hides
     // behind a diversity field, and a *plain* one reads as an ordinary small integer,

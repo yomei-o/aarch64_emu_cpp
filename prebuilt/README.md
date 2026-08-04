@@ -20,9 +20,14 @@ This is what an arm64 macOS executable needs in order to run, and nothing else.
     hello, h.c                                 a dynamically linked test program,
                                                built by the Mac's own clang
 
-`CoreFoundation` and `libobjc` are **not** here and are not needed. `libxpc` names them,
-but nothing in this closure binds a symbol from either, so the emulator loads without
-them and says so.
+`CoreFoundation` and `libobjc` are **not** here, and this set is therefore not yet
+enough. That was a wrong call, and the way it was wrong is worth keeping: nothing in the
+closure *binds* a symbol from either, so the emulator reports no unresolved imports —
+but the cache has already written the addresses, so libdispatch's initializer calls
+straight into libobjc twenty-four thousand instructions later and branches into unmapped
+memory. "No unresolved symbols" does not mean "no missing libraries" when the libraries
+are pre-linked. `dsc_extract` now attributes every pointer in the extracted data and
+names the libraries it points into, which is the check that was missing.
 
 ## Where it came from, and how to make another
 

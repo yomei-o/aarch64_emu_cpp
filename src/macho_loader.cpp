@@ -17,6 +17,7 @@
 // Everything about *linking* — dependencies, chained fixups, symbol binding — is
 // in macho_dyld.cpp; this file only reads and places.
 #include "loader.h"
+#include <cstdio>
 #include <cstring>
 
 namespace a64 {
@@ -241,7 +242,38 @@ uint64_t build_stack_darwin(Memory& mem, uint64_t stack_top, const std::string& 
     std::vector<uint64_t> argp, envpp, applep;
     for (const std::string& s : argv) argp.push_back(push_str(s));
     for (const std::string& s : envp) envpp.push_back(push_str(s));
+
+    // The `apple[]` vector is not decoration. dyld and the kernel pass real values
+    // through it, and libSystem reads them before it will run: libpthread looks for
+    // `ptr_munge=` and calls a zero there fatal — "BUG IN LIBPTHREAD: Token from the
+    // kernel is 0", which names neither the vector nor the key.
+    //
+    // The cookies are *fixed* rather than random, deliberately. On a real system they
+    // are entropy, and the guest must not depend on their values; here reproducibility
+    // is worth more, because a differential test whose output moves between runs cannot
+    // be compared against anything.
+    auto hex = [](const char* key, uint64_t v) {
+        char buf[64];
+        std::snprintf(buf, sizeof buf, "%s=0x%llx", key, static_cast<unsigned long long>(v));
+        return std::string(buf);
+    };
     applep.push_back(push_str("executable_path=" + exe_path));
+    applep.push_back(push_str(hex("ptr_munge", 0x0F1E2D3C4B5A6978ull)));
+    applep.push_back(push_str(hex("stack_guard", 0x00C0FFEE00C0FFEEull)));
+    applep.push_back(push_str(hex("th_port", 0x103)));       // what thread_self_trap returns
+    applep.push_back(push_str("malloc_entropy=0x1234567812345678,0x8765432187654321"));
+    {
+        // main_stack: top, size, then the guard region below it. A guest that trusts
+        // these will fault at the guard rather than run off the end quietly.
+        constexpr uint64_t kSize = 8ull << 20, kGuard = 4ull << 20;
+        char buf[128];
+        std::snprintf(buf, sizeof buf, "main_stack=0x%llx,0x%llx,0x%llx,0x%llx",
+                      static_cast<unsigned long long>(stack_top),
+                      static_cast<unsigned long long>(kSize),
+                      static_cast<unsigned long long>(stack_top - kSize),
+                      static_cast<unsigned long long>(kGuard));
+        applep.push_back(push_str(buf));
+    }
 
     const size_t words = 1 + argp.size() + 1 + envpp.size() + 1 + applep.size() + 1;
     uint64_t sp = (p - words * 8) & ~0xFull;

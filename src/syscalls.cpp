@@ -37,6 +37,12 @@ bool Syscalls::svc(uint32_t imm) {
     // Linux traps with `svc #0`, Darwin with `svc #0x80`. The immediate is the
     // personality selector, so a Mach-O guest and an ELF guest need no mode flag.
     if (imm == 0x80) return svc_darwin();
+    // A third personality on the same instruction: the stubs behind the synthesised
+    // dyld vtable trap here with the slot index in w16.
+    if (imm == 0x81) {
+        cpu_.setx(0, static_cast<uint64_t>(dyld_api_stub(static_cast<uint32_t>(cpu_.wr(16)))));
+        return true;
+    }
     if (imm != 0) {
         cpu_.setx(0, static_cast<uint64_t>(kENOSYS));
         return true;

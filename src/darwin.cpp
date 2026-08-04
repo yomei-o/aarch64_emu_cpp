@@ -126,6 +126,56 @@ void Syscalls::setup_commpage() {
     fill(0x0000'000F'FFFF'4000ull);
 }
 
+// A stand-in for `dyld4::gAPIs`, the object real dyld constructs to answer questions
+// about itself.
+//
+// libdyld.dylib is a thin shim: `_dyld_get_active_platform()` is a C++ virtual call
+// through a global whose vtable only dyld ever fills in. Having replaced dyld, this
+// emulator has to fill it in too, or the guest loads a null vtable pointer and branches
+// to zero -- which is what it did.
+//
+// So the vtable is synthesised, with every slot pointing at its own three-instruction
+// stub: load the slot number, trap, return. `svc #0x81` is a third personality on the
+// same instruction that already distinguishes Linux from Darwin, and its handler looks
+// the slot up in a table of answers. An unknown slot prints its own index and returns
+// zero, which is how the next one gets identified -- the same bargain the MIG routines
+// make, and the reason neither needs guessing at in advance.
+void Syscalls::setup_dyld_apis(uint64_t gapis_addr) {
+    if (!gapis_addr) return;
+    dyld_vtable_ = kDyldStubBase;
+    // The stubs go a clear 64 KiB past the table, so an off-the-end slot reads zero and
+    // faults at zero rather than executing whatever happened to follow.
+    const uint64_t stubs = kDyldStubBase + 0x10000;
+    for (uint32_t k = 0; k < kDyldSlots; ++k) {
+        const uint64_t stub = stubs + k * 16;
+        mem_.write<uint64_t>(dyld_vtable_ + k * 8, stub);
+        // movz w16, #k  /  svc #0x81  /  ret
+        mem_.write<uint32_t>(stub + 0, 0x52800010u | ((k & 0xFFFF) << 5));
+        mem_.write<uint32_t>(stub + 4, 0xD4001021u);        // svc #0x81
+        mem_.write<uint32_t>(stub + 8, 0xD65F03C0u);        // ret
+        mem_.write<uint32_t>(stub + 12, 0xD503201Fu);       // nop, to pad the slot
+    }
+    // The object's first word is its vtable pointer. Nothing else about the object is
+    // touched, because nothing that reads a field can be answered without knowing which
+    // field it is -- and a slot that is read announces itself the same way a method does.
+    mem_.write<uint64_t>(gapis_addr, dyld_vtable_);
+}
+
+// The handler for those stubs. `w16` holds the vtable slot index.
+int64_t Syscalls::dyld_api_stub(uint32_t slot) {
+    switch (slot) {
+        // _dyld_get_active_platform. PLATFORM_MACOS is 1; returning 0 would be
+        // PLATFORM_UNKNOWN, and libSystem branches on it.
+        case 66: return 1;
+        default:
+            std::fprintf(stderr,
+                         "[mac] dyld API vtable slot %u (+0x%X) is not implemented, "
+                         "returning 0, at PC %016llX\n",
+                         slot, slot * 8, static_cast<unsigned long long>(cpu_.pc - 4));
+            return 0;
+    }
+}
+
 // Mach IPC, enough of it to answer the kernel RPCs a libSystem startup makes.
 //
 // `mach_msg2_trap` passes the message *header* in registers rather than reading it from
@@ -221,6 +271,41 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
             mem_.write<uint32_t>(data + 32, 0);          // RetCode
             mem_.write<uint32_t>(data + 36, count);
             for (uint32_t k = 0; k < count; ++k) mem_.write<uint32_t>(data + 40 + k * 4, w[k]);
+            return kKernSuccess;
+        }
+        // Routines whose reply carries a *port*. That makes the message "complex": the
+        // COMPLEX bit in msgh_bits, a descriptor count, and a 12-byte port descriptor
+        // where a simple reply would have had its NDR record.
+        //
+        //   206  host_get_clock_service(host, id, &port)
+        //   3418 semaphore_create(task, &sem, policy, value)
+        //
+        // Nothing here delivers a message or counts a semaphore, so the port only has to
+        // be distinct and non-zero -- and it is handed out from the same counter as every
+        // other port, so two of them never compare equal.
+        case 206:
+        case 3418: {
+            const uint32_t size = 24 + 4 + 12;
+            if (reply_cap && size > reply_cap) return kKernFailure;
+            mem_.write<uint32_t>(data + 0, 0x80000000u);     // msgh_bits: COMPLEX
+            mem_.write<uint32_t>(data + 4, size);
+            mem_.write<uint32_t>(data + 8, 0);
+            mem_.write<uint32_t>(data + 12, 0);
+            mem_.write<uint32_t>(data + 16, 0);
+            mem_.write<uint32_t>(data + 20, msgh_id + 100);
+            mem_.write<uint32_t>(data + 24, 1);              // msgh_descriptor_count
+            mem_.write<uint32_t>(data + 28, next_port_++);   // the new port's name
+            mem_.write<uint32_t>(data + 32, 0);              // pad1
+            // pad2:16, disposition:8, type:8 — MOVE_SEND (17), PORT_DESCRIPTOR (0).
+            mem_.write<uint32_t>(data + 36, 17u << 16);
+            return kKernSuccess;
+        }
+        // Replies that are only a return code: semaphore_destroy and friends.
+        case 3419: {
+            const uint32_t size = 24 + 8 + 4;
+            if (reply_cap && size > reply_cap) return kKernFailure;
+            reply_header(size);
+            mem_.write<uint32_t>(data + 32, 0);              // RetCode
             return kKernSuccess;
         }
         // _host_page_size(host, &out).
@@ -381,8 +466,36 @@ bool Syscalls::svc_darwin() {
         case 20: r = 1000; break;                          // getpid
         case 24: case 25: case 43: case 47: r = 1000; break;  // getuid/geteuid/getgid/getegid
         case 327: r = 0; break;                            // issetugid
+        // Signals, and the thread calls that go with them. These *must* succeed: the
+        // Linux side learned the same lesson, where refusing rt_sigprocmask took musl's
+        // startup apart a few instructions later. Nothing here installs a handler, which
+        // is honest for a guest that never raises one -- and a guest that does will fault
+        // rather than run a handler that was never registered.
+        case 46: r = 0; break;                             // sigaction
+        case 48: r = 0; break;                             // sigprocmask
+        case 329: r = 0; break;                            // __pthread_sigmask
+        case 328: r = 0; break;                            // __pthread_kill
+        // bsdthread_ctl(cmd, ...): the QoS and priority knobs. Claimed as supported in
+        // bsdthread_register's feature word, so they have to answer; there is one thread
+        // and no scheduler to inform, which makes success the truth.
+        case 478: r = 0; break;                            // bsdthread_ctl
+        // __semwait_signal[_nocancel](cond, mutex, timeout, relative, sec, nsec). With
+        // one thread there is nothing that could ever signal, so blocking would be a
+        // deadlock and returning success is "it was already signalled". Written down
+        // because it is a real simplification: a guest that depends on the *ordering* a
+        // semaphore gives will not get it, and threads will need this to block properly.
+        case 423: case 334: r = 0; break;                  // __semwait_signal[_nocancel]
         case 372: r = 1000; break;                         // thread_selfid
-        case 366: r = 0; break;                            // bsdthread_register
+        // bsdthread_register returns the set of thread features the kernel supports, and
+        // libpthread treats zero as fatal: "Token from the kernel is 0". These are the
+        // bits a real xnu returns -- DISPATCHFUNC, FINEPRIO, BSDTHREADCTL, SETSELF,
+        // QOS_MAINTENANCE, QOS_DEFAULT.
+        //
+        // Claiming the real set rather than a smaller one is deliberate. A reduced set
+        // sends libpthread down legacy paths that Apple no longer exercises, which is a
+        // worse place to be than on the modern path missing a syscall -- and the missing
+        // syscall announces itself, where a legacy path just behaves oddly.
+        case 366: r = 0x4000001F; break;                   // bsdthread_register
         case 116: {                                        // gettimeofday
             const uint64_t ns = host_nanos();
             mem_.write<uint64_t>(a0, ns / 1000000000ull);
@@ -396,7 +509,96 @@ bool Syscalls::svc_darwin() {
             r = 0;
             break;
         }
-        case 202: case 274: err = kBsdENOENT; break;       // sysctl, sysctlbyname
+        // __sysctl(name, namelen, oldp, oldlenp, newp, newlen). A libSystem startup asks
+        // for a handful of machine properties this way, and answering with ENOENT is not
+        // neutral: libpthread reads its stack bounds through it and treats a failure as a
+        // zero token, then aborts with "Token from the kernel is 0" -- a message about
+        // something else entirely.
+        //
+        // Unknown MIBs print themselves rather than failing quietly, because the number
+        // is the whole question and guessing at which one a library wanted is how this
+        // took a detour through bsdthread_register.
+        case 202: {
+            const uint32_t namelen = static_cast<uint32_t>(a1);
+            uint32_t mib[8] = {0};
+            for (uint32_t k = 0; k < namelen && k < 8; ++k)
+                mib[k] = mem_.read<uint32_t>(a0 + k * 4);
+            const uint64_t oldp = a2, oldlenp = a3;
+            auto give_int = [&](uint64_t v, unsigned width) -> int64_t {
+                if (trace)
+                    std::fprintf(stderr, "[mac]   sysctl -> %llX (%u bytes) into %llX\n",
+                                 static_cast<unsigned long long>(v), width,
+                                 static_cast<unsigned long long>(oldp));
+                if (oldlenp) {
+                    const uint64_t have = mem_.read<uint64_t>(oldlenp);
+                    if (oldp && have < width) {
+                        if (trace)
+                            std::fprintf(stderr, "[mac]   ...but the caller's buffer is "
+                                                 "%llu bytes\n",
+                                         static_cast<unsigned long long>(have));
+                        return -22;                               // EINVAL
+                    }
+                    mem_.write<uint64_t>(oldlenp, width);
+                }
+                if (oldp) {
+                    if (width == 8) mem_.write<uint64_t>(oldp, v);
+                    else mem_.write<uint32_t>(oldp, static_cast<uint32_t>(v));
+                }
+                return 0;
+            };
+            auto give_str = [&](const char* s) -> int64_t {
+                const uint64_t n = std::strlen(s) + 1;
+                if (oldlenp) mem_.write<uint64_t>(oldlenp, n);
+                if (oldp) mem_.write_bytes(oldp, s, n);
+                return 0;
+            };
+            constexpr uint32_t CTL_KERN = 1, CTL_HW = 6;
+            // Where main.cpp actually put the stack, so the answer is the truth rather
+            // than a plausible constant.
+            constexpr uint64_t kStackTop = 0x0000'7FFF'FFFF'F000ull;
+            if (namelen == 2 && mib[0] == CTL_KERN) {
+                switch (mib[1]) {
+                    case 2:  r = give_str("24.6.0"); break;        // KERN_OSRELEASE
+                    case 1:  r = give_str("Darwin"); break;        // KERN_OSTYPE
+                    case 8:  r = give_int(1024 * 1024, 4); break;  // KERN_ARGMAX
+                    case 10: r = give_str("aarch64emu"); break;    // KERN_HOSTNAME
+                    // KERN_USRSTACK64: where the main thread's stack *top* is. libpthread
+                    // derives the main thread's bounds from this, and a zero here is the
+                    // zero token it complains about.
+                    // KERN_USRSTACK64: the top of the main thread's stack. libpthread
+                    // derives the main thread's bounds from it, and a zero here becomes
+                    // "BUG IN LIBPTHREAD: Token from the kernel is 0" -- a message about
+                    // something else entirely.
+                    //
+                    // The number is 59 on Sequoia, not the 70 the older headers give, and
+                    // that was settled by reading the caller rather than a header: on
+                    // failure it substitutes 0x1_6FE00000, which is exactly where a macOS
+                    // arm64 main-thread stack sits. Nothing else it could be asking for.
+                    case 59: case 70: r = give_int(kStackTop, 8); break;
+                    case 35: r = give_int(kStackTop, 4); break;   // KERN_USRSTACK32
+                    default: goto sysctl_unknown;
+                }
+                break;
+            }
+            if (namelen == 2 && mib[0] == CTL_HW) {
+                switch (mib[1]) {
+                    case 3:  r = give_int(1, 4); break;            // HW_NCPU
+                    case 7:  r = give_int(16384, 4); break;        // HW_PAGESIZE
+                    case 24: r = give_int(1, 4); break;            // HW_AVAILCPU
+                    case 25: r = give_int(8ull << 30, 8); break;   // HW_MEMSIZE
+                    default: goto sysctl_unknown;
+                }
+                break;
+            }
+        sysctl_unknown:
+            std::fprintf(stderr, "[mac] sysctl not implemented:");
+            for (uint32_t k = 0; k < namelen && k < 8; ++k) std::fprintf(stderr, " %u", mib[k]);
+            std::fprintf(stderr, "   (namelen %u, at PC %016llX)\n", namelen,
+                         static_cast<unsigned long long>(cpu_.pc - 4));
+            err = kBsdENOENT;
+            break;
+        }
+        case 274: err = kBsdENOENT; break;                 // sysctlbyname
         case 54: err = 25; break;                          // ioctl: ENOTTY, we are not a tty
         case 92: case 406: r = 0; break;                   // fcntl[_nocancel]
         case 294: err = kBsdEINVAL; break;                 // shared_region_check_np: no cache

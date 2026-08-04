@@ -143,6 +143,29 @@ MachoExport macho_lookup_export(const MachoImage& img, const std::string& sym) {
     return r;
 }
 
+// Look a name up in the symbol table, whether or not it is exported.
+//
+// Separate from macho_lookup_export on purpose. That one consults the export trie and
+// stops there, which is right for *binding* -- the trie is what a library promises to
+// the outside world. But the interesting internals are not in it: `dyld4::gAPIs` is a
+// private global, so the trie says "not found" and looking further would be wrong for a
+// bind and is exactly what is wanted here.
+uint64_t macho_lookup_symtab(const MachoImage& img, const std::string& sym) {
+    for (uint32_t i = 0; i < img.nsyms; ++i) {
+        const uint8_t* n = img.file.data() + img.symoff + i * 16;
+        uint32_t strx;
+        std::memcpy(&strx, n, 4);
+        if ((n[4] & 0x0E) != 0x0E) continue;              // N_SECT: has an address
+        const char* name = reinterpret_cast<const char*>(img.file.data()) + img.stroff + strx;
+        if (sym == name) {
+            uint64_t value;
+            std::memcpy(&value, n + 8, 8);
+            return value;                                  // an unslid virtual address
+        }
+    }
+    return 0;
+}
+
 // ---- chained fixups ---------------------------------------------------------
 
 bool macho_apply_fixups(const MachoImage& img, Memory& mem,
@@ -578,6 +601,13 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
             }
         };
         visit(0);
+    }
+
+    // Where dyld's own API object lives, if a cache-derived libdyld is loaded.
+    // libdyld dispatches _dyld_get_active_platform and friends through its vtable.
+    for (const MachoImage& img : images) {
+        const uint64_t a = macho_lookup_symtab(img, "__ZN5dyld45gAPIsE");
+        if (a) { out->dyld_gapis = img.slide + a; break; }
     }
 
     const MachoImage& m = images[0];

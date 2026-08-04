@@ -52,39 +52,43 @@ What works:
 
 ## ⏭ Next, in order
 
-1. **A real macOS binary — 1246 instructions in, and it wants Mach IPC.** This is the
-   live front. `tools/dsc_extract.c` pulls libSystem's 39-library closure out of a
-   Mac's dyld shared cache (8.4 MB, not the cache's 4.9 GB); the emulator loads it,
-   links it, binds the GOT slots the cache leaves for dyld, runs every image's
-   initializers, and gets **1246 instructions into Apple's own code** — through
-   libplatform's `os_alloc_once` and a real `mach_vm_map` of 32 KiB — before stopping
-   on libpthread's own diagnostic:
+1. **A real macOS binary — 5564 instructions in, standing in for dyld's own API
+   object.** This is the live front, and the guest tree for it is committed:
 
-       BUG IN LIBPTHREAD: host_info() failed
+       sh prebuilt/unpack.sh
+       ./aarch64emu --root guests/macos guests/macos/hello
 
-   with KERN_FAILURE, which is what an unimplemented Mach trap returns here. The trap
-   is **-47, `mach_msg2_trap`**, and the message is a MIG request to the host port
-   (0x10B) asking for `host_info`. So the next piece is **Mach IPC**: enough of
-   `mach_msg2_trap` to answer the handful of MIG routines a libSystem startup makes.
+   Everything from loading to libSystem's startup now works: the 39-library closure
+   maps and links, the GOT slots the cache leaves null get bound, every image's
+   initializers run, `os_alloc_once` allocates through a real `mach_vm_map`,
+   libpthread gets its host info over Mach IPC, its stack bounds over sysctl and its
+   pointer-munge cookie out of `apple[]`.
 
-   What is known about the call, from `--trace-sys`:
+   Where it stops: **libdyld.dylib dispatches `_dyld_get_active_platform()` as a C++
+   virtual call through `dyld4::gAPIs`**, an object only real dyld constructs. Having
+   replaced dyld, the host has to construct it too, and `setup_dyld_apis` does —
+   a synthesised vtable whose every slot is a three-instruction stub (`movz w16, #slot;
+   svc #0x81; ret`) so an unanswered method announces its own index, the same bargain
+   the MIG routines make.
 
-       [mac] -47(7FFFFFFFEC60, 200000003, 2800001513, 11040000010B, ...)  lr=180444338
+   **The open bug is small and specific.** The guest reads the vtable pointer
+   correctly (a `--watch` on `&gAPIs` shows it write and read back `0x3_00000000`),
+   then adds an offset and loads a slot — but the address it loads from lands in the
+   *stub* area rather than the table, so it branches to three instructions read as a
+   pointer. Either the offset is much larger than the table (dyld's APIs class has
+   several hundred virtual methods; the table is 1024 slots now, which should be
+   enough) or the object stores the pointer with the Itanium ABI's two leading words
+   (offset-to-top and typeinfo) so slot zero is at +16, not +0. Printing the addresses
+   from `setup_dyld_apis` and from the stub handler settles it in one run; the code is
+   in `darwin.cpp`.
 
-   x0 is the message buffer, x2 packs `msgh_bits` (0x1513 — COPY_SEND for the remote
-   port, MAKE_SEND_ONCE for the reply) with a send size of 0x28, and x3 packs the
-   remote port (0x1104, one this emulator handed out) with the local one (0x10B, the
-   host port). A reply has to be written back into the same buffer.
+   After that, expect more dyld APIs and more MIG routines, each announcing itself.
 
-   Expect `host_info(HOST_BASIC_INFO)` first — libpthread wants the CPU count — and
-   then probably `task_info` and `mach_ports_lookup`. Only the routines that actually
-   get called need answering; the rest should keep failing loudly.
-
-   To reproduce: `dsc_extract --only /usr/lib/ -o out <cache>
-   /usr/lib/libSystem.B.dylib`, then `aarch64emu --root out out/hello`.
-   `--trace-sys` shows the trap; the crash message is read by finding the string
-   pointer the code stores just before the BRK (`--watch 100000000:300000000`, filter
-   to accesses where the address is not the PC) and looking it up in the library.
+   Answered so far: MIG `host_info` (HOST_BASIC_INFO, HOST_PRIORITY_INFO),
+   `_host_page_size`, `host_get_clock_service`, `semaphore_create`/`_destroy`; syscalls
+   `sigaction`, `sigprocmask`, `__pthread_sigmask`, `__pthread_kill`, `bsdthread_ctl`,
+   `bsdthread_register` (which must return xnu's real feature word — zero is fatal),
+   `__semwait_signal`, and `__sysctl` for the MIBs a startup reads.
 2. **arm64e chained pointers.** Only `DYLD_CHAINED_PTR_64` and `_64_OFFSET` are
    implemented. Cache libraries do not use them (they are pre-linked), so this has
    not yet bitten; a third-party arm64e dylib would. The emulator can ignore the

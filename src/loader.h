@@ -19,6 +19,10 @@ struct LoadedImage {
     // loader must call these before the entry point; on Linux the guest's own ld.so
     // does it, which is why the ELF path leaves this empty.
     std::vector<uint64_t> initializers;
+    // Mach-O only: the address of `dyld4::gAPIs` in libdyld, when a cache-derived
+    // libdyld is among the images. Real dyld constructs that object; having replaced
+    // dyld, the host has to stand in for it.
+    uint64_t dyld_gapis = 0;
 };
 
 // `base` is where to place an ET_DYN (PIE or shared object) image; ignored for
@@ -121,6 +125,10 @@ struct MachoExport {
     std::string import_name;      // the name in that library, when renamed
 };
 MachoExport macho_lookup_export(const MachoImage& img, const std::string& sym);
+// The symbol table, whether or not the name is exported. `dyld4::gAPIs` is private, so
+// the export trie does not have it and a bind must not look further -- but the host,
+// standing in for dyld, has to find it.
+uint64_t macho_lookup_symtab(const MachoImage& img, const std::string& sym);
 
 // Loads a dynamically linked Mach-O and everything it needs, then does dyld's job:
 // walks LC_DYLD_CHAINED_FIXUPS and writes the rebased and bound pointers. Apple's

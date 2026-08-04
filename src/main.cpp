@@ -238,7 +238,10 @@ int main(int argc, char** argv) {
     sys.exe_path = guest_exe;
     sys.files.set_root(root);
     sys.set_mmap_base(kMmapBase);
-    if (darwin) sys.setup_commpage();
+    if (darwin) {
+        sys.setup_commpage();
+        sys.setup_dyld_apis(img.dyld_gapis);
+    }
 
     int rc = 0;
     try {

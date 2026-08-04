@@ -33,6 +33,10 @@ public:
     // because libsyscall reads the page size out of it during startup and a zero there
     // makes every allocation round to nothing.
     void setup_commpage();
+    // A stand-in for dyld's own API object, in darwin.cpp. libdyld.dylib dispatches
+    // `_dyld_get_active_platform` and friends through a global vtable that only real
+    // dyld fills in, so having replaced dyld this has to fill it in too.
+    void setup_dyld_apis(uint64_t gapis_addr);
     // The address a handler returns to when the guest supplied no restorer.
     static constexpr uint64_t kSigreturnMagic = 0x0000'0000'DEAD'0000ull;
 
@@ -44,6 +48,7 @@ private:
     bool svc_darwin();
     // Mach IPC, in darwin.cpp: enough of mach_msg2_trap and MIG to answer the kernel
     // RPCs a libSystem startup makes.
+    int64_t dyld_api_stub(uint32_t slot);
     int64_t mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
                       uint64_t remote_local, uint64_t voucher_id,
                       uint64_t desc_rcvname, uint64_t rcv_size);
@@ -99,6 +104,14 @@ private:
     // fails only if it is zero. Handing out the same one twice would make two
     // different things compare equal.
     uint32_t next_port_ = 0x1103;
+    // Where the synthesised dyld vtable and its stubs live: clear of the image, the
+    // libraries, the arena and the stack.
+    static constexpr uint64_t kDyldStubBase = 0x0000'0003'0000'0000ull;
+    // dyld's APIs class has several hundred virtual methods, and a slot past the end of
+    // the table lands in whatever follows it -- the stubs, in the first version, so the
+    // guest read three instructions as a function pointer and branched to them.
+    static constexpr uint32_t kDyldSlots = 1024;
+    uint64_t dyld_vtable_ = 0;
 };
 
 }  // namespace a64

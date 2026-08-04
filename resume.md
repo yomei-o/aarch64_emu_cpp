@@ -20,8 +20,21 @@ initialises over a bootstrap port, libcorecrypto runs AES on the emulated crypto
 instructions, and `main` returns to the host, which calls the guest's `exit` — the thing
 that flushes stdio, and without which the program printed nothing at all.
 
-The macOS milestone is **met**. What is left on that side is breadth rather than a wall:
-see "What to pick up".
+The macOS milestone is **met**. What is left on that side is breadth rather than a wall.
+
+**Pick up here (2026-08-05).** One command, and it is the live frontier:
+
+    ./aarch64emu --dyld-sections --root guests/macos guests/macos/hello
+
+Without the flag the guest prints and exits cleanly in 199,279 instructions, and `--strict`
+runs the *same* 199,279 — no path through it depends on reading unmapped memory any more.
+With the flag, dyld's section-location API is answered instead of refused, libobjc stops
+walking load commands and starts using the shared cache's preoptimized class layout for
+real, and the run gets 86,000 instructions further before branching through a **null
+function pointer at 285,669 instructions**. Finding what that pointer is, is the next job.
+The full account — including which kind numbers are measured and which are deliberately
+still refused — is item 1 under "Next, in order"; `--trace-sys` prints every section it
+answers with, and `--pcwatch ADDR` prints a guest function's arguments.
 
 Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agree byte for
 byte over the whole macOS run, which is the best differential oracle here for anyone

@@ -283,7 +283,15 @@ int64_t Syscalls::sys_readv(int fd, uint64_t iov, uint64_t cnt) {
 }
 
 int64_t Syscalls::sys_brk(uint64_t addr) {
-    if (addr && addr >= brk_start_) brk_ = addr;
+    if (addr && addr >= brk_start_) {
+        // Map what the break now covers. With permissive memory nothing had to be done
+        // here -- a write allocated its own page -- but that is exactly what `--strict`
+        // withdraws, and growing the break is the guest *asking* for the memory. malloc
+        // then writes into it 2.7 M instructions later, which under --strict was the first
+        // thing to report itself.
+        if (addr > brk_) mem_.map(brk_, addr - brk_);
+        brk_ = addr;
+    }
     return static_cast<int64_t>(brk_);
 }
 

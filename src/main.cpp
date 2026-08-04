@@ -33,7 +33,7 @@ std::vector<uint8_t> read_file(const char* path) {
 int main(int argc, char** argv) {
     using namespace a64;
 
-    bool trace_sys = false, stats = false, macho_info = false;
+    bool trace_sys = false, stats = false, macho_info = false, strict = false;
     uint64_t max_insns = 0, sample = 0, watch_lo = 0, watch_hi = 0;
     // The guest sees this directory as "/". Defaulting to the host cwd means a
     // relative path from the guest lands where a user would expect it to.
@@ -44,6 +44,11 @@ int main(int argc, char** argv) {
         if (a == "--trace-sys") trace_sys = true;
         else if (a == "--stats") stats = true;
         else if (a == "--macho-info") macho_info = true;
+        // --strict — a guest access to a page nothing mapped stops the run and names the
+        // address, instead of reading zero and letting the mistake surface later somewhere
+        // else. Off by default: some libc reads speculatively, and refusing to run is worse
+        // than being permissive. On, it is the fastest way to find a wild pointer.
+        else if (a == "--strict") strict = true;
         // --watch LO:HI — log every guest access in an address range, with the PC that
         // made it. For questions of the form "the guest read a zero, but from where".
         else if (a == "--watch" && i + 1 < argc) {
@@ -123,6 +128,19 @@ int main(int argc, char** argv) {
                          static_cast<unsigned long long>(addr),
                          static_cast<unsigned long long>(value),
                          static_cast<unsigned long long>(cpu.pc));
+        };
+    }
+    // --strict: report the address and stop. A wild access is not something to hand the
+    // guest as a signal — the guest is not what is wrong — so it goes out as a CpuError,
+    // which prints the registers and names the PC that made the access.
+    if (strict) {
+        mem.strict = true;
+        mem.on_unmapped = [&cpu](uint64_t addr, bool is_write) {
+            char buf[128];
+            std::snprintf(buf, sizeof buf, "unmapped %s at %016llX (--strict)",
+                          is_write ? "write" : "read",
+                          static_cast<unsigned long long>(addr));
+            throw CpuError{buf, cpu.pc, 0};
         };
     }
     // An instruction we do not implement is delivered to the guest as SIGILL when it
@@ -239,6 +257,26 @@ int main(int argc, char** argv) {
     sys.files.set_root(root);
     sys.set_mmap_base(kMmapBase);
     if (darwin) {
+        // A thread pointer for the main thread, before it runs its first instruction.
+        //
+        // On Darwin, xnu sets TPIDRRO_EL0 when it starts the thread, so `_pthread_self()`
+        // works from the very beginning — and libsystem_kernel depends on it earlier than
+        // anything else does: `cerror`, the error path every failing syscall goes through,
+        // stores errno in the thread structure. The third syscall this guest makes is an
+        // `access()` on a file that legitimately does not exist, so `cerror` runs 315
+        // instructions in, long before libpthread has installed a real `pthread_t`.
+        //
+        // With permissive memory that wrote errno to address 8 and nothing said anything.
+        // `--strict` reported it as the first thing it found. libpthread replaces this with
+        // its own structure later; until then it only has to be real memory, 16-byte
+        // aligned because the low bits of TPIDRRO_EL0 are the CPU number and get masked off.
+        // The pointer lands in the *middle* of the region, because Darwin's thread pointer
+        // points into the middle of `struct _pthread` — at the TSD array — and the header
+        // fields are at negative offsets from it. Pointing at the base of a region made the
+        // first write land 0xE0 bytes below it, which is how that came to be known.
+        constexpr uint64_t kTsdBase = 0x0000'0003'0400'0000ull, kTsdSize = 128u * 1024;
+        mem.map(kTsdBase, kTsdSize);
+        cpu.tpidr_el0 = kTsdBase + kTsdSize / 2;
         sys.setup_commpage();
         sys.setup_dyld_apis(img.dyld_gapis);
         sys.set_objc_images(img.image_paths, img.image_headers);
@@ -265,6 +303,43 @@ int main(int argc, char** argv) {
             uint64_t apple_g = envp_g;
             while (mem.read<uint64_t>(apple_g)) apple_g += 8;
             apple_g += 8;
+
+            // The fifth argument: `const ProgramVars* vars`. dyld passes it and libsystem_c
+            // dereferences it immediately — `__libc_initializer` calls `__program_vars_init`,
+            // which copies the five members into NXArgc, NXArgv, environ and __progname.
+            // Passing four arguments left x4 holding whatever the last call had, and with
+            // permissive memory a null read zeros: `environ` came out NULL, so every
+            // `getenv` in the process answered "unset" and nothing said why. `--strict`
+            // reported it as a read of address 8, five thousand instructions in.
+            //
+            //     struct ProgramVars { void* mh; int* NXArgcPtr; char*** NXArgvPtr;
+            //                          char*** environPtr; const char** __prognamePtr; };
+            //
+            // The pointed-at words live next to the struct rather than on the stack,
+            // because libsystem_c keeps the *pointers*, not copies, and the stack frame this
+            // is built from is gone by the time anything reads them.
+            constexpr uint64_t kVars = 0x0000'0003'0500'0000ull;
+            uint64_t vars_g = 0;
+            if (darwin) {
+                mem.map(kVars, 4096);
+                const uint64_t argv0 = mem.read<uint64_t>(argv_g);
+                uint64_t progname = argv0;                  // dyld uses the last component
+                for (uint64_t s = argv0; ; ++s) {
+                    const uint8_t c = mem.read<uint8_t>(s);
+                    if (!c) break;
+                    if (c == '/') progname = s + 1;
+                }
+                mem.write<uint32_t>(kVars + 0x30, static_cast<uint32_t>(argc_g));
+                mem.write<uint64_t>(kVars + 0x38, argv_g);
+                mem.write<uint64_t>(kVars + 0x40, envp_g);
+                mem.write<uint64_t>(kVars + 0x48, progname);
+                mem.write<uint64_t>(kVars + 0x00, img.phdr_addr);   // the mach_header
+                mem.write<uint64_t>(kVars + 0x08, kVars + 0x30);
+                mem.write<uint64_t>(kVars + 0x10, kVars + 0x38);
+                mem.write<uint64_t>(kVars + 0x18, kVars + 0x40);
+                mem.write<uint64_t>(kVars + 0x20, kVars + 0x48);
+                vars_g = kVars;
+            }
             for (size_t k = 0; k < img.initializers.size(); ++k) {
                 // Which initializer is running, when asked. Order matters here and is not
                 // derivable from the dependency graph alone -- dyld runs libSystem's
@@ -281,6 +356,7 @@ int main(int argc, char** argv) {
                 cpu.setx(1, argv_g);
                 cpu.setx(2, envp_g);
                 cpu.setx(3, apple_g);
+                cpu.setx(4, vars_g);
                 cpu.setx(30, kInitReturn);
                 while (!cpu.halted && cpu.pc != kInitReturn) cpu.step();
                 if (cpu.halted) break;

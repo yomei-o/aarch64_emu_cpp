@@ -42,6 +42,27 @@ public:
         return cache_;
     }
 
+    // `--strict`: a guest access to a page nothing ever mapped is a fault, not a zero.
+    //
+    // The permissive default is still the right default -- a libc that reads
+    // speculatively past something should not stop the machine -- but it hides the one
+    // class of bug that is hardest to find afterwards. A wild pointer reads zero, the
+    // guest computes with it, and the failure surfaces tens of thousands of instructions
+    // later somewhere unrelated: the mmap/interpreter address collision took 90,000.
+    //
+    // Only *guest* loads and stores are checked. The bulk helpers below (`read_bytes`,
+    // `write_bytes`, `set`) are how the host maps things in the first place -- the loader
+    // writing segments, mmap zeroing, the stack -- so they always allocate, and `map()`
+    // exists for the regions the host synthesises out of nothing.
+    bool strict = false;
+    std::function<void(uint64_t addr, bool is_write)> on_unmapped;
+    void map(uint64_t addr, uint64_t len) {
+        for (uint64_t a = addr & ~kPageMask; a < addr + len; a += kPageSize) (void)page(a);
+    }
+    bool is_mapped(uint64_t addr) const {
+        return pages_.find(addr >> kPageBits) != pages_.end();
+    }
+
     // Reads and writes never straddle a page here: guest accesses are at most 16
     // bytes and pages are 64 KiB, so only the rare unaligned access near a page
     // edge needs the slow path, which byte-copies.
@@ -57,6 +78,7 @@ public:
 
     template <typename T> T read(uint64_t a) {
         T v;
+        if (strict && !is_mapped(a) && on_unmapped) on_unmapped(a, false);
         if (((a & kPageMask) + sizeof(T)) <= kPageSize)
             std::memcpy(&v, page(a) + (a & kPageMask), sizeof(T));
         else
@@ -69,6 +91,7 @@ public:
         return v;
     }
     template <typename T> void write(uint64_t a, T v) {
+        if (strict && !is_mapped(a) && on_unmapped) on_unmapped(a, true);
         if (watch_hi && a >= watch_lo && a < watch_hi && on_watch) {
             uint64_t as_u64 = 0;
             std::memcpy(&as_u64, &v, sizeof(T) > 8 ? 8 : sizeof(T));

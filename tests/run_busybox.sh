@@ -14,7 +14,9 @@
 set -e
 cd "$(dirname "$0")/.."
 BB=guests/busybox
-EMU=./aarch64emu
+# Overridable so the same suite can be run under a different build or flag --
+# `EMU="./aarch64emu --strict" sh tests/run_busybox.sh` is how the strict sweep is done.
+EMU=${EMU:-./aarch64emu}
 if [ ! -f "$BB" ]; then
     echo "skip busybox tests (no $BB -- see the header for how to fetch it)"
     exit 0

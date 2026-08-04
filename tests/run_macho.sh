@@ -11,7 +11,7 @@
 # clang can emit arm64 Mach-O on any host, so this needs no Mac.
 set -e
 cd "$(dirname "$0")"
-EMU=../aarch64emu
+EMU=${EMU:-../aarch64emu}
 CLANG=${CLANG:-clang}
 HOSTCC=${HOSTCC:-cc}
 # -fno-stack-protector because the Darwin target enables it by default and there is

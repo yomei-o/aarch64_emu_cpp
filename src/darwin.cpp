@@ -142,6 +142,11 @@ void Syscalls::setup_commpage() {
 // make, and the reason neither needs guessing at in advance.
 void Syscalls::setup_dyld_apis(uint64_t gapis_addr) {
     if (!gapis_addr) return;
+    // Declare the region first. Nothing maps it -- it is invented by the host, not part of
+    // any image -- and with permissive memory the writes below created it as a side effect.
+    // Under `--strict` a side effect is exactly what stops the run, and rightly: the host
+    // should say where it is putting things.
+    mem_.map(kDyldStubBase, 0x10000 + kDyldSlots * 16);
     dyld_vtable_ = kDyldStubBase;
     // The stubs go a clear 64 KiB past the table, so an off-the-end slot reads zero and
     // faults at zero rather than executing whatever happened to follow.
@@ -302,6 +307,8 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
             constexpr uint64_t kInfoSize = 32;
             const size_t n = objc_image_paths_.size();
             const uint64_t infos = kObjcArena;
+            // Another host-invented region: the info array and the path strings after it.
+            mem_.map(kObjcArena, n * kInfoSize + 64 * 1024);
             uint64_t strp = infos + n * kInfoSize;
             for (size_t j = 0; j < n; ++j) {
                 const std::string& s = objc_image_paths_[j];

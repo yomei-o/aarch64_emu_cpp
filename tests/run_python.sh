@@ -14,7 +14,9 @@
 set -e
 cd "$(dirname "$0")/.."
 PY=guests/sysroot/opt/python/bin/python3.13
-EMU="./aarch64emu --root guests/sysroot"
+# Overridable, so the suite can be run under a different build or flag; --root has to
+# stay, since the guest tree is what makes it a sysroot.
+EMU="${EMU:-./aarch64emu} --root guests/sysroot"
 if [ ! -f "$PY" ]; then
     echo "skip python tests (no $PY -- see the header for how to fetch it)"
     exit 0

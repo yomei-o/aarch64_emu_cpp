@@ -4,7 +4,7 @@
 # emulator reproduces the host byte for byte.
 set -e
 cd "$(dirname "$0")"
-EMU=../aarch64emu
+EMU=${EMU:-../aarch64emu}
 CLANG=${CLANG:-clang}
 HOSTCC=${HOSTCC:-cc}
 A64="--target=aarch64-linux-gnu -ffreestanding -nostdlib -fuse-ld=lld -static"

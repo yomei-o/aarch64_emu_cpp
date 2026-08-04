@@ -431,7 +431,90 @@ void Cpu::exec_loadstore(uint32_t insn) {
         const unsigned o2 = (insn >> 23) & 1, o1 = (insn >> 21) & 1;
         const unsigned rs = (insn >> 16) & 0x1F, rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
         const uint64_t addr = xsp(rn);
-        if (o1) fail("LDXP/STXP (exclusive pair) not implemented", insn);
+
+        // o1 == 1 is the four-way pair/compare-and-swap corner of this group, and the
+        // encodings overlap in a way that is easy to get wrong:
+        //
+        //   o2=0, size=1x  ->  LDXP / STXP     (exclusive pair, 32- or 64-bit halves)
+        //   o2=0, size=0x  ->  CASP            (compare-and-swap pair)
+        //   o2=1           ->  CAS / CASB / CASH (single, size selects the width)
+        //
+        // CASP and STXP share o2=0 and o1=1 and are told apart only by bit 31. Reading
+        // a `casp` as a `stxp` stores the wrong register and reports success.
+        if (o1) {
+            const unsigned rt2 = (insn >> 10) & 0x1F;
+            if (!o2 && ((insn >> 31) & 1)) {                           // LDXP / STXP
+                const bool pair64 = size == 3;
+                if (l) {
+                    excl_valid_ = true;
+                    excl_addr_ = addr;
+                    if (pair64) {
+                        setx(rt, mem_.read<uint64_t>(addr));
+                        setx(rt2, mem_.read<uint64_t>(addr + 8));
+                    } else {
+                        setw(rt, mem_.read<uint32_t>(addr));
+                        setw(rt2, mem_.read<uint32_t>(addr + 4));
+                    }
+                } else {
+                    if (!excl_valid_ || excl_addr_ != addr) { setx(rs, 1); return; }
+                    excl_valid_ = false;
+                    if (pair64) {
+                        mem_.write<uint64_t>(addr, xr(rt));
+                        mem_.write<uint64_t>(addr + 8, xr(rt2));
+                    } else {
+                        mem_.write<uint32_t>(addr, wr(rt));
+                        mem_.write<uint32_t>(addr + 4, wr(rt2));
+                    }
+                    setx(rs, 0);
+                }
+                return;
+            }
+            if (!o2) {                                                 // CASP
+                const bool pair64 = size == 1;
+                const unsigned rs2 = rs + 1, rtp = rt + 1;
+                if (pair64) {
+                    const uint64_t lo = mem_.read<uint64_t>(addr), hi = mem_.read<uint64_t>(addr + 8);
+                    if (lo == xr(rs) && hi == xr(rs2)) {
+                        mem_.write<uint64_t>(addr, xr(rt));
+                        mem_.write<uint64_t>(addr + 8, xr(rtp));
+                    }
+                    setx(rs, lo);
+                    setx(rs2, hi);
+                } else {
+                    const uint32_t lo = mem_.read<uint32_t>(addr), hi = mem_.read<uint32_t>(addr + 4);
+                    if (lo == wr(rs) && hi == wr(rs2)) {
+                        mem_.write<uint32_t>(addr, wr(rt));
+                        mem_.write<uint32_t>(addr + 4, wr(rtp));
+                    }
+                    setw(rs, lo);
+                    setw(rs2, hi);
+                }
+                return;
+            }
+            // CAS / CASB / CASH. Rs is both the comparand and the destination for the
+            // old value, which is what makes the instruction useful and also what makes
+            // the order of these three lines matter.
+            const bool is64 = size == 3;
+            uint64_t old;
+            switch (size) {
+                case 0: old = mem_.read<uint8_t>(addr); break;
+                case 1: old = mem_.read<uint16_t>(addr); break;
+                case 2: old = mem_.read<uint32_t>(addr); break;
+                default: old = mem_.read<uint64_t>(addr); break;
+            }
+            const uint64_t want = size < 3 ? (xr(rs) & ((1ull << (8u << size)) - 1))
+                                           : xr(rs);
+            if (old == want) {
+                switch (size) {
+                    case 0: mem_.write<uint8_t>(addr, static_cast<uint8_t>(xr(rt))); break;
+                    case 1: mem_.write<uint16_t>(addr, static_cast<uint16_t>(xr(rt))); break;
+                    case 2: mem_.write<uint32_t>(addr, static_cast<uint32_t>(xr(rt))); break;
+                    default: mem_.write<uint64_t>(addr, xr(rt)); break;
+                }
+            }
+            setreg(rs, is64, old);
+            return;
+        }
 
         // A real exclusive monitor, because a threaded guest depends on it. The
         // interpreter runs one thread at a time, so the only thing that can break an
@@ -527,6 +610,81 @@ void Cpu::exec_loadstore(uint32_t insn) {
             else { mem_.write<uint64_t>(addr, xr(rt)); mem_.write<uint64_t>(addr + 8, xr(rt2)); }
         }
         if (mode == 1 || mode == 3) setxsp(rn, base + imm);           // write back
+        return;
+    }
+
+    // ---- atomic memory operations (ARMv8.1 "LSE") ---------------------------
+    //
+    // LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/LDUMAX/LDUMIN, SWP and LDAPR. Apple's
+    // libraries use these throughout rather than an LDXR/STXR loop, so an emulator
+    // that means to run libSystem needs them all, not a subset.
+    //
+    // They share their group with the register-offset load/store, and the only thing
+    // that separates them is bits 11..10: 00 here, 10 there. Each is read-modify-write
+    // in one step, which is exactly right for an interpreter that runs one thread at a
+    // time -- no monitor, nothing to interrupt.
+    //
+    // The ST<op> forms are not a separate encoding: they are the LD<op> forms with Rt
+    // as XZR, so discarding the old value falls out of the register file.
+    if (grp == 7 && !((insn >> 26) & 1) && ((insn >> 24) & 1) == 0 &&
+        ((insn >> 21) & 1) && ((insn >> 10) & 3) == 0) {
+        const unsigned size = (insn >> 30) & 3;
+        const unsigned rs = (insn >> 16) & 0x1F, rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
+        const unsigned o3 = (insn >> 15) & 1, opc = (insn >> 12) & 7;
+        const uint64_t addr = xsp(rn);
+        const bool is64 = size == 3;
+
+        auto load_sized = [&]() -> uint64_t {
+            switch (size) {
+                case 0: return mem_.read<uint8_t>(addr);
+                case 1: return mem_.read<uint16_t>(addr);
+                case 2: return mem_.read<uint32_t>(addr);
+                default: return mem_.read<uint64_t>(addr);
+            }
+        };
+        auto store_sized = [&](uint64_t v) {
+            switch (size) {
+                case 0: mem_.write<uint8_t>(addr, static_cast<uint8_t>(v)); break;
+                case 1: mem_.write<uint16_t>(addr, static_cast<uint16_t>(v)); break;
+                case 2: mem_.write<uint32_t>(addr, static_cast<uint32_t>(v)); break;
+                default: mem_.write<uint64_t>(addr, v); break;
+            }
+        };
+
+        if (o3 && opc == 4 && rs == 31) {                             // LDAPR
+            setreg(rt, is64, load_sized());
+            return;
+        }
+        const uint64_t old = load_sized();
+        const uint64_t operand = reg(rs, is64);
+        uint64_t val;
+        if (o3) {                                                     // SWP
+            if (opc != 0) fail("unimplemented atomic memory operation", insn);
+            val = operand;
+        } else {
+            // The signed comparisons must be done at the operand's own width: an
+            // 8-bit LDSMAX compares bytes, and comparing them as 64-bit values makes
+            // every negative byte look large.
+            const unsigned bits = 8u << size;
+            auto sext = [bits](uint64_t v) {
+                return bits >= 64 ? static_cast<int64_t>(v)
+                                  : static_cast<int64_t>(sign_extend(v, bits));
+            };
+            switch (opc) {
+                case 0: val = old + operand; break;                   // LDADD
+                case 1: val = old & ~operand; break;                  // LDCLR
+                case 2: val = old ^ operand; break;                   // LDEOR
+                case 3: val = old | operand; break;                   // LDSET
+                case 4: val = sext(old) > sext(operand) ? old : operand; break;   // LDSMAX
+                case 5: val = sext(old) < sext(operand) ? old : operand; break;   // LDSMIN
+                case 6: val = old > operand ? old : operand; break;   // LDUMAX
+                default: val = old < operand ? old : operand; break;  // LDUMIN
+            }
+        }
+        store_sized(val);
+        // The old value goes to Rt *after* the store, and only if Rt is not XZR --
+        // which is how the ST<op> aliases discard it.
+        setreg(rt, is64, size < 3 ? (old & ((1ull << (8u << size)) - 1)) : old);
         return;
     }
 

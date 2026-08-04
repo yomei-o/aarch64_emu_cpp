@@ -137,7 +137,38 @@ What works:
    as an unimplemented FP/SIMD instruction 60,000 instructions before the mistake. Slot
    107 already read x1 for this reason; slot 118 takes no arguments and hid it.
 
-   ### The selector wall, measured — and it needs `dsc_extract`, not another slot
+   ### Correction: the cache's ObjC tables *are* extracted, in `__OBJC_RO`
+
+   **The section below is wrong and is kept because the mistake is instructive.** It
+   concluded that the ObjC optimisation tables are outside the extracted libraries and that
+   the next move needs a Mac. It reached that by checking whether each offset in the
+   `objc_opt_t` header lands inside the 16 KiB `__TEXT,__objc_opt_ro` *section* — which none
+   of them do — and stopping there. They land in libobjc's `__OBJC_RO` and `__OBJC_RW`
+   *segments*, which `dsc_extract` copies out like any other, and which are right there in
+   the file:
+
+       segment __OBJC_RO   0x1FAFEF4A8..0x1FED531B8   (~50 MB)
+       segment __OBJC_RW   0x1EE1B4000..0x1EE40B240
+
+       selopt             0x1FDA53BD8  __OBJC_RO  a hash table header
+       headeropt_ro       0x1FAFEF4A8  __OBJC_RO  version 0x0AEF, 24 headers
+       headeropt_rw       0x1EE1B4000  __OBJC_RW
+       relMethodSelBase   0x1FB005290  __OBJC_RO  "…\0_isDeallocating\0isFault\0_ob…"
+
+   That last one settles it: the address `relativeMethodSelectorBaseAddress` points at holds
+   **the coalesced selector strings** — the pool every small method list in the cache names
+   its selectors as offsets into. Nothing is missing and no Mac is needed.
+
+   The lesson is the one this file already states twice, applied to itself: *measure the
+   thing, not a proxy for it.* "Is the offset inside this section" was a proxy for "is the
+   table in the file", and it answered no while the answer was yes.
+
+   **So the next move is `_dyld_get_objc_selector` (slot 84) after all**, and it does not
+   need Apple's perfect hash reimplemented: build a name → address map by walking the
+   selector pool at `relMethodSelBase`, and answer from it. The addresses that pool contains
+   are, by construction, the ones the method lists mean.
+
+   ### The old section, wrong in its conclusion, still right in its measurements
 
    `unrecognized selector` is the *other* half of claiming a shared cache. libobjc now
    reads the cache's preoptimized metadata, which means it expects the cache's **uniqued

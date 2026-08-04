@@ -1099,6 +1099,25 @@ void Cpu::exec_dp_register(uint32_t insn) {
             // does nothing here, and the round-trip in tests/pac.c holds on both,
             // so the behaviour is checkable rather than merely convenient.
             if (!is64) fail("pointer authentication needs a 64-bit form", insn);
+            //
+            // The whole family, so the halves are not guessed at:
+            //
+            //   0x00..0x03  PACIA  PACIB  PACDA  PACDB     sign
+            //   0x04..0x07  AUTIA  AUTIB  AUTDA  AUTDB     authenticate
+            //   0x08..0x0B  PACIZA PACIZB PACDZA PACDZB    sign, zero modifier
+            //   0x0C..0x0F  AUTIZA AUTIZB AUTDZA AUTDZB    authenticate, zero modifier
+            //   0x10..0x11  XPACI  XPACD                   strip
+            //
+            // **Making AUT*/XPAC* strip the top bits was tried, and measured worse.** The
+            // argument for it was good: `--strict` reported libobjc's `addMethod` writing to
+            // 0x80006000002000E0 when the object it meant was at 0x6000002000C0, which is a
+            // signature surviving an authenticate. But the class `bits` field is not a plain
+            // pointer — libobjc tests bit 63 of it directly (`tbnz x8, #63` inside
+            // `class_data_bits_t::setData`), so the bit carries meaning of its own, and the
+            // shared cache's pointers arrive canonical anyway because `dsc_extract`'s slide
+            // walk has already rewritten them. Stripping took the macOS guest from 134,534
+            // instructions to 122,663 and moved the failure earlier. Reverted; recorded here
+            // so the next attempt starts from the measurement rather than the argument.
             if (opcode <= 0x11) return;
             fail("unimplemented pointer-authentication instruction", insn);
         } else if (rm != 0) {

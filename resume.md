@@ -14,8 +14,8 @@ Everything below is ordered by what that needs.
 Four suites, all differential — the oracle is always the host, never a recorded
 file:
 
-    sh tests/run_tests.sh      8 passed   freestanding C, built twice and diffed
-    sh tests/run_macho.sh      8 passed   the same sources as arm64 Mach-O, plus a dylib
+    sh tests/run_tests.sh      9 passed   freestanding C, built twice and diffed
+    sh tests/run_macho.sh     10 passed   the same sources as arm64 Mach-O, plus a dylib
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
     node web/test_node.mjs     8 passed   the same guests under WebAssembly
@@ -52,30 +52,40 @@ What works:
 
 ## ⏭ Next, in order
 
-1. **A real macOS binary.** The linking machinery is done and tested against
-   locally built dylibs; what is missing is **libSystem**, and that is not a
-   technical problem. On macOS 11+ `/usr/lib/libSystem.B.dylib` and everything under
-   it do not exist as files — they live only inside the **dyld shared cache**, which
-   is several GB and only obtainable from a Mac.
+1. **A real macOS binary — 662 instructions in, one slot short.** This is the live
+   front. `tools/dsc_extract.c` pulls libSystem's 39-library closure out of a Mac's
+   dyld shared cache (8.4 MB, not the cache's 4.9 GB), and the emulator loads it,
+   links it, runs libSystem's initializers and gets 662 instructions into Apple's own
+   code before stopping — with libplatform's own message:
 
-   Steps, in order:
-   - get the cache (`/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/
-     dyld_shared_cache_arm64e*`) and a real dynamically linked hello built by the
-     Mac's own clang;
-   - parse the cache header and map the dylibs out of it (they are pre-linked at
-     fixed addresses in one big mapping — mapping the cache wholesale is easier
-     than extracting individual libraries);
-   - fill in the Darwin syscalls and Mach traps a real libSystem startup makes.
-     Expect `shared_region_check_np`, `csops`, `proc_info`, `getrlimit`, `sysctl`
-     with real answers, and the commpage at `0xFFFFFC000`.
+       BUG IN LIBPLATFORM: Failed to allocate in os_alloc_once
 
-   A macOS CPython is downloadable without a Mac (python-build-standalone publishes
-   `aarch64-apple-darwin`), so the cache is the only Mac-only dependency.
+   The cause is understood exactly. libsystem_platform loads `&vm_page_size` from a
+   `__got` slot at `0x1E7FEC378`:
+
+       ldr x21, [x21, #0x3d0]   ; -> &vm_page_size    ... holds 0
+       ldr x22, [x22, #0x378]   ; -> &mach_task_self_ ... holds 0
+       ldr x8,  [x21]           ; reads address 0 -> 0
+       lsl x2,  x8, #1          ; size = 0
+       bl  mach_vm_map          ; KERN_INVALID_ARGUMENT
+
+   That address is inside no dylib's segments and the slide information never
+   rebases it: the slot is **zero in the cache on purpose**, for dyld to fill from
+   the cache's **patch table**. A patch-table reader is written (`read_patch_table`
+   in dsc_extract) and it is *not yet producing that slot* — the next step is to look
+   at the self-check it prints, which lists a few of the symbol names it found. If
+   they read as `_vm_page_size` and friends the walk is right and the address
+   arithmetic is wrong; if they are garbage the structure offsets are wrong.
+   `dyld_cache_header.patchInfoAddr` is at 0x98.
+
+   To reproduce: `dsc_extract --only /usr/lib/ -o out <cache>
+   /usr/lib/libSystem.B.dylib`, then `aarch64emu --root out out/hello`. `--watch
+   1E7FEC370:1E7FEC3E0` shows the slot being read as zero.
 2. **arm64e chained pointers.** Only `DYLD_CHAINED_PTR_64` and `_64_OFFSET` are
-   implemented. System binaries are arm64e and use authenticated pointers
-   (`DYLD_CHAINED_PTR_ARM64E`), where the slot carries a signing key and a
-   discriminator. The emulator can ignore the signature — it has no PAC — but must
-   read the different bit layout. Currently refused loudly.
+   implemented. Cache libraries do not use them (they are pre-linked), so this has
+   not yet bitten; a third-party arm64e dylib would. The emulator can ignore the
+   signature — PAC is the identity here — but must read the different bit layout.
+   Currently refused loudly.
 3. **A trimmed Python for the browser demo.** The page can run CPython today, but the
    guest tree is 45 MB into MEMFS. Dropping the stdlib to what a script actually
    imports would make a shippable Pages demo.
@@ -86,6 +96,54 @@ What works:
 5. **`--strict` memory.** Unmapped reads return zero and unmapped writes allocate, so a
    wild pointer is invisible. Faulting instead would have caught the mmap/interpreter
    address collision immediately rather than 90,000 instructions later.
+
+## What running a real macOS binary needed, in the order it was needed
+
+Kept because every one of these was invisible until the guest was several hundred
+instructions past it, and each looked like a different problem than it was.
+
+- **`dsc_extract`, a shared-cache extractor.** Cache dylibs are pre-linked at fixed
+  addresses, so pulling out a library's segments and keeping their addresses is
+  enough to run it. Only the *file* layout has to be repaired.
+- **The symbol table is shared.** Each dylib's LC_SYMTAB has its own symoff/nsyms but
+  a stroff into one common pool, with strsize covering the whole thing — so copying
+  strsize copied the names of every symbol in macOS, once per library, producing
+  434 MB dylibs. Rebuilt per library instead.
+- **Never hold a pointer into a growing buffer.** `dst->symoff = ob_put(...);
+  dst->stroff = ob_put(...);` loses the second write when the realloc moves the
+  buffer, leaving the cache's offset in the field. libSystem survived it; libxpc came
+  out claiming a 445 MB string table at offset 2.2 GB.
+- **Data pointers in the cache are not pointers.** They are packed
+  `dyld_cache_slide_pointer` values in per-page chains, rewritten by the kernel at map
+  time. Sequoia's arm64e cache uses **slide info version 5** (v3 was implemented
+  first, and the version check skipped the rest): a 34-bit offset relative to
+  `value_add`, with the chain step at bits 52..62 rather than 51..61.
+- **A heuristic cannot check that.** An authenticated packed slot hides behind a
+  16-bit diversity field and a plain one reads as an ordinary small integer. The
+  residual-scan check found 9 of 9334. Count what the slide walk *rewrote* instead.
+- **libSystem exports libc by re-exporting**, and contains almost no code — so a
+  symbol lookup that stops at the named library finds nothing. Also: a chained
+  import's `lib_ordinal` indexes *every* dylib-referencing load command in order, and
+  omitting LC_REEXPORT_DYLIB/LC_LOAD_UPWARD_DYLIB renumbers the rest.
+- **The closure needs bounding.** Following every edge from libSystem gives 477
+  libraries and 784 MB, through one chain: libxpc → libobjc (upward), XPCSupport
+  (weak), CoreFoundation (plain) → everything. Not following weak or upward, and
+  filtering to `/usr/lib/`, gives 39 libraries and 8.4 MB.
+- **GOT islands.** The cache coalesces GOT entries into pages belonging to no dylib.
+  Collecting "every rebased page no extracted library owns" gives 301 MB of other
+  libraries' data; collecting the pages the extracted *code* names — found by scanning
+  for ADRP, per instruction-flagged **section**, because `__cstring` decodes as
+  plausible ADRPs — gives a few hundred KB.
+- **The commpage**, at `0xF_FFFF_C000` *and* a read-only copy 32 KiB below since macOS
+  13. libsyscall builds `vm_page_size` from the page shift in it, so an absent
+  commpage means a page size of zero and every allocation rounding to nothing.
+- **ARMv8.1 LSE atomics**, all of them — Apple's libraries use CAS/SWP/LD<op> rather
+  than LDXR/STXR loops.
+- **PAC**, as the identity.
+- **Mach VM traps**, because libmalloc builds its zones through them. They return a
+  `kern_return_t` in x0 and do *not* use the carry flag, unlike the BSD calls.
+- **Image initializers**, in post-order, before the entry point. Without them the
+  guest reaches printf and branches through a null 57 instructions in.
 
 ## Notes and gotchas
 

@@ -6,9 +6,9 @@
 set -e
 cd "$(dirname "$0")/.."
 
-ARCHIVE=prebuilt/macos-libsystem-15.7.4-arm64e.tar.xz
+ARCHIVE=prebuilt/macos-libsystem-objc-15.7.4-arm64e.tar.xz
 DEST=guests/macos
-WANT=68cb88b71ef60358bba9f812f269bc4f9810c98fbfe9dce2e2af5af8486d9fe6
+WANT=7347f3be562ae48aea5cc966d8c6c8007b66ae79581bcb5e6561ca6fa4bbfea3
 
 [ -f "$ARCHIVE" ] || { echo "$ARCHIVE is not here; see prebuilt/README.md"; exit 1; }
 

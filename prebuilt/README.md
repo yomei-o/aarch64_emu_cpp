@@ -1,7 +1,7 @@
 # A macOS libSystem, extracted from a dyld shared cache
 
-`macos-libsystem-15.7.4-arm64e.tar.xz` — 1.8 MB compressed, 9.8 MB unpacked, 40 files.
-This is what an arm64 macOS executable needs in order to run, and nothing else.
+`macos-libsystem-objc-15.7.4-arm64e.tar.xz` — 21 MB compressed, 85 MB unpacked, 48
+files. This is what an arm64 macOS executable needs in order to run, and nothing else.
 
     sh prebuilt/unpack.sh                      # into guests/macos/
     ./aarch64emu --root guests/macos guests/macos/hello
@@ -15,34 +15,39 @@ This is what an arm64 macOS executable needs in order to run, and nothing else.
                                                libsystem_c, libsystem_kernel,
                                                libsystem_malloc, libsystem_pthread,
                                                libdispatch, libxpc, libcorecrypto, …
-    usr/lib/dsc_extras.dylib             1.2M  not a real library: the GOT pages the
+    usr/lib/libobjc.A.dylib                    the ObjC runtime, which libdispatch's
+                                               initializer calls whether or not the
+                                               program has any ObjC in it
+    usr/lib/libc++.1.dylib, libc++abi          pulled in by libobjc
+    usr/lib/swift/libswiftCore.dylib     9.1M  likewise
+    usr/lib/dsc_extras.dylib             1.5M  not a real library: the GOT pages the
                                                cache owns and no dylib does
     hello, h.c                                 a dynamically linked test program,
                                                built by the Mac's own clang
 
-`CoreFoundation` and `libobjc` are **not** here, and this set is therefore not yet
-enough. That was a wrong call, and the way it was wrong is worth keeping: nothing in the
-closure *binds* a symbol from either, so the emulator reports no unresolved imports —
-but the cache has already written the addresses, so libdispatch's initializer calls
-straight into libobjc twenty-four thousand instructions later and branches into unmapped
-memory. "No unresolved symbols" does not mean "no missing libraries" when the libraries
-are pre-linked. `dsc_extract` now attributes every pointer in the extracted data and
-names the libraries it points into, which is the check that was missing.
+An earlier version of this archive left `libobjc` out, on the grounds that nothing in
+the closure *binds* a symbol from it — and nothing does. That was wrong, and the way it
+was wrong is worth keeping: the cache has already written the addresses, so libdispatch's
+initializer calls straight into libobjc twenty-four thousand instructions later and
+branches into unmapped memory. **"No unresolved symbols" does not mean "no missing
+libraries" when the libraries are pre-linked.** `dsc_extract` now attributes every pointer
+in the extracted data and names the libraries it points into, which is the check that was
+missing. `CoreFoundation` is still absent and, by that check, still not needed.
 
 ## Where it came from, and how to make another
 
 macOS 15.7.4, Apple Silicon. On macOS 11 and later none of these libraries exist as
 files: they live only inside `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/
-dyld_shared_cache_arm64e`, which is 4.9 GB across two files. This is 0.2% of it —
-the transitive closure of `libSystem.B.dylib` over non-weak, non-upward dependencies
-inside `/usr/lib`.
+dyld_shared_cache_arm64e`, which is 4.9 GB across two files. This is under 2% of it —
+the transitive closure of `libSystem.B.dylib` and `libobjc.A.dylib` over non-weak,
+non-upward dependencies inside `/usr/lib`.
 
 `tools/dsc_extract.c` does the extraction, on the Mac, with nothing but the system
 compiler:
 
     cc -O2 -o dsc_extract tools/dsc_extract.c
     CACHE=/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e
-    ./dsc_extract --only /usr/lib/ -o out "$CACHE" /usr/lib/libSystem.B.dylib
+    ./dsc_extract --only /usr/lib/ -o out "$CACHE"         /usr/lib/libSystem.B.dylib /usr/lib/libobjc.A.dylib
 
 That is worth knowing about even with this archive present, because a different macOS
 version has a different cache, and because the tool reports what it did — how many

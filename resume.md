@@ -74,9 +74,6 @@ What works:
    it by dyld (`_dyld_objc_notify_register`, and the objc optimisation header in the
    cache); nothing does that here. That is the next frontier and it is a real one.
 
-   The smaller set stops earlier, branching into libobjc's address range with libobjc
-   absent — same cause, no message.
-
    Everything before that works: 45 libraries map and link, the GOT slots the cache
    leaves null get bound, initializers run in dyld's order, `os_alloc_once` allocates
    through a real `mach_vm_map`, libpthread gets its host info over Mach IPC and its

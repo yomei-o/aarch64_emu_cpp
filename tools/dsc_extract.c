@@ -946,10 +946,104 @@ static void write_extras(const char* outdir, const char* install_name) {
     free(ob.p);
 }
 
+// Which outside pages the extracted code actually reaches.
+//
+// "Every rebased page that no extracted library owns" is correct and useless: it is
+// every other library's data, 301 MiB of it. What is wanted is the few pages our
+// libraries reach into, and those can be found exactly rather than guessed, by reading
+// the code.
+//
+// Every such reference is an ADRP -- the only way AArch64 forms an address more than
+// 1 MiB away -- usually followed by an ADD or an LDR that supplies the low twelve
+// bits. So: scan the __TEXT of each extracted library, decode each ADRP and the
+// instruction after it, and note the page of anything that lands outside the extracted
+// libraries. The GOT islands are exactly those pages.
+static uint64_t* refpage;
+static size_t n_refpage, cap_refpage;
+
+static int u64_cmp(const void* a, const void* b) {
+    const uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static void refpage_add(uint64_t page) {
+    if (n_refpage == cap_refpage) {
+        cap_refpage = cap_refpage ? cap_refpage * 2 : 4096;
+        refpage = realloc(refpage, cap_refpage * sizeof *refpage);
+        if (!refpage) die("out of memory");
+    }
+    refpage[n_refpage++] = page;
+}
+
+static void scan_text_for_references(uint64_t page_size) {
+    for (int wi = 0; wi < nwant; ++wi) {
+        const int k = find_image(want[wi]);
+        if (k < 0) continue;
+        const uint8_t* mh = at(image_addr(k), sizeof(struct mach_header_64));
+        if (!mh) continue;
+        struct mach_header_64 h;
+        memcpy(&h, mh, sizeof h);
+        size_t o = sizeof h;
+        for (uint32_t i = 0; i < h.ncmds; ++i) {
+            struct load_command lc;
+            memcpy(&lc, mh + o, sizeof lc);
+            if (lc.cmd == LC_SEGMENT_64) {
+                struct segment_command_64 sc;
+                memcpy(&sc, mh + o, sizeof sc);
+                if (strncmp(sc.segname, "__TEXT", 6) == 0 && sc.filesize >= 8) {
+                    const uint8_t* code = at(sc.vmaddr, sc.filesize);
+                    if (code) {
+                        for (uint64_t off = 0; off + 8 <= sc.filesize; off += 4) {
+                            uint32_t insn, next;
+                            memcpy(&insn, code + off, 4);
+                            memcpy(&next, code + off + 4, 4);
+                            // ADRP: bit31 set, bits 28..24 == 10000.
+                            if (!(insn >> 31) || ((insn >> 24) & 0x1F) != 0x10) continue;
+                            const uint32_t rd = insn & 0x1F;
+                            const uint64_t immlo = (insn >> 29) & 3;
+                            const uint64_t immhi = (insn >> 5) & 0x7FFFF;
+                            int64_t imm = (int64_t)((immhi << 2) | immlo);
+                            if (imm & (1 << 20)) imm -= (1 << 21);      // sign extend 21 bits
+                            uint64_t target = ((sc.vmaddr + off) & ~0xFFFull) +
+                                              (uint64_t)(imm * 4096);
+                            // ADD immediate, 64-bit: 1 00 100010 sh imm12 Rn Rd
+                            if ((next >> 23) == 0x244 && ((next >> 5) & 0x1F) == rd) {
+                                uint64_t imm12 = (next >> 10) & 0xFFF;
+                                if ((next >> 22) & 1) imm12 <<= 12;
+                                target += imm12;
+                            // LDR immediate, unsigned offset, 64-bit: 1111100101 imm12 Rn Rt
+                            } else if ((next >> 22) == 0x3E5 && ((next >> 5) & 0x1F) == rd) {
+                                target += ((next >> 10) & 0xFFF) * 8;
+                            }
+                            if (page_owned_by_any_image(target, 1)) continue;
+                            refpage_add(target & ~(page_size - 1));
+                        }
+                    }
+                }
+            }
+            o += lc.cmdsize;
+        }
+    }
+    qsort(refpage, n_refpage, sizeof *refpage, u64_cmp);
+    size_t w = 0;
+    for (size_t r = 0; r < n_refpage; ++r)
+        if (!w || refpage[r] != refpage[w - 1]) refpage[w++] = refpage[r];
+    n_refpage = w;
+}
+
+static int page_is_referenced(uint64_t page) {
+    size_t lo = 0, hi = n_refpage;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (refpage[mid] < page) lo = mid + 1; else hi = mid;
+    }
+    return lo < n_refpage && refpage[lo] == page;
+}
+
 // Walk the slide information and collect every rebased page that no image owns.
 static void collect_extras(void) {
     build_owned_ranges();
-    printf("cache images own %zu merged address range(s)\n", n_owned);
+    printf("extracted libraries own %zu merged address range(s)\n", n_owned);
     for (int m = 0; m < C.nslides; ++m) {
         const struct slidemap* sm = &C.slide[m];
         uint32_t version, page_size, page_count;
@@ -957,6 +1051,7 @@ static void collect_extras(void) {
         memcpy(&page_size, sm->info + 4, 4);
         memcpy(&page_count, sm->info + 8, 4);
         if (version != 3 && version != 5) continue;
+        if (!n_refpage) scan_text_for_references(page_size);
         const uint8_t* starts = sm->info + 24;
         if (24 + (size_t)page_count * 2 > sm->info_size) continue;
         for (uint32_t p = 0; p < page_count; ++p) {
@@ -965,6 +1060,10 @@ static void collect_extras(void) {
             if (start == 0xFFFF) continue;
             const uint64_t page_addr = sm->addr + (uint64_t)p * page_size;
             if (page_owned_by_any_image(page_addr, page_size)) continue;
+            // The scan above says which outside pages the extracted code reaches. A
+            // page it never names belongs to some other library and is 301 MiB of
+            // nobody's business.
+            if (!page_is_referenced(page_addr)) continue;
             const uint8_t* src = at(page_addr, page_size);
             if (!src) continue;
             uint8_t* tmp = malloc(page_size);

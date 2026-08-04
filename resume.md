@@ -144,6 +144,24 @@ What works:
      interesting ones are a program that uses Foundation (needs CoreFoundation and
      Foundation extracted, which `dsc_extract` can do), and one that spawns a thread on
      Darwin (`bsdthread_create` is not implemented; the Linux side's scheduler is).
+
+     **A new macOS guest no longer needs a Mac to build**, which was the reason there was
+     only one. `guests/macos/build.sh NAME` compiles `NAME.c` with clang and links it with
+     `lld -flavor darwin`, against the extracted libraries in this tree — no Apple SDK, and
+     no headers either, because the guest declares its own prototypes.
+     `guests/macos/threads.c` is committed and is the pthread guest `bsdthread_create` will
+     be tested against; it prints a sum the host can check without running anything.
+
+     Two halves, and only one of them is verified here. The **link** half is: `-syslibroot`
+     pointed at `guests/macos` resolves `libSystem.B.dylib` and all seventeen of its
+     re-exports out of `usr/lib/system` — which is the part specific to a cache-extracted
+     tree, since a Mac links against `.tbd` stubs instead — and with no object file the only
+     error left is the missing `_main`. The **compile** half needs a clang with the AArch64
+     target built in, and the emscripten clang this project is otherwise built with has only
+     wasm and x86. `build.sh` stops and says exactly that rather than producing something
+     shaped like a guest. Output is arm64 and not arm64e on purpose: the libraries are
+     arm64e and linking against them is fine, but an arm64e *output* carries
+     `DYLD_CHAINED_PTR_ARM64E` fixups, which are item 2 below.
    - ✅ **`--strict` is clean on this guest.** Permissive and strict now run the *same*
      199,279 instructions, which is the result worth stating: no path through this guest
      depends on reading unmapped memory. Getting there from the one remaining finding — an
@@ -175,9 +193,23 @@ What works:
      — changed the fault by 15 instructions. They are all implemented now and the trace is
      silent, but the temptation to claim them as the cause was real and the instruction
      count is what refused it.
-   - **The dyld API slots still answered with zero** are listed further down. Most are
-     honest zeros now; `_dyld_lookup_section_info` (111) is called constantly and makes
-     libobjc fall back to walking load commands, which works but costs 16% of the run.
+   - **The dyld API slots still answered with zero** are down to two on this guest, and
+     both are deliberate:
+
+     `_dyld_lookup_section_info` (111), 130-odd calls. The signature is legible from the
+     trace — x1 is a mach_header, x2 a per-image handle dyld precomputes, and the rest is
+     `(kind, uint64_t* offset, uint64_t* size)`. What is *not* legible is the order of the
+     `_dyld_section_location_kind` enum, and that is the whole answer: kind 5 is a section
+     name, and picking the wrong one returns the wrong section's contents with no
+     indication anything went wrong. Returning false is a *correct* answer — libobjc then
+     walks the load commands itself, which works — so this stays false until the enum can
+     be measured rather than recalled. The way to measure it is to log the
+     `getsectiondata(mh, seg, sect)` call libobjc makes immediately after each false, and
+     pair the strings with the kinds. It costs 16% of the run, which is the only reason to
+     want it, and item 4 is a better lever on the same problem.
+
+     Slot 97, 18 calls from libobjc. Answering zero is not visibly wrong; it has not been
+     identified because nothing has gone looking.
 
 2. **arm64e chained pointers.** Only `DYLD_CHAINED_PTR_64` and `_64_OFFSET` are
    implemented. Cache libraries do not use them (they are pre-linked), so this has

@@ -171,13 +171,29 @@ What works:
    not among them**. So `sel_registerName` is not the path that produces the wrong SEL, and
    the disagreement is in how libobjc reads a *method list*, not in how it uniques a name.
 
-   That narrows the next measurement to one question, and it can be answered without a Mac:
-   **for a class whose `dealloc` is not found, what SEL does its method list yield, and what
-   SEL does the send use?** `--watch` on the selector pool address of `dealloc`
-   (0x1FB0052CB) shows every reader of it, and the method list entries are at fixed offsets
-   from the class's `ro`. The `LargeSharedCache` flag is set, so a small method list names
-   its selector as a 32-bit offset from `relMethodSelBase` — if libobjc is instead treating
-   it as a direct pointer or as a selref, the two SELs will differ by a recognisable amount.
+   That measurement has now been made, and it says the send side is right and the class side
+   is empty:
+
+   - libxpc's selref for `dealloc`, at 0x1E7FEF020, holds **0x1FB0052CB** — the pool address,
+     the same one slot 84 returns. The send is using the correct SEL.
+   - `--watch` on 0x1FB0052CB shows the string being read only byte-by-byte by `strcmp`,
+     from the error path. Nothing compares it as a selector.
+   - **`OS_xpc_bundle`'s `ro->baseMethods` is 0.** The class has no method list in the image
+     at all. In a shared cache that is normal: the builder merges a class's methods — and its
+     categories — into a preoptimized `class_rw_t`, and the image keeps nothing.
+
+   So the missing `dealloc` is not missing from a list that is being misread; it is in the
+   cache's preoptimized class data, which is reached through `headeropt_rw`. That table is in
+   the extracted libobjc (segment `__OBJC_RW`, 0x1EE1B4000, version 0x0AEF, count 8) and
+   **slot 117 now returns it** instead of the zeroed 1 MiB the host used to invent. It is
+   called, it gets the real address, and the wall has not moved — so the next question is
+   what libobjc does with it: `objc::headeropt_rw` is indexed by header, and if the header
+   index libobjc computes for libxpc does not match the one the cache recorded, it will read
+   the wrong entry or none. The `headeropt_ro` table (0x1FAFEF4A8, 24 headers) is the map
+   between the two, and `_dyld_lookup_section_info` (slot 111) is what libobjc would normally
+   use to find a header — it is still answered with zero, which makes libobjc fall back to
+   walking load commands. That fallback works for sections; it may not produce the same
+   *index*.
 
    ### The old section, wrong in its conclusion, still right in its measurements
 

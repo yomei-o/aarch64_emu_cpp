@@ -329,10 +329,29 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // returning null makes libobjc conclude there is no optimisation data at all after
         // it has already been told there is.
         case 117: {
-            if (!objc_opt_rw_) {
+            if (!objc_opt_rw_ && objc_opt_ro_) {
+                // The *real* table, not an invented one. `objc_opt_t`'s headeropt_rw_offset
+                // (at +24) points into libobjc's `__OBJC_RW` segment, which dsc_extract
+                // copies out like any other — 0x1EE1B4000 on this OS, holding version 0x0AEF
+                // and a count of 8 where a zeroed region holds nothing.
+                //
+                // Handing over a zeroed 1 MiB was the second half of a half-truth: the host
+                // says there is a shared cache, so libobjc reads the cache's *preoptimized*
+                // class data — and this is where it lives. `OS_xpc_bundle` has
+                // `ro->baseMethods == 0`, because in a cache the class's methods have been
+                // merged into its preoptimized `class_rw_t` by the cache builder rather than
+                // left in the image; with the table zeroed there is nowhere for `dealloc` to
+                // be, which is exactly what `unrecognized selector` said.
+                const int32_t off = static_cast<int32_t>(mem_.read<uint32_t>(objc_opt_ro_ + 24));
+                if (off) objc_opt_rw_ = objc_opt_ro_ + static_cast<uint64_t>(static_cast<int64_t>(off));
+            }
+            if (!objc_opt_rw_) {                    // no header at all: a region of our own
                 objc_opt_rw_ = kObjcOptRw;
                 mem_.set(objc_opt_rw_, 0, kObjcOptRwSize);
             }
+            if (trace)
+                std::fprintf(stderr, "[objc] headeropt_rw -> %012llX\n",
+                             static_cast<unsigned long long>(objc_opt_rw_));
             return static_cast<int64_t>(objc_opt_rw_);
         }
         // _dyld_objc_register_callbacks. libobjc hands dyld the functions it wants called

@@ -52,43 +52,47 @@ What works:
 
 ## ⏭ Next, in order
 
-1. **A real macOS binary — 5564 instructions in, standing in for dyld's own API
-   object.** This is the live front, and the guest tree for it is committed:
+1. **A real macOS binary — 35,424 instructions in, inside the ObjC runtime.** This is
+   the live front. Two guest trees matter:
 
-       sh prebuilt/unpack.sh
+       sh prebuilt/unpack.sh                      # 40 files, 10 MB -> 24,077 insns
        ./aarch64emu --root guests/macos guests/macos/hello
 
-   Everything from loading to libSystem's startup now works: the 39-library closure
-   maps and links, the GOT slots the cache leaves null get bound, every image's
-   initializers run, `os_alloc_once` allocates through a real `mach_vm_map`,
-   libpthread gets its host info over Mach IPC, its stack bounds over sysctl and its
-   pointer-munge cookie out of `apple[]`.
+   and a larger one that has to be made on a Mac, because libobjc turned out not to be
+   optional (see below) — 45 libraries, 85 MB, which gets to 35,424:
 
-   Where it stops: **libdyld.dylib dispatches `_dyld_get_active_platform()` as a C++
-   virtual call through `dyld4::gAPIs`**, an object only real dyld constructs. Having
-   replaced dyld, the host has to construct it too, and `setup_dyld_apis` does —
-   a synthesised vtable whose every slot is a three-instruction stub (`movz w16, #slot;
-   svc #0x81; ret`) so an unanswered method announces its own index, the same bargain
-   the MIG routines make.
+       ./dsc_extract --only /usr/lib/ -o out "$CACHE" \
+           /usr/lib/libSystem.B.dylib /usr/lib/libobjc.A.dylib
 
-   **The open bug is small and specific.** The guest reads the vtable pointer
-   correctly (a `--watch` on `&gAPIs` shows it write and read back `0x3_00000000`),
-   then adds an offset and loads a slot — but the address it loads from lands in the
-   *stub* area rather than the table, so it branches to three instructions read as a
-   pointer. Either the offset is much larger than the table (dyld's APIs class has
-   several hundred virtual methods; the table is 1024 slots now, which should be
-   enough) or the object stores the pointer with the Itanium ABI's two leading words
-   (offset-to-top and typeinfo) so slot zero is at +16, not +0. Printing the addresses
-   from `setup_dyld_apis` and from the stub handler settles it in one run; the code is
-   in `darwin.cpp`.
+   With the larger set the guest gets through malloc, stdio, and libobjc's own startup,
+   and stops with libobjc's own diagnostic:
 
-   After that, expect more dyld APIs and more MIG routines, each announcing itself.
+       objc[1000]: Attempt to use unknown class 0x1ee40b2e0.
 
-   Answered so far: MIG `host_info` (HOST_BASIC_INFO, HOST_PRIORITY_INFO),
-   `_host_page_size`, `host_get_clock_service`, `semaphore_create`/`_destroy`; syscalls
-   `sigaction`, `sigprocmask`, `__pthread_sigmask`, `__pthread_kill`, `bsdthread_ctl`,
-   `bsdthread_register` (which must return xnu's real feature word — zero is fatal),
-   `__semwait_signal`, and `__sysctl` for the MIBs a startup reads.
+   which is libdispatch's `_os_object_init` asking `objc_lookUpClass` for `OS_object`.
+   The ObjC runtime normally gets the shared cache's pre-built class tables handed to
+   it by dyld (`_dyld_objc_notify_register`, and the objc optimisation header in the
+   cache); nothing does that here. That is the next frontier and it is a real one.
+
+   The smaller set stops earlier, branching into libobjc's address range with libobjc
+   absent — same cause, no message.
+
+   Everything before that works: 45 libraries map and link, the GOT slots the cache
+   leaves null get bound, initializers run in dyld's order, `os_alloc_once` allocates
+   through a real `mach_vm_map`, libpthread gets its host info over Mach IPC and its
+   cookies out of `apple[]`, and malloc and stdio both initialise — the guest's own
+   `assert` reached the terminal through the emulated `write`, which is how the
+   initializer ordering bug announced itself.
+
+   Answered so far, each found by the guest naming it: MIG `host_info`
+   (HOST_BASIC_INFO, HOST_PRIORITY_INFO), `_host_page_size`, `host_get_clock_service`,
+   `semaphore_create`/`_destroy`, `task_restartable_ranges_register`; Mach traps for VM
+   and ports and `mach_msg2`; syscalls `sigaction`, `sigprocmask`, `__pthread_sigmask`,
+   `__pthread_kill`, `bsdthread_ctl`, `bsdthread_register` (which must return xnu's real
+   feature word — zero is fatal), `__semwait_signal`, `__sysctl`; and dyld API vtable
+   slot 66 (`_dyld_get_active_platform`). Slots 1, 8, 44, 51, 61, 69, 71 and 84 are
+   called and answered with zero, from malloc's and stdio's initialisers -- worth
+   identifying if something downstream looks wrong.
 2. **arm64e chained pointers.** Only `DYLD_CHAINED_PTR_64` and `_64_OFFSET` are
    implemented. Cache libraries do not use them (they are pre-linked), so this has
    not yet bitten; a third-party arm64e dylib would. The emulator can ignore the
@@ -164,6 +168,25 @@ instructions past it, and each looked like a different problem than it was.
   cache, correctly encoded, the entire time. Correspondingly the emulator maps
   `dsc_extras` **last**, because a library whose `vmsize` exceeds its `filesize`
   zero-fills the difference and would wipe an island mapped before it.
+- **"No unresolved symbols" does not mean "no missing libraries"** when the libraries
+  are pre-linked. The cache has already written the addresses, so a library left out of
+  the extraction is not a link error — it is a pointer into unmapped memory, found by
+  branching there twenty thousand instructions later. libobjc was excluded on exactly
+  that reasoning and libdispatch's initializer calls it anyway. `dsc_extract` now
+  attributes every pointer in the extracted data and names the libraries it points into.
+- **`gAPIs` is a pointer to dyld's API object, not the object.** Three levels:
+  `gAPIs -> object -> vtable -> method`. Collapsing two of them made the guest read
+  `vtable[0]` as the object's vtable pointer and land in the stub area, where it read
+  three instructions as a function pointer.
+- **dyld runs libSystem's initializer before its own dependencies', and that ordering
+  is not in the graph.** A post-order walk descends from libSystem into libdispatch,
+  libobjc and libc++abi, whose initializers call `atexit`, which calls malloc, which
+  libSystem's initializer has not yet brought up. The guest says so itself —
+  `Assertion failed: (p), function atexit_register` — which only became visible once
+  stdio worked well enough to print it.
+- **The syscall number is a 32-bit value.** Reading all of x16 turns `mov w16, #-3`,
+  which selects Mach trap 3, into 4294967293 — a positive number that goes down the BSD
+  path and reports an absurd syscall.
 - **`--dump ADDR` in dsc_extract settled that in one run**, after three readings of
   "the slot is zero" with three different explanations. From outside, "zero in the
   file" is indistinguishable from "never copied", and "no slide information" from "a

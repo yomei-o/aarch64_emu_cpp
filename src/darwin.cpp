@@ -316,7 +316,9 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
             mem_.write<uint32_t>(data + 36, 17u << 16);
             return kKernSuccess;
         }
-        // Replies that are only a return code: semaphore_destroy and friends.
+        // Replies that are only a return code: semaphore_destroy, and the restartable
+        // range registration libobjc also reaches through MIG rather than the trap.
+        case 8000: case 8001:
         case 3419: {
             const uint32_t size = 24 + 8 + 4;
             if (reply_cap && size > reply_cap) return kKernFailure;
@@ -343,7 +345,10 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
 
 // Returns false to stop the machine (only for exit).
 bool Syscalls::svc_darwin() {
-    const int64_t nr = static_cast<int64_t>(cpu_.xr(16));
+    // The number is a *32-bit* value, sign-extended. Reading the whole of x16 turns a
+    // `mov w16, #-3` -- which is how the guest selects Mach trap 3 -- into 4294967293,
+    // a positive number that goes down the BSD path and reports an absurd syscall.
+    const int64_t nr = static_cast<int32_t>(cpu_.wr(16));
     const uint64_t a0 = cpu_.xr(0), a1 = cpu_.xr(1), a2 = cpu_.xr(2);
     const uint64_t a3 = cpu_.xr(3);
 
@@ -398,6 +403,17 @@ bool Syscalls::svc_darwin() {
         };
 
         switch (-nr) {
+            // task_restartable_ranges_register / _synchronize. libobjc marks the ranges
+            // of its method-cache lookup so the kernel can rewind a thread preempted
+            // inside one, and says so out loud when it fails:
+            //
+            //     objc[1000]: task_restartable_ranges_register failed
+            //
+            // Succeeding is honest for the kernel's part -- nothing here preempts the
+            // guest from outside. It is *not* honest once this emulator's own scheduler
+            // preempts a guest thread mid-range, which it will: that thread would need
+            // its PC rewound to the range's recovery point, and it will not be.
+            case 3: case 4: r = kKernSuccess; break;
             // ---- Mach VM. libmalloc builds its zones through these, so a guest that
             // reaches malloc reaches here.
             case 10: r = vm_alloc(a1, a2, 0, a3); break;   // mach_vm_allocate_trap

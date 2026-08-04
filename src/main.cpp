@@ -262,6 +262,15 @@ int main(int argc, char** argv) {
             while (mem.read<uint64_t>(apple_g)) apple_g += 8;
             apple_g += 8;
             for (size_t k = 0; k < img.initializers.size(); ++k) {
+                // Which initializer is running, when asked. Order matters here and is not
+                // derivable from the dependency graph alone -- dyld runs libSystem's
+                // first, and an initializer that calls atexit before malloc is up gets a
+                // null and asserts inside libsystem_c, naming neither itself nor the
+                // ordering.
+                if (trace_sys)
+                    std::fprintf(stderr, "[init] %zu/%zu at %012llX\n", k + 1,
+                                 img.initializers.size(),
+                                 static_cast<unsigned long long>(img.initializers[k]));
                 cpu.sp = sp0;
                 cpu.pc = img.initializers[k];
                 cpu.setx(0, argc_g);

@@ -1595,7 +1595,6 @@ int main(int argc, char** argv) {
             if (idx >= 0) queue_deps(image_addr(idx));
         }
         read_patch_table();
-    build_all_ranges();
         dump_address(dump_addr);
         return 0;
     }
@@ -1632,6 +1631,9 @@ int main(int argc, char** argv) {
     // out -- and before anything is copied, because a library's own segments can be
     // patch targets too.
     read_patch_table();
+    // The same reason: attribution needs every image's ranges, and the pointers are
+    // attributed while the data is being copied.
+    build_all_ranges();
 
     mkdir(outdir, 0755);
     uint64_t total = 0;

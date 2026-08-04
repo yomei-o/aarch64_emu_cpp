@@ -576,13 +576,8 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
     // allocates runs, and it is reached last by breadth-first discovery.
     {
         std::vector<bool> done(images.size(), false);
-        std::function<void(size_t)> visit = [&](size_t idx) {
-            if (done[idx]) return;
-            done[idx] = true;                      // set before recursing: cycles exist
-            for (const std::string& dep : images[idx].dylibs) {
-                auto it = by_name.find(dep);
-                if (it != by_name.end()) visit(it->second);
-            }
+        // Emit one image's own initializers, in either encoding.
+        auto emit = [&](size_t idx) {
             const MachoImage& im = images[idx];
             for (const MachoImage::InitSec& sec : im.inits) {
                 const uint64_t at = im.slide + sec.addr;
@@ -600,6 +595,30 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
                 }
             }
         };
+        std::function<void(size_t)> visit = [&](size_t idx) {
+            if (done[idx]) return;
+            done[idx] = true;                      // set before recursing: cycles exist
+            for (const std::string& dep : images[idx].dylibs) {
+                auto it = by_name.find(dep);
+                if (it != by_name.end()) visit(it->second);
+            }
+            emit(idx);
+        };
+
+        // libSystem's own initializer runs **first**, ahead of its own dependencies, and
+        // that ordering is not derivable from the graph. It is what brings malloc up, and
+        // a post-order walk descends from libSystem into libdispatch, libobjc and
+        // libc++abi first -- whose initializers call `atexit`, which calls malloc, which
+        // has not been initialised. The guest states the consequence itself:
+        //
+        //     Assertion failed: (p), function atexit_register, file atexit.c, line 115
+        //
+        // dyld special-cases libSystem for exactly this reason. Marking it done keeps the
+        // walk from emitting it twice while still visiting everything it needs.
+        {
+            auto it = by_name.find("/usr/lib/libSystem.B.dylib");
+            if (it != by_name.end()) { emit(it->second); done[it->second] = true; }
+        }
         visit(0);
     }
 

@@ -1098,6 +1098,10 @@ static int page_is_referenced(uint64_t page) {
 struct patch_target { uint64_t addr; uint64_t value; };
 static struct patch_target* patches;
 static size_t n_patches, cap_patches;
+static const char* patch_sym;          // --patch-sym NAME: show both readings
+static int n_shown_sym;
+static int patch_cache_relative;       // --patch-cache-relative
+static uint64_t cache_base;            // the first mapping's address
 
 static void patch_add(uint64_t addr, uint64_t value) {
     if (n_patches == cap_patches) {
@@ -1210,7 +1214,30 @@ static void read_patch_table(void) {
                     memcpy(&use_off, locs + li * 8 + 0, 4);
                     memcpy(&bits, locs + li * 8 + 4, 4);
                     const uint32_t addend = (bits >> 7) & 0x1F;
-                    patch_add(client_base + use_off, impl_base + impl_off + addend);
+                    // `dylibOffsetOfUse` and `dylibOffsetOfImpl` are offsets, and the
+                    // question is *from where*: the client dylib's mach_header, or the
+                    // cache's base. The two differ by wherever that dylib starts, so
+                    // one of them produces GOT slots and the other produces addresses
+                    // a few megabytes away that are still inside the cache and still
+                    // look plausible. --patch-sym prints both for a named symbol so
+                    // the answer comes from the cache rather than from reasoning.
+                    const uint64_t use_from_dylib = client_base + use_off;
+                    const uint64_t use_from_cache = cache_base + use_off;
+                    const uint64_t val_from_dylib = impl_base + impl_off + addend;
+                    const uint64_t val_from_cache = cache_base + impl_off + addend;
+                    if (patch_sym && strcmp(patch_sym, sym) == 0 && n_shown_sym < 12) {
+                        printf("    %s in %s:\n"
+                           "        use  dylib-relative %012llX   cache-relative %012llX\n"
+                           "        impl dylib-relative %012llX   cache-relative %012llX\n",
+                           sym, image_path((int)client_index),
+                           (unsigned long long)use_from_dylib,
+                           (unsigned long long)use_from_cache,
+                           (unsigned long long)val_from_dylib,
+                           (unsigned long long)val_from_cache);
+                        n_shown_sym++;
+                    }
+                    patch_add(patch_cache_relative ? use_from_cache : use_from_dylib,
+                              patch_cache_relative ? val_from_cache : val_from_dylib);
                 }
             }
         }
@@ -1294,6 +1321,8 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--list") == 0) list = 1;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outdir = argv[++i];
         else if (strcmp(argv[i], "--all-deps") == 0) follow_all_kinds = 1;
+        else if (strcmp(argv[i], "--patch-sym") == 0 && i + 1 < argc) patch_sym = argv[++i];
+        else if (strcmp(argv[i], "--patch-cache-relative") == 0) patch_cache_relative = 1;
         else if (strcmp(argv[i], "--no-symbols") == 0) want_symbols = 0;
         else if (strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
             if (n_only < 8) only_prefix[n_only++] = argv[++i]; else ++i;
@@ -1340,6 +1369,10 @@ int main(int argc, char** argv) {
     }
 
     find_images();
+    // The cache base: the lowest mapping address, which every "cache-relative"
+    // offset in the patch table would be measured from.
+    cache_base = C.nmaps ? C.map[0].addr : 0;
+    for (int m = 1; m < C.nmaps; ++m) if (C.map[m].addr < cache_base) cache_base = C.map[m].addr;
     printf("cache %.16s: %d file(s), %d mapping(s), %u image(s)\n",
            (const char*)C.main, C.nfiles, C.nmaps, images_count);
     for (int m = 0; m < C.nmaps; ++m)

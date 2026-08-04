@@ -33,7 +33,7 @@ std::vector<uint8_t> read_file(const char* path) {
 int main(int argc, char** argv) {
     using namespace a64;
 
-    bool trace_sys = false, stats = false;
+    bool trace_sys = false, stats = false, macho_info = false;
     uint64_t max_insns = 0, sample = 0;
     // The guest sees this directory as "/". Defaulting to the host cwd means a
     // relative path from the guest lands where a user would expect it to.
@@ -43,6 +43,7 @@ int main(int argc, char** argv) {
         const std::string a = argv[i];
         if (a == "--trace-sys") trace_sys = true;
         else if (a == "--stats") stats = true;
+        else if (a == "--macho-info") macho_info = true;
         else if (a == "--max" && i + 1 < argc) max_insns = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--sample" && i + 1 < argc) sample = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--root" && i + 1 < argc) root = argv[++i];
@@ -55,6 +56,39 @@ int main(int argc, char** argv) {
 
     const std::vector<uint8_t> file = read_file(argv[i]);
     if (file.empty()) { std::fprintf(stderr, "aarch64emu: cannot read %s\n", argv[i]); return 1; }
+
+    // --macho-info: read a Mach-O and say what is in it, optionally looking up
+    // symbols. Not a debugging convenience but a way to check the export-trie walker
+    // against real Apple libraries: a trie walk that goes wrong usually returns
+    // "not found" rather than crashing, which is invisible until a bind produces a
+    // null pointer somewhere else entirely.
+    if (macho_info) {
+        MachoImage img;
+        std::string perr;
+        if (!macho_parse(file, &img, &perr)) {
+            std::fprintf(stderr, "aarch64emu: %s\n", perr.c_str());
+            return 1;
+        }
+        std::printf("%s\n  install name: %s\n  entry: %s\n  needs dyld: %s\n",
+                    argv[i], img.install_name.empty() ? "(none)" : img.install_name.c_str(),
+                    img.has_main ? "LC_MAIN" : (img.unixthread_pc ? "LC_UNIXTHREAD" : "(none)"),
+                    img.needs_dyld ? "yes" : "no");
+        for (const MachoImage::Seg& s : img.segs)
+            std::printf("  segment %-14s vm %012llX + %-10llu file %llu + %llu\n",
+                        s.name.c_str(), static_cast<unsigned long long>(s.vmaddr),
+                        static_cast<unsigned long long>(s.vmsize),
+                        static_cast<unsigned long long>(s.fileoff),
+                        static_cast<unsigned long long>(s.filesize));
+        std::printf("  exports trie: %u bytes, symtab: %u symbols, chained fixups: %u bytes\n",
+                    img.exports_size, img.nsyms, img.fixups_size);
+        for (const std::string& d : img.dylibs) std::printf("  needs %s\n", d.c_str());
+        for (int k = i + 1; k < argc; ++k) {
+            const uint64_t a = macho_lookup_export(img, argv[k]);
+            if (a) std::printf("  %-40s -> %012llX\n", argv[k], static_cast<unsigned long long>(a));
+            else   std::printf("  %-40s -> not exported\n", argv[k]);
+        }
+        return 0;
+    }
 
     Memory mem;
     Cpu cpu(mem);

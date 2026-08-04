@@ -26,6 +26,7 @@
 #include "loader.h"
 #include <cstring>
 #include <functional>
+#include <algorithm>
 #include <map>
 
 namespace a64 {
@@ -274,6 +275,7 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
                 const std::function<std::vector<uint8_t>(const std::string&)>& read_file,
                 LoadedImage* out, std::string* err) {
     std::vector<MachoImage> images;
+    std::vector<std::string> missing_libs, unresolved;
     images.reserve(16);
 
     MachoImage main_img;
@@ -305,20 +307,41 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
                 if (!bytes.empty()) { found = cand; break; }
             }
             if (bytes.empty()) {
-                *err = "cannot find the library " + dep + " that " + who + " needs";
-                return false;
+                // Not fatal here, deliberately. A guest extracted from a shared cache
+                // will be missing whatever the extraction did not follow, and most of
+                // it is never called -- so the useful thing is to finish, collect
+                // *everything* that is absent, and report the whole list at once.
+                // Failing on the first one turns each iteration into a single
+                // library, and there are hundreds.
+                missing_libs.push_back(dep + "  (needed by " + who + ")");
+                by_name[dep] = SIZE_MAX;            // remembered, so it is reported once
+                continue;
             }
             MachoImage lib;
             if (!macho_parse(bytes, &lib, err)) { *err = dep + ": " + *err; return false; }
-            lib.slide = next_base;
+            // A library that prefers address 0 has to be given somewhere to go. One
+            // that names a nonzero address has already been placed there and must not
+            // move: that is how every library extracted from a shared cache arrives,
+            // pre-linked against its neighbours at their cache addresses. Sliding one
+            // of those breaks every pointer that already pointed into it.
             lib.guest_path = found;
-            next_base = (next_base + lib.vm_end + 0xFFFFull) & ~0xFFFFull;
+            if (lib.text_vmaddr) {
+                lib.slide = 0;
+            } else {
+                lib.slide = next_base;
+                next_base = (next_base + lib.vm_end + 0xFFFFull) & ~0xFFFFull;
+            }
             by_name[dep] = images.size();
             if (!lib.install_name.empty() && lib.install_name != dep)
                 by_name[lib.install_name] = images.size();
             images.push_back(std::move(lib));
         }
     }
+
+    // by_name may hold SIZE_MAX for a library that was named but not found; drop
+    // those before anything indexes with it.
+    for (auto it = by_name.begin(); it != by_name.end();)
+        if (it->second == SIZE_MAX) it = by_name.erase(it); else ++it;
 
     for (const MachoImage& img : images) {
         macho_map(img, mem);
@@ -342,19 +365,59 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
             }
             for (const MachoImage* o : search) {
                 const uint64_t a = macho_lookup_export(*o, sym);
-                if (a) return o->slide + a;
+                // The trie stores an offset from the **mach_header**, not a virtual
+                // address. For an ordinary dylib, which prefers address 0, the two
+                // are the same number and the distinction is invisible. A library
+                // extracted from a shared cache carries its cache address --
+                // libsystem_c's __TEXT is at 0x1_8016C000 -- and there `slide + a`
+                // resolves every symbol to somewhere in the first megabyte.
+                if (a) return o->load_addr() + a;
             }
-            // A weak import that is missing is *defined* to be null; the guest
-            // checks for it. A strong one that is missing is a broken program, but
-            // dyld reports that at the call site, so leaving it null and letting it
-            // fault at 0 is the same story the guest would hear on a Mac.
-            (void)weak;
+            // A weak import that is missing is *defined* to be null and the guest
+            // checks for it, so that is not worth mentioning. A strong one that is
+            // missing means the guest will branch to zero at some point, and which
+            // symbol it was is the single most useful thing to know -- it says
+            // exactly which library still has to be extracted.
+            if (!weak) {
+                const std::string lib = (ordinal >= 1 && ordinal <= img.dylibs.size())
+                                            ? img.dylibs[ordinal - 1] : std::string("(flat)");
+                unresolved.push_back(sym + "  from " + lib);
+            }
             return 0;
         };
         if (!macho_apply_fixups(img, mem, resolve, err)) {
             *err = img.guest_path + ": " + *err;
             return false;
         }
+    }
+
+    // One report, everything at once. Iterating on which libraries to pull out of a
+    // shared cache means running this repeatedly, and a run that names one missing
+    // thing per attempt is a run per library.
+    if (!missing_libs.empty() || !unresolved.empty()) {
+        std::string msg = "the guest is not completely linked:\n";
+        if (!missing_libs.empty()) {
+            msg += "  " + std::to_string(missing_libs.size()) + " librar" +
+                   (missing_libs.size() == 1 ? "y" : "ies") + " not found:\n";
+            for (size_t k = 0; k < missing_libs.size() && k < 40; ++k)
+                msg += "    " + missing_libs[k] + "\n";
+            if (missing_libs.size() > 40) msg += "    ...\n";
+        }
+        if (!unresolved.empty()) {
+            // Deduplicated: one absent library accounts for hundreds of symbols, and
+            // the library is the actionable part.
+            std::sort(unresolved.begin(), unresolved.end());
+            unresolved.erase(std::unique(unresolved.begin(), unresolved.end()),
+                             unresolved.end());
+            msg += "  " + std::to_string(unresolved.size()) +
+                   " unresolved non-weak symbol(s):\n";
+            for (size_t k = 0; k < unresolved.size() && k < 40; ++k)
+                msg += "    " + unresolved[k] + "\n";
+            if (unresolved.size() > 40)
+                msg += "    ... and " + std::to_string(unresolved.size() - 40) + " more\n";
+        }
+        *err = msg;
+        return false;
     }
 
     const MachoImage& m = images[0];

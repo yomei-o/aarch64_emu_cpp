@@ -55,6 +55,7 @@
 #define LC_ID_DYLIB            0x0D
 #define LC_LOAD_DYLIB          0x0C
 #define LC_LOAD_WEAK_DYLIB     0x80000018u
+#define LC_LOAD_UPWARD_DYLIB   0x80000023u
 #define LC_REEXPORT_DYLIB      0x8000001Fu
 #define LC_DYLD_INFO_ONLY      0x80000022u
 #define LC_DYLD_EXPORTS_TRIE   0x80000033u
@@ -242,6 +243,14 @@ static int find_image(const char* path) {
 #define MAX_WANT 512
 static const char* want[MAX_WANT];
 static int nwant;
+// Off by default. A pre-linked library is loaded through its export trie, so the
+// symbol table is not needed to *run* it -- and in a shared cache it is the single
+// most dangerous thing to copy, because both the nlist array and the string pool
+// are shared by every library. Opt in when you want to inspect the result with nm.
+static int want_symbols = 1;
+// Where the bytes went, per library. Printed always: guessing which part is
+// oversized has already cost two round trips.
+struct parts { uint64_t segs, symtab, exports, other, pad; };
 
 static void want_add(const char* p) {
     for (int i = 0; i < nwant; ++i) if (strcmp(want[i], p) == 0) return;
@@ -256,9 +265,39 @@ static const char* lc_str(const uint8_t* cmd, uint32_t cmdsize, size_t at_off) {
     return (const char*)cmd + off;
 }
 
-// Walk one dylib's load commands and queue everything it depends on. Re-exports
-// matter as much as plain loads: libSystem is almost entirely a list of them, so a
-// closure that ignored LC_REEXPORT_DYLIB would extract a library with no code.
+// Which dependency edges the closure follows, and the reason the defaults are what
+// they are -- measured, on macOS 15.7.4, starting from /usr/lib/libSystem.B.dylib:
+//
+//     every edge kind                    477 libraries   784 MB
+//     without weak                       157             260 MB
+//     without weak or upward             137             231 MB
+//     without weak or upward, /usr/lib    39             8.8 MB
+//
+// The last line is the libc. The first is most of macOS, and it arrives through one
+// chain: libxpc has an *upward* dependency on libobjc, a *weak* one on XPCSupport,
+// and a plain one on CoreFoundation — and from CoreFoundation, everything.
+//
+// Weak and upward are excluded because of what they mean, not because they are
+// inconvenient. A weak dependency may legitimately be absent; an upward one exists
+// to break a cycle and is loaded later, if at all. A plain LC_LOAD_DYLIB outside the
+// prefix filter *is* a real dependency, so dropping one is reported rather than
+// assumed harmless.
+static int follow_all_kinds;                 // --all-deps
+static const char* only_prefix[8];
+static int n_only;
+static int skipped_kind, skipped_prefix;
+static const char* skipped_example[8];
+static int n_skipped_example;
+
+static void note_skip(const char* name, int by_prefix) {
+    if (by_prefix) skipped_prefix++; else skipped_kind++;
+    if (n_skipped_example < 8) {
+        for (int i = 0; i < n_skipped_example; ++i)
+            if (strcmp(skipped_example[i], name) == 0) return;
+        skipped_example[n_skipped_example++] = name;
+    }
+}
+
 static void queue_deps(uint64_t mh_addr) {
     const uint8_t* mh = at(mh_addr, sizeof(struct mach_header_64));
     if (!mh) die("mach_header at %llx is outside every mapping", (unsigned long long)mh_addr);
@@ -268,10 +307,17 @@ static void queue_deps(uint64_t mh_addr) {
     for (uint32_t i = 0; i < h.ncmds; ++i) {
         struct load_command lc;
         memcpy(&lc, mh + o, sizeof lc);
-        if (lc.cmd == LC_LOAD_DYLIB || lc.cmd == LC_LOAD_WEAK_DYLIB ||
-            lc.cmd == LC_REEXPORT_DYLIB) {
+        const int is_dep = lc.cmd == LC_LOAD_DYLIB || lc.cmd == LC_REEXPORT_DYLIB;
+        const int is_soft = lc.cmd == LC_LOAD_WEAK_DYLIB || lc.cmd == LC_LOAD_UPWARD_DYLIB;
+        if (is_dep || is_soft) {
             const char* name = lc_str(mh + o, lc.cmdsize, 8);
-            if (name) want_add(name);
+            if (!name) { o += lc.cmdsize; continue; }
+            if (is_soft && !follow_all_kinds) { note_skip(name, 0); o += lc.cmdsize; continue; }
+            int allowed = n_only == 0;
+            for (int k = 0; k < n_only; ++k)
+                if (strncmp(name, only_prefix[k], strlen(only_prefix[k])) == 0) allowed = 1;
+            if (!allowed) { note_skip(name, 1); o += lc.cmdsize; continue; }
+            want_add(name);
         }
         o += lc.cmdsize;
     }
@@ -316,6 +362,22 @@ static uint32_t put_blob(struct outbuf* b, const uint8_t* d, uint32_t size,
     return (uint32_t)ob_put(b, d, size);
 }
 
+// Patch a field of an already-written load command, by offset.
+//
+// This exists because the obvious version does not work. Holding a pointer into the
+// buffer across an append is use-after-free: `ob_put` reallocs, and
+//
+//     dst->symoff = ob_put(...);        // fine, or fine by luck
+//     dst->stroff = ob_put(...);        // dst now dangles -- write is lost
+//
+// silently loses the second write, leaving the *cache's* offset in the field. The
+// result is a file whose LC_SYMTAB claims a 445 MB string table at offset 2.2 GB,
+// which llvm-objdump rejects and a loader might not. libSystem happened to survive
+// it; libxpc did not.
+static void patch32(struct outbuf* b, size_t cmd_off, size_t field, uint32_t v) {
+    memcpy(b->p + cmd_off + field, &v, 4);
+}
+
 // Rebuild one cache dylib as a standalone Mach-O file.
 static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes) {
     const int idx = find_image(path);
@@ -323,6 +385,9 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
     const uint64_t mh_addr = image_addr(idx);
     const uint8_t* mh = at(mh_addr, sizeof(struct mach_header_64));
     if (!mh) { fprintf(stderr, "  ! unmapped: %s\n", path); return 0; }
+
+    struct parts pt_local = {0, 0, 0, 0, 0};
+    struct parts* pt = &pt_local;
 
     struct mach_header_64 h;
     memcpy(&h, mh, sizeof h);
@@ -375,6 +440,7 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
                 }
                 ob_pad(&ob, 16384);
                 const size_t new_off = ob_put(&ob, src, sc.filesize);
+                pt->segs += sc.filesize;
                 // Patch this segment's fileoff, and every section's offset with it.
                 const uint64_t delta_from = sc.fileoff;
                 struct segment_command_64* dst =
@@ -409,11 +475,20 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
             case LC_SYMTAB: {
                 struct symtab_command sc;
                 memcpy(&sc, mh + o, sizeof sc);
-                struct symtab_command* dst = (struct symtab_command*)(ob.p + o);
+                // In a shared cache the string pool is shared by every library, so
+                // this command's strsize spans hundreds of megabytes that are not
+                // this library's. Each name is therefore looked up individually and
+                // a private string table built from just those.
                 const uint8_t* syms = at_linkedit(le_vmaddr, le_fileoff, sc.symoff,
                                                   (uint64_t)sc.nsyms * 16);
-                if (!syms || !sc.nsyms) {
-                    dst->symoff = dst->nsyms = dst->stroff = dst->strsize = 0;
+                if (!want_symbols || !syms || !sc.nsyms ||
+                    (uint64_t)sc.nsyms * 16 > MAX_BLOB) {
+                    if (want_symbols && sc.nsyms && (uint64_t)sc.nsyms * 16 > MAX_BLOB)
+                        fprintf(stderr, "  ! %s: LC_SYMTAB claims %u symbols, which is "
+                                        "the cache's table and not this library's; "
+                                        "dropped\n", path, sc.nsyms);
+                    patch32(&ob, o, 8, 0);   patch32(&ob, o, 12, 0);
+                    patch32(&ob, o, 16, 0);  patch32(&ob, o, 20, 0);
                     break;
                 }
                 struct outbuf nl = {0}, st = {0};
@@ -437,9 +512,15 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
                     memcpy(ent, &new_strx, 4);
                     ob_put(&nl, ent, 16);
                 }
-                dst->symoff = (uint32_t)ob_put(&ob, nl.p, nl.len);
-                dst->stroff = (uint32_t)ob_put(&ob, st.p, st.len);
-                dst->strsize = (uint32_t)st.len;
+                // Every append first, every patch afterwards. Interleaving them is
+                // the bug documented on patch32.
+                const uint32_t sym_at = (uint32_t)ob_put(&ob, nl.p, nl.len);
+                const uint32_t str_at = (uint32_t)ob_put(&ob, st.p, st.len);
+                patch32(&ob, o, 8, sym_at);
+                patch32(&ob, o, 12, sc.nsyms);
+                patch32(&ob, o, 16, str_at);
+                patch32(&ob, o, 20, (uint32_t)st.len);
+                pt->symtab = nl.len + st.len;
                 free(nl.p);
                 free(st.p);
                 break;
@@ -447,34 +528,37 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
             case LC_DYLD_INFO_ONLY: {
                 struct dyld_info_command dc;
                 memcpy(&dc, mh + o, sizeof dc);
-                struct dyld_info_command* dst = (struct dyld_info_command*)(ob.p + o);
-                // Only the export trie is worth carrying: a cache dylib is already
-                // linked, so its rebase and bind programs are empty or irrelevant.
-                dst->rebase_off = dst->rebase_size = 0;
-                dst->bind_off = dst->bind_size = 0;
-                dst->weak_bind_off = dst->weak_bind_size = 0;
-                dst->lazy_bind_off = dst->lazy_bind_size = 0;
                 const uint8_t* ex = at_linkedit(le_vmaddr, le_fileoff, dc.export_off,
                                                 dc.export_size);
-                dst->export_off = put_blob(&ob, ex, dc.export_size, "export trie", path,
-                                           &dst->export_size);
+                uint32_t sz = 0;
+                const uint32_t at_off = put_blob(&ob, ex, dc.export_size, "export trie",
+                                                 path, &sz);
+                // Only the export trie is worth carrying: a cache dylib is already
+                // linked, so its rebase and bind programs are empty or irrelevant.
+                for (size_t fld = 8; fld <= 36; fld += 4) patch32(&ob, o, fld, 0);
+                patch32(&ob, o, 40, at_off);
+                patch32(&ob, o, 44, sz);
+                pt->exports += sz;
                 break;
             }
             // LC_DYLD_CHAINED_FIXUPS belongs here even though a cache dylib is
             // pre-linked and has none: a library extracted from anywhere else may,
             // and a *stale* offset is worse than no fixups at all -- it points at
-            // whatever now lives there and gets parsed as a fixup header. That is
-            // how the round-trip test caught this one.
+            // whatever now lives there and gets parsed as a fixup header.
             case LC_DYLD_CHAINED_FIXUPS:
             case LC_DYLD_EXPORTS_TRIE:
             case LC_FUNCTION_STARTS:
             case LC_DATA_IN_CODE: {
                 struct linkedit_data_command dc;
                 memcpy(&dc, mh + o, sizeof dc);
-                struct linkedit_data_command* dst = (struct linkedit_data_command*)(ob.p + o);
                 const uint8_t* d = at_linkedit(le_vmaddr, le_fileoff, dc.dataoff, dc.datasize);
-                dst->dataoff = put_blob(&ob, d, dc.datasize, "a LINKEDIT blob", path,
-                                        &dst->datasize);
+                uint32_t sz = 0;
+                const uint32_t at_off = put_blob(&ob, d, dc.datasize, "a LINKEDIT blob",
+                                                 path, &sz);
+                patch32(&ob, o, 8, at_off);
+                patch32(&ob, o, 12, sz);
+                if (lc.cmd == LC_DYLD_EXPORTS_TRIE) pt->exports += sz;
+                else pt->other += sz;
                 break;
             }
             // A code signature covers file offsets that no longer exist, and a
@@ -482,22 +566,18 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
             // a stale offset would make the file look signed and not be.
             case LC_CODE_SIGNATURE:
             case LC_DYLIB_CODE_SIGN_DRS:
-            case LC_LINKER_OPTIMIZATION_HINT: {
-                struct linkedit_data_command* dst = (struct linkedit_data_command*)(ob.p + o);
-                dst->dataoff = 0;
-                dst->datasize = 0;
+            case LC_LINKER_OPTIMIZATION_HINT:
+                patch32(&ob, o, 8, 0);
+                patch32(&ob, o, 12, 0);
                 break;
-            }
             // LC_DYSYMTAB's tables (indirect symbols, relocations, the local/extern
             // symbol ranges) are all LINKEDIT offsets. They are not carried, because
             // nothing that loads a pre-linked library reads them -- but the whole
             // command has to be zeroed rather than left pointing at offsets that no
             // longer mean anything.
-            case LC_DYSYMTAB: {
-                uint32_t* w = (uint32_t*)(ob.p + o);
-                for (uint32_t k = 2; k < lc.cmdsize / 4; ++k) w[k] = 0;
+            case LC_DYSYMTAB:
+                for (uint32_t k = 2; k < lc.cmdsize / 4; ++k) patch32(&ob, o, k * 4, 0);
                 break;
-            }
             default: break;
         }
         o += lc.cmdsize;
@@ -524,10 +604,12 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
     if (!f) die("cannot write %s: %s", full, strerror(errno));
     fwrite(ob.p, 1, ob.len, f);
     fclose(f);
-    // Segments and LINKEDIT reported separately: a total alone does not say which
-    // half is unreasonable, and it was the LINKEDIT half that went wrong.
-    printf("  %-48s %8.1f KiB  (code+data %.0f, linkedit %.0f)\n", path, ob.len / 1024.0,
-           le_start / 1024.0, (ob.len - le_start) / 1024.0);
+    // Broken out by part, always. A total alone does not say which piece is
+    // unreasonable, and twice now it was a LINKEDIT piece that had quietly picked up
+    // something shared by the whole cache.
+    printf("  %-46s %7.0f KiB = code/data %.0f + syms %.0f + exports %.0f + other %.0f\n",
+           path, ob.len / 1024.0, pt->segs / 1024.0, pt->symtab / 1024.0,
+           pt->exports / 1024.0, pt->other / 1024.0);
     *out_bytes += ob.len;
     free(ob.p);
     return 1;
@@ -539,16 +621,31 @@ int main(int argc, char** argv) {
     for (; i < argc; ++i) {
         if (strcmp(argv[i], "--list") == 0) list = 1;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outdir = argv[++i];
-        else break;
+        else if (strcmp(argv[i], "--all-deps") == 0) follow_all_kinds = 1;
+        else if (strcmp(argv[i], "--no-symbols") == 0) want_symbols = 0;
+        else if (strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
+            if (n_only < 8) only_prefix[n_only++] = argv[++i]; else ++i;
+        } else break;
     }
     if (i >= argc) {
         fprintf(stderr,
-            "usage: dsc_extract [--list] [-o outdir] <cache> [dylib ...]\n"
+            "usage: dsc_extract [options] <cache> [dylib ...]\n"
             "\n"
             "  --list          print every library in the cache and stop\n"
             "  -o outdir       where to write; the tree mirrors the install names\n"
+            "  --only PREFIX   only follow dependencies whose path starts with PREFIX\n"
+            "                  (repeatable). Whatever is dropped gets reported.\n"
+            "  --all-deps      also follow weak and upward dependencies. On macOS 15\n"
+            "                  this takes libSystem's closure from 39 libraries and\n"
+            "                  8.8 MB to 477 and 784 MB, via libxpc -> libobjc and\n"
+            "                  CoreFoundation, so it is off by default.\n"
+            "  --no-symbols    do not carry a symbol table (the export trie is what a\n"
+            "                  loader uses; symbols are for reading the result)\n"
             "  dylib ...       what to extract; dependencies follow automatically.\n"
-            "                  Defaults to /usr/lib/libSystem.B.dylib.\n");
+            "                  Defaults to /usr/lib/libSystem.B.dylib.\n"
+            "\n"
+            "For a libc and nothing else:\n"
+            "  dsc_extract --only /usr/lib/ -o out <cache> /usr/lib/libSystem.B.dylib\n");
         return 2;
     }
 
@@ -594,6 +691,14 @@ int main(int argc, char** argv) {
         if (idx >= 0) queue_deps(image_addr(idx));
     }
     printf("\n%d librar%s in the closure\n", nwant, nwant == 1 ? "y" : "ies");
+    // Never a silent cap: a dropped dependency is a real dependency that a loader
+    // would have loaded, so say how many and give examples. The emulator reports the
+    // symbols it then cannot resolve, which is how the list gets extended.
+    if (skipped_kind || skipped_prefix) {
+        printf("not followed: %d weak/upward, %d outside --only. For example:\n",
+               skipped_kind, skipped_prefix);
+        for (int k = 0; k < n_skipped_example; ++k) printf("    %s\n", skipped_example[k]);
+    }
 
     if (!outdir) { for (int k = 0; k < nwant; ++k) printf("  %s\n", want[k]); return 0; }
 

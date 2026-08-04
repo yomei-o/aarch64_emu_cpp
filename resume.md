@@ -52,35 +52,39 @@ What works:
 
 ## ⏭ Next, in order
 
-1. **A real macOS binary — 662 instructions in, one slot short.** This is the live
-   front. `tools/dsc_extract.c` pulls libSystem's 39-library closure out of a Mac's
-   dyld shared cache (8.4 MB, not the cache's 4.9 GB), and the emulator loads it,
-   links it, runs libSystem's initializers and gets 662 instructions into Apple's own
-   code before stopping — with libplatform's own message:
+1. **A real macOS binary — 1246 instructions in, and it wants Mach IPC.** This is the
+   live front. `tools/dsc_extract.c` pulls libSystem's 39-library closure out of a
+   Mac's dyld shared cache (8.4 MB, not the cache's 4.9 GB); the emulator loads it,
+   links it, binds the GOT slots the cache leaves for dyld, runs every image's
+   initializers, and gets **1246 instructions into Apple's own code** — through
+   libplatform's `os_alloc_once` and a real `mach_vm_map` of 32 KiB — before stopping
+   on libpthread's own diagnostic:
 
-       BUG IN LIBPLATFORM: Failed to allocate in os_alloc_once
+       BUG IN LIBPTHREAD: host_info() failed
 
-   The cause is understood exactly. libsystem_platform loads `&vm_page_size` from a
-   `__got` slot at `0x1E7FEC378`:
+   with KERN_FAILURE, which is what an unimplemented Mach trap returns here. The trap
+   is **-47, `mach_msg2_trap`**, and the message is a MIG request to the host port
+   (0x10B) asking for `host_info`. So the next piece is **Mach IPC**: enough of
+   `mach_msg2_trap` to answer the handful of MIG routines a libSystem startup makes.
 
-       ldr x21, [x21, #0x3d0]   ; -> &vm_page_size    ... holds 0
-       ldr x22, [x22, #0x378]   ; -> &mach_task_self_ ... holds 0
-       ldr x8,  [x21]           ; reads address 0 -> 0
-       lsl x2,  x8, #1          ; size = 0
-       bl  mach_vm_map          ; KERN_INVALID_ARGUMENT
+   What is known about the call, from `--trace-sys`:
 
-   That address is inside no dylib's segments and the slide information never
-   rebases it: the slot is **zero in the cache on purpose**, for dyld to fill from
-   the cache's **patch table**. A patch-table reader is written (`read_patch_table`
-   in dsc_extract) and it is *not yet producing that slot* — the next step is to look
-   at the self-check it prints, which lists a few of the symbol names it found. If
-   they read as `_vm_page_size` and friends the walk is right and the address
-   arithmetic is wrong; if they are garbage the structure offsets are wrong.
-   `dyld_cache_header.patchInfoAddr` is at 0x98.
+       [mac] -47(7FFFFFFFEC60, 200000003, 2800001513, 11040000010B, ...)  lr=180444338
+
+   x0 is the message buffer, x2 packs `msgh_bits` (0x1513 — COPY_SEND for the remote
+   port, MAKE_SEND_ONCE for the reply) with a send size of 0x28, and x3 packs the
+   remote port (0x1104, one this emulator handed out) with the local one (0x10B, the
+   host port). A reply has to be written back into the same buffer.
+
+   Expect `host_info(HOST_BASIC_INFO)` first — libpthread wants the CPU count — and
+   then probably `task_info` and `mach_ports_lookup`. Only the routines that actually
+   get called need answering; the rest should keep failing loudly.
 
    To reproduce: `dsc_extract --only /usr/lib/ -o out <cache>
-   /usr/lib/libSystem.B.dylib`, then `aarch64emu --root out out/hello`. `--watch
-   1E7FEC370:1E7FEC3E0` shows the slot being read as zero.
+   /usr/lib/libSystem.B.dylib`, then `aarch64emu --root out out/hello`.
+   `--trace-sys` shows the trap; the crash message is read by finding the string
+   pointer the code stores just before the BRK (`--watch 100000000:300000000`, filter
+   to accesses where the address is not the PC) and looking it up in the library.
 2. **arm64e chained pointers.** Only `DYLD_CHAINED_PTR_64` and `_64_OFFSET` are
    implemented. Cache libraries do not use them (they are pre-linked), so this has
    not yet bitten; a third-party arm64e dylib would. The emulator can ignore the
@@ -144,6 +148,23 @@ instructions past it, and each looked like a different problem than it was.
   `kern_return_t` in x0 and do *not* use the carry flag, unlike the BSD calls.
 - **Image initializers**, in post-order, before the entry point. Without them the
   guest reaches printf and branches through a null 57 instructions in.
+- **The cache's patch table**, for the GOT slots it deliberately leaves null. Worth
+  three notes: the walk was correct on the first attempt (the table carries symbol
+  names, so a run that prints a few of them proves it); a fixed cap of 65536 collected
+  locations against 3.65 *million* in the table stopped inside libobjc and never
+  reached the library it was being read for; and it has to run *after* the dependency
+  closure so it can be filtered to the libraries being written out.
+- **A page can be part-owned.** The cache packs several libraries' small
+  `__DATA_CONST` segments into one 16 KiB page, so "skip any page overlapping an
+  extracted library" discards the rest of that page. `&mach_task_self_` was in the
+  cache, correctly encoded, the entire time. Correspondingly the emulator maps
+  `dsc_extras` **last**, because a library whose `vmsize` exceeds its `filesize`
+  zero-fills the difference and would wipe an island mapped before it.
+- **`--dump ADDR` in dsc_extract settled that in one run**, after three readings of
+  "the slot is zero" with three different explanations. From outside, "zero in the
+  file" is indistinguishable from "never copied", and "no slide information" from "a
+  chain that skips this slot". A tool that answers the question directly is worth more
+  than another round of reasoning about which of them it is.
 
 ## Notes and gotchas
 

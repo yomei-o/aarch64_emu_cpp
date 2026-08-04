@@ -52,7 +52,7 @@ What works:
 
 ## ⏭ Next, in order
 
-1. **A real macOS binary — 75,035 instructions in, inside the ObjC runtime.** This is
+1. **A real macOS binary — 78,465 instructions in, inside the ObjC runtime.** This is
    the live front, and the guest tree for it is committed:
 
        sh prebuilt/unpack.sh                # 48 files, 85 MB unpacked, 21 MB packed
@@ -67,20 +67,26 @@ What works:
    which is `OBJC_METACLASS_$_NSObject`, in libobjc's own `__DATA_DIRTY`, failing
    `checkIsKnownClass`.
 
-   What is known: `map_images` is being called correctly now (the struct-array form; see
-   below), the `OPTIMIZED_BY_DYLD` bit is cleared in every image's `__objc_imageinfo` so
-   libobjc should read the classlists itself, and 35,793 instructions of real work happen
-   inside it. What is *not* known is why the registration does not take. Two threads to
-   pull, in order:
+   What the registration *does* do, from `tools/profile_pcs.py` over a `--sample 1` trace:
+   16% of the run is `libmacho`'s `getsegmentdata` and another 24% is `strcmp`/`strncmp`,
+   which is libobjc walking load commands looking for its sections; `map_images_nolock`,
+   `realizeClassWithoutSwift` and `load_images` all appear. So classes are being realized.
+   It is not doing nothing.
 
-   - **No image's `__objc_imageinfo` is ever read** (`--watch 1E7FF18F8:1E7FF1900` shows
-     only the emulator's own accesses). Either libobjc locates the section some other
-     way, or it is still skipping `addHeader`. Finding out what those 35,793 instructions
-     *do* is the direct route: `--sample 1` and `tools/whichlib.py` over the window
-     between the two `[call]` lines.
-   - The third field of `_dyld_objc_notify_mapped_info` is passed as zero because nothing
-     reads it either way. If libobjc turns out to locate sections through it, that is the
-     answer.
+   The remaining wall is narrower than it looked, and it is worth writing down what it is
+   *not*. `OBJC_METACLASS_$_NSObject + 32` is the class's `bits` field, and it reads as
+   `0x80006000002000C0`. That looks like an un-decoded packed cache pointer, and it is not:
+   decoding it as one gives an address inside libcorecrypto's `_ccsigma_verify`, and only
+   four slots in the whole of libobjc's data segments have the top bit set (against 4000
+   that do not), so the slide decoding is fine. The value is the shared cache's own
+   **preoptimized class encoding**, which libobjc reads with the help of its
+   `__objc_opt_ro` table.
+
+   That table is not lost: on this OS it lives *inside libobjc*, in `__TEXT,__objc_opt_ro`
+   (16 KiB), so an extracted library has it. `_dyld_for_objc_header_opt_ro` (slot 118) now
+   returns its address, which moved the guest 75,035 -> 78,465. The next step is the
+   matching `_dyld_for_objc_header_opt_rw` (117) -- a *writable* table dyld allocates,
+   which nothing here does yet -- and then whatever libobjc asks for next.
 
    `tools/dyld_slots.py` now names 98 of the vtable slots by scanning libdyld for the
    dispatch shape, so any unimplemented one is a name rather than a number. The ones

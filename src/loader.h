@@ -23,6 +23,7 @@ struct LoadedImage {
     // libdyld is among the images. Real dyld constructs that object; having replaced
     // dyld, the host has to stand in for it.
     uint64_t dyld_gapis = 0;
+    uint64_t objc_opt_ro = 0;
     // Every loaded image, in load order: the path the guest should see and where its
     // mach_header landed. libobjc's `map_images` wants exactly these two arrays, and
     // nothing else in the emulator has the list.
@@ -113,6 +114,11 @@ struct MachoImage {
     // tells libobjc its classes are already in the shared cache's tables and it need not
     // read the classlist -- true on a Mac, and a dead end here.
     std::vector<uint64_t> objc_imageinfo;
+    // libobjc's own `__TEXT,__objc_opt_ro`: the shared cache's ObjC optimisation header,
+    // which on this OS lives inside libobjc rather than in a separate cache region.
+    // dyld hands its address to libobjc, and libobjc needs it to interpret the
+    // preoptimized class layout the cache uses.
+    uint64_t objc_opt_ro = 0;
 
     // Where the mach_header actually landed. Chained rebases in the OFFSET format
     // are measured from here, not from the slide.

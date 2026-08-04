@@ -388,6 +388,11 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
         if (end > high) high = end;
     }
 
+    for (const MachoImage& img : images)
+        // The section's `addr` is already a virtual address in the image's own terms, so
+        // the slide is all that has to be added -- the same rule the segments follow.
+        if (img.objc_opt_ro) { out->objc_opt_ro = img.slide + img.objc_opt_ro; break; }
+
     // Tell libobjc these images are *not* preoptimized.
     //
     // Every cache dylib's `__objc_imageinfo` has OPTIMIZED_BY_DYLD set, which is libobjc's

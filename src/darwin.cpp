@@ -211,6 +211,14 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // _dyld_get_active_platform. PLATFORM_MACOS is 1; returning 0 would be
         // PLATFORM_UNKNOWN, and libSystem branches on it.
         case 66: return 1;
+        // _dyld_for_objc_header_opt_ro. On this OS the shared cache's ObjC optimisation
+        // header lives inside libobjc itself, in `__TEXT,__objc_opt_ro` -- so unlike the
+        // rest of the cache's tables, it is *present* in an extracted library and only
+        // needs pointing at. libobjc uses it to interpret the preoptimized class layout,
+        // which is what `OBJC_METACLASS_$_NSObject`'s data field is in: its `bits` field
+        // decodes to nonsense read as an ordinary pointer, and only four slots in the
+        // whole of libobjc's data have the top bit set, so it is not an unpacked pointer.
+        case 118: return static_cast<int64_t>(objc_opt_ro_);
         // _dyld_objc_register_callbacks. libobjc hands dyld the functions it wants called
         // when images are mapped -- `map_images` is what registers every class in every
         // loaded image, so without it the first `objc_msgSend` finds an unknown class:

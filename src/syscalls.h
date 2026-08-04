@@ -29,6 +29,10 @@ public:
     // Signal delivery, in signals.cpp. Returns false when nothing is installed --
     // then the caller reports the fault, which is the default action anyway.
     bool deliver_signal(int sig, uint64_t fault_addr);
+    // The Darwin commpage, in darwin.cpp. The host places it before the guest starts,
+    // because libsyscall reads the page size out of it during startup and a zero there
+    // makes every allocation round to nothing.
+    void setup_commpage();
     // The address a handler returns to when the guest supplied no restorer.
     static constexpr uint64_t kSigreturnMagic = 0x0000'0000'DEAD'0000ull;
 
@@ -85,6 +89,11 @@ private:
     // fallback; main.cpp places it clear of the image, the interpreter and the stack.
     uint64_t mmap_next_ = 0x0000'7F40'0000'0000ull;
     uint64_t tid_address_ = 0;
+    // Mach port names. Nothing here delivers a message, so a port only has to be a
+    // number that is non-zero and distinct: the guest stores it, compares it, and
+    // fails only if it is zero. Handing out the same one twice would make two
+    // different things compare equal.
+    uint32_t next_port_ = 0x1103;
 };
 
 }  // namespace a64

@@ -789,12 +789,25 @@ static int range_cmp(const void* a, const void* b) {
     return x < y ? -1 : (x > y ? 1 : 0);
 }
 
+// Only the libraries actually being extracted count as owned.
+//
+// The first version excluded every page owned by *any* image in the cache, on the
+// reasoning that such a page belongs to that library and not to us. That is wrong,
+// and the way it is wrong is instructive: the cache coalesces GOT entries, so the
+// slot libsystem_platform reads to find `vm_page_size` sits at 0x1E7FEC378 -- inside
+// a *different* library's __DATA_CONST. Excluding it left the collected run ending at
+// 0x1E7FEC000, 0x378 short, and the guest read a zero where a pointer belonged.
+//
+// So a page is skipped only when it is inside a library that is being written out
+// anyway. Everything else the slide information rebases comes along.
 static void build_owned_ranges(void) {
     size_t cap = 4096;
     owned = malloc(cap * sizeof *owned);
     if (!owned) die("out of memory");
-    for (uint32_t k = 0; k < images_count; ++k) {
-        const uint8_t* mh = at(image_addr((int)k), sizeof(struct mach_header_64));
+    for (int wi = 0; wi < nwant; ++wi) {
+        const int k = find_image(want[wi]);
+        if (k < 0) continue;
+        const uint8_t* mh = at(image_addr(k), sizeof(struct mach_header_64));
         if (!mh) continue;
         struct mach_header_64 h;
         memcpy(&h, mh, sizeof h);

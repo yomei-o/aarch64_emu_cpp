@@ -73,6 +73,59 @@ int darwin_oflags_to_linux(int f) {
 
 }  // namespace
 
+// The commpage: a read-only page the Darwin kernel maps at a fixed address so that
+// userland can read machine properties without a syscall. libsyscall builds
+// `vm_page_size` from the page shift found here, and libplatform sizes its
+// allocations in pages -- so an all-zero commpage means a page size of one byte, a
+// rounded-up allocation of zero bytes, and `BUG IN LIBPLATFORM: Failed to allocate in
+// os_alloc_once` from a kernel interface that looked like it was working.
+//
+// The offsets are xnu's `cpu_capabilities.h`. Filling in only the fields a userland
+// libc reads is deliberate: an invented value in an unread field is harmless, but an
+// invented value in a read one is a wrong answer that looks like a working guest.
+void Syscalls::setup_commpage() {
+    // Two base addresses, both filled identically.
+    //
+    // 0xF_FFFFC000 is _COMM_PAGE64_BASE_ADDRESS (nine hex digits, not eight -- writing
+    // 0xFFFFC000 puts the page four bits low, where nothing reads it, and the guest
+    // then computes a page size of zero). macOS 13 split the commpage in two, moving
+    // the constant fields to a read-only page 32 KiB below, and libsystem_kernel on
+    // Sequoia reads its page shift from *there*: a watch on the range showed a byte
+    // read at 0xF_FFFF4037, which is KERNEL_PAGE_SHIFT's offset.
+    //
+    // Which field lives on which page is not something to guess at, so both get the
+    // same layout. A duplicated field costs nothing; a missing one is read as zero and
+    // turns into a wrong answer several hundred instructions away.
+    auto fill = [this](uint64_t base) {
+        mem_.set(base, 0, 0x4000);
+        const char sig[] = "commpage 64-bit";
+        mem_.write_bytes(base + 0x000, sig, sizeof sig);
+        mem_.write<uint64_t>(base + 0x010, 0);          // CPU_CAPABILITIES64: claim nothing
+        mem_.write<uint16_t>(base + 0x01E, 3);          // VERSION
+        mem_.write<uint16_t>(base + 0x020, 0);          // CPU_CAPABILITIES
+        mem_.write<uint8_t>(base + 0x022, 1);           // NCPUS
+        mem_.write<uint8_t>(base + 0x024, 14);          // USER_PAGE_SHIFT_32: 16 KiB
+        mem_.write<uint8_t>(base + 0x025, 14);          // USER_PAGE_SHIFT_64: 16 KiB
+        mem_.write<uint8_t>(base + 0x026, 6);           // CACHE_LINESIZE shift (64 bytes)
+        mem_.write<uint32_t>(base + 0x028, 1);          // SCHED_GEN
+        mem_.write<uint32_t>(base + 0x02C, 0);          // MEMORY_PRESSURE
+        mem_.write<uint32_t>(base + 0x030, 100);        // SPIN_COUNT
+        mem_.write<uint8_t>(base + 0x034, 1);           // ACTIVE_CPUS
+        mem_.write<uint8_t>(base + 0x035, 1);           // PHYSICAL_CPUS
+        mem_.write<uint8_t>(base + 0x036, 1);           // LOGICAL_CPUS
+        mem_.write<uint8_t>(base + 0x037, 14);          // KERNEL_PAGE_SHIFT: 16 KiB
+        mem_.write<uint64_t>(base + 0x038, 8ull << 30); // MEMORY_SIZE: 8 GiB
+        mem_.write<uint32_t>(base + 0x040, 0x1B588BB3); // CPUFAMILY: an Apple M-series
+        mem_.write<uint32_t>(base + 0x044, 0);          // KDEBUG_ENABLE
+        // The timebase, matched to what mach_timebase_info_trap reports: 1/1, so
+        // mach_absolute_time is nanoseconds.
+        mem_.write<uint32_t>(base + 0x0C0, 1);          // numer
+        mem_.write<uint32_t>(base + 0x0C4, 1);          // denom
+    };
+    fill(0x0000'000F'FFFF'C000ull);
+    fill(0x0000'000F'FFFF'4000ull);
+}
+
 // Returns false to stop the machine (only for exit).
 bool Syscalls::svc_darwin() {
     const int64_t nr = static_cast<int64_t>(cpu_.xr(16));
@@ -80,9 +133,17 @@ bool Syscalls::svc_darwin() {
     const uint64_t a3 = cpu_.xr(3);
 
     if (trace) {
-        std::fprintf(stderr, "[mac] %lld(%llX, %llX, %llX)\n",
+        // All six, because a Mach trap's arguments are positional and getting the
+        // layout wrong looks exactly like the guest passing nonsense.
+        // x30 as well: these trap stubs are three instructions long, so the return
+        // address is the only way to see which library asked.
+        std::fprintf(stderr, "[mac] %lld(%llX, %llX, %llX, %llX, %llX, %llX)  lr=%llX\n",
                      static_cast<long long>(nr), static_cast<unsigned long long>(a0),
-                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2));
+                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                     static_cast<unsigned long long>(a3),
+                     static_cast<unsigned long long>(cpu_.xr(4)),
+                     static_cast<unsigned long long>(cpu_.xr(5)),
+                     static_cast<unsigned long long>(cpu_.xr(30)));
     }
 
     int64_t r = 0;          // the success value
@@ -90,30 +151,74 @@ bool Syscalls::svc_darwin() {
 
     // A Mach trap, not a BSD syscall: a different table reached through the same
     // instruction, distinguished only by the sign of x16.
+    //
+    // The return convention differs too. A Mach trap returns a `kern_return_t` in x0
+    // and leaves the carry flag alone -- there is no errno and no flag. Reporting
+    // failure the BSD way here would make a successful allocation look like an error
+    // and vice versa.
     if (nr < 0) {
+        const uint64_t a4 = cpu_.xr(4), a5 = cpu_.xr(5);
+        constexpr int64_t kKernSuccess = 0, kKernFailure = 5, kKernInvalidArgument = 4;
+        // A Mach VM allocation, from the same arena BSD mmap uses. Honours the
+        // alignment mask and VM_FLAGS_ANYWHERE, and writes the address back through
+        // the pointer the caller passed -- which is the part that matters: libmalloc
+        // reads its zone address from there and does not check it against anything.
+        auto vm_alloc = [&](uint64_t addr_ptr, uint64_t size, uint64_t mask,
+                            uint64_t flags) -> int64_t {
+            if (!size) return kKernInvalidArgument;
+            const bool anywhere = (flags & 1) != 0;        // VM_FLAGS_ANYWHERE
+            if (!anywhere) {
+                // A fixed request: the address is already what the caller wants, and
+                // memory here is allocated on touch, so honouring it is just zeroing.
+                const uint64_t want = mem_.read<uint64_t>(addr_ptr);
+                mem_.set(want, 0, size);
+                return kKernSuccess;
+            }
+            const int64_t got = sys_mmap(0, size + mask, 0, 0x20 /*MAP_ANON*/, -1, 0);
+            if (got < 0) return kKernFailure;
+            const uint64_t aligned = (static_cast<uint64_t>(got) + mask) & ~mask;
+            mem_.set(aligned, 0, size);
+            mem_.write<uint64_t>(addr_ptr, aligned);
+            return kKernSuccess;
+        };
+
         switch (-nr) {
-            case 26: r = 0x203; break;                    // mach_reply_port
-            case 27: r = 0x103; break;                    // thread_self_trap
-            case 28: r = 0x107; break;                    // task_self_trap
-            case 29: r = 0x10B; break;                    // host_self_trap
-            case 61: r = 0; break;                        // swtch_pri: yield, nothing to yield to
-            case 89: {                                    // mach_timebase_info_trap
+            // ---- Mach VM. libmalloc builds its zones through these, so a guest that
+            // reaches malloc reaches here.
+            case 10: r = vm_alloc(a1, a2, 0, a3); break;   // mach_vm_allocate_trap
+            case 15: r = vm_alloc(a1, a2, a3, a4); break;  // mach_vm_map_trap
+            case 12: r = kKernSuccess; break;              // mach_vm_deallocate: arena only grows
+            case 14: r = kKernSuccess; break;              // mach_vm_protect: nothing modelled
+            case 11: r = kKernSuccess; break;              // mach_vm_purgable_control
+            // ---- Mach ports. Nothing here delivers messages, so a port is a number
+            // that has to be non-zero and distinct; the guest stores it and compares
+            // it, and only fails if it is zero.
+            case 16: mem_.write<uint32_t>(a2, next_port_++); r = kKernSuccess; break;
+            case 24: mem_.write<uint32_t>(a3, next_port_++); r = kKernSuccess; break;
+            case 18: case 19: case 21: case 22: r = kKernSuccess; break;
+            case 26: r = next_port_++; break;              // mach_reply_port
+            case 27: r = 0x103; break;                     // thread_self_trap
+            case 28: r = 0x107; break;                     // task_self_trap
+            case 29: r = 0x10B; break;                     // host_self_trap
+            case 61: case 62: r = kKernSuccess; break;     // swtch_pri, thread_switch
+            case 89: {                                     // mach_timebase_info_trap
                 // numer/denom of 1/1 makes mach_absolute_time() nanoseconds, which
                 // is what the host clock already hands back.
                 mem_.write<uint32_t>(a0, 1);
                 mem_.write<uint32_t>(a0 + 4, 1);
-                r = 0;
+                r = kKernSuccess;
                 break;
             }
             default:
                 std::fprintf(stderr, "[mac] unimplemented Mach trap %lld at PC %016llX\n",
                              static_cast<long long>(nr),
                              static_cast<unsigned long long>(cpu_.pc - 4));
-                err = kBsdENOSYS;
+                r = kKernFailure;
                 break;
         }
-        cpu_.setx(0, err ? static_cast<uint64_t>(err) : static_cast<uint64_t>(r));
-        cpu_.c = err != 0;
+        (void)a5;
+        cpu_.setx(0, static_cast<uint64_t>(r));
+        cpu_.c = false;
         return true;
     }
 

@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
     using namespace a64;
 
     bool trace_sys = false, stats = false, macho_info = false;
-    uint64_t max_insns = 0, sample = 0;
+    uint64_t max_insns = 0, sample = 0, watch_lo = 0, watch_hi = 0;
     // The guest sees this directory as "/". Defaulting to the host cwd means a
     // relative path from the guest lands where a user would expect it to.
     std::string root = ".";
@@ -44,6 +44,16 @@ int main(int argc, char** argv) {
         if (a == "--trace-sys") trace_sys = true;
         else if (a == "--stats") stats = true;
         else if (a == "--macho-info") macho_info = true;
+        // --watch LO:HI — log every guest access in an address range, with the PC that
+        // made it. For questions of the form "the guest read a zero, but from where".
+        else if (a == "--watch" && i + 1 < argc) {
+            const std::string spec = argv[++i];
+            const size_t colon = spec.find(':');
+            watch_lo = std::strtoull(spec.c_str(), nullptr, 16);
+            watch_hi = colon == std::string::npos
+                           ? watch_lo + 0x4000
+                           : std::strtoull(spec.c_str() + colon + 1, nullptr, 16);
+        }
         else if (a == "--max" && i + 1 < argc) max_insns = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--sample" && i + 1 < argc) sample = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--root" && i + 1 < argc) root = argv[++i];
@@ -104,6 +114,17 @@ int main(int argc, char** argv) {
     cpu.sample_every = sample;
     Syscalls sys(cpu, mem);
     sys.trace = trace_sys;
+    if (watch_hi) {
+        mem.watch_lo = watch_lo;
+        mem.watch_hi = watch_hi;
+        mem.on_watch = [&cpu](uint64_t addr, unsigned size, uint64_t value, bool is_write) {
+            std::fprintf(stderr, "[watch] %s %u @ %010llX = %llX   from PC %010llX\n",
+                         is_write ? "write" : "read ", size,
+                         static_cast<unsigned long long>(addr),
+                         static_cast<unsigned long long>(value),
+                         static_cast<unsigned long long>(cpu.pc));
+        };
+    }
     // An instruction we do not implement is delivered to the guest as SIGILL when it
     // has a handler. OpenSSL's CPU probes depend on exactly that.
     cpu.on_undefined = [&sys](uint32_t, uint64_t at) { return sys.deliver_signal(4, at); };
@@ -217,6 +238,7 @@ int main(int argc, char** argv) {
     sys.exe_path = guest_exe;
     sys.files.set_root(root);
     sys.set_mmap_base(kMmapBase);
+    if (darwin) sys.setup_commpage();
 
     int rc = 0;
     try {

@@ -15,6 +15,7 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -44,13 +45,35 @@ public:
     // Reads and writes never straddle a page here: guest accesses are at most 16
     // bytes and pages are 64 KiB, so only the rare unaligned access near a page
     // edge needs the slow path, which byte-copies.
+    // An optional watch on an address range, reported through `on_watch`. Off by
+    // default and one predictable branch when off.
+    //
+    // This exists because of a specific class of question that guessing cannot
+    // answer: a guest read a zero from somewhere and computed nonsense from it, and
+    // the useful thing to know is *which address* it read. Reasoning about which
+    // structure "should" have supplied the value is how an afternoon goes missing.
+    uint64_t watch_lo = 0, watch_hi = 0;
+    std::function<void(uint64_t addr, unsigned size, uint64_t value, bool is_write)> on_watch;
+
     template <typename T> T read(uint64_t a) {
-        if (((a & kPageMask) + sizeof(T)) <= kPageSize) {
-            T v; std::memcpy(&v, page(a) + (a & kPageMask), sizeof(T)); return v;
+        T v;
+        if (((a & kPageMask) + sizeof(T)) <= kPageSize)
+            std::memcpy(&v, page(a) + (a & kPageMask), sizeof(T));
+        else
+            read_bytes(a, &v, sizeof(T));
+        if (watch_hi && a >= watch_lo && a < watch_hi && on_watch) {
+            uint64_t as_u64 = 0;
+            std::memcpy(&as_u64, &v, sizeof(T) > 8 ? 8 : sizeof(T));
+            on_watch(a, sizeof(T), as_u64, false);
         }
-        T v; read_bytes(a, &v, sizeof(T)); return v;
+        return v;
     }
     template <typename T> void write(uint64_t a, T v) {
+        if (watch_hi && a >= watch_lo && a < watch_hi && on_watch) {
+            uint64_t as_u64 = 0;
+            std::memcpy(&as_u64, &v, sizeof(T) > 8 ? 8 : sizeof(T));
+            on_watch(a, sizeof(T), as_u64, true);
+        }
         if (((a & kPageMask) + sizeof(T)) <= kPageSize) {
             std::memcpy(page(a) + (a & kPageMask), &v, sizeof(T)); return;
         }

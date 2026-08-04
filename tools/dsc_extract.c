@@ -109,12 +109,28 @@ struct region {
     const uint8_t* base;      // where in the mapped file that address lives
 };
 
+// A mapping that also carries slide information. This is the part that makes a
+// naive extraction produce a library that links and then branches to nonsense: the
+// pointers in a cache's __DATA and __AUTH segments are **not pointers**. They are
+// packed `dyld_cache_slide_pointer3` values -- an offset from the cache base plus,
+// for authenticated ones, a signing key and a diversity value -- threaded into
+// per-page chains. The kernel rewrites them when it maps the cache. Copy them
+// verbatim and the guest reads something like 0x80140000004377AC as a function
+// pointer, where 0x8014… is the signature field and 0x4377AC is the real offset.
+struct slidemap {
+    uint64_t addr, size;
+    const uint8_t* info;      // the dyld_cache_slide_info for this mapping
+    uint64_t info_size;
+};
+
 static struct {
     const uint8_t* file[MAX_FILES];
     size_t file_size[MAX_FILES];
     int nfiles;
     struct region map[MAX_MAPS];
     int nmaps;
+    struct slidemap slide[MAX_MAPS];
+    int nslides;
     const uint8_t* main;      // the main cache file, which holds the image paths
     size_t main_size;
 } C;
@@ -171,6 +187,33 @@ static void add_cache_file(const uint8_t* f, size_t size, const char* label) {
         C.map[C.nmaps].base = f + m.fileOffset;
         C.nmaps++;
     }
+    // The slide information lives in a *second*, parallel mapping table --
+    // mappingWithSlideOffset/Count at 0x138/0x13C -- with the same address ranges plus
+    // a slideInfoFileOffset into this same file. Older caches have neither field, and
+    // then there is nothing to decode.
+    if (size > 0x140) {
+        uint32_t ws_off, ws_count;
+        memcpy(&ws_off, f + 0x138, 4);
+        memcpy(&ws_count, f + 0x13C, 4);
+        if (ws_off && ws_off + (size_t)ws_count * 56 <= size) {
+            for (uint32_t i = 0; i < ws_count; ++i) {
+                const uint8_t* e = f + ws_off + (size_t)i * 56;
+                uint64_t addr, msize, si_off, si_size;
+                memcpy(&addr, e, 8);
+                memcpy(&msize, e + 8, 8);
+                memcpy(&si_off, e + 24, 8);
+                memcpy(&si_size, e + 32, 8);
+                if (!si_off || !si_size || si_off + si_size > size) continue;
+                if (C.nslides >= MAX_MAPS) die("too many slide mappings");
+                C.slide[C.nslides].addr = addr;
+                C.slide[C.nslides].size = msize;
+                C.slide[C.nslides].info = f + si_off;
+                C.slide[C.nslides].info_size = si_size;
+                C.nslides++;
+            }
+        }
+    }
+
     C.file[C.nfiles] = f;
     C.file_size[C.nfiles] = size;
     C.nfiles++;
@@ -193,6 +236,80 @@ static const uint8_t* at_linkedit(uint64_t seg_vmaddr, uint64_t seg_fileoff,
     if (!size) return NULL;
     if (off < seg_fileoff) return NULL;
     return at(seg_vmaddr + (off - seg_fileoff), size);
+}
+
+// ---- slide information ------------------------------------------------------
+//
+// Turn a segment's copied bytes into real pointers. The chains are per page and are
+// described by dyld_cache_slide_info3:
+//
+//     uint32 version (3), page_size, page_starts_count, pad
+//     uint64 auth_value_add
+//     uint16 page_starts[page_starts_count]      0xFFFF = nothing on this page
+//
+// Each slot is a union: bit 63 says whether it is authenticated. Authenticated slots
+// hold an offset from the cache base in the low 32 bits (the signature above it is
+// discarded -- there is no PAC here, and the emulator treats signing as the
+// identity). Plain slots hold a 51-bit value whose top 8 bits are shifted down, a
+// packing that has to be undone exactly or every pointer lands 8 TiB away.
+//
+// Cache segments are not page aligned, so a chain can begin in the previous
+// library's bytes and run into ours: the walk follows the whole chain and writes back
+// only the slots that fall inside this segment.
+static int slide_unsupported_version;
+
+static void apply_slide(uint8_t* dst, uint64_t seg_addr, uint64_t seg_size) {
+    for (int m = 0; m < C.nslides; ++m) {
+        const struct slidemap* sm = &C.slide[m];
+        if (seg_addr >= sm->addr + sm->size || seg_addr + seg_size <= sm->addr) continue;
+        uint32_t version, page_size, page_count;
+        memcpy(&version, sm->info, 4);
+        memcpy(&page_size, sm->info + 4, 4);
+        memcpy(&page_count, sm->info + 8, 4);
+        if (version != 3) {
+            if (!slide_unsupported_version) {
+                fprintf(stderr, "  ! slide info version %u is not implemented; pointers in "
+                                "data segments will be left packed and the result will not "
+                                "run\n", version);
+                slide_unsupported_version = version;
+            }
+            continue;
+        }
+        uint64_t auth_value_add;
+        memcpy(&auth_value_add, sm->info + 16, 8);
+        const uint8_t* starts = sm->info + 24;
+        if (24 + (size_t)page_count * 2 > sm->info_size) continue;
+
+        for (uint32_t p = 0; p < page_count; ++p) {
+            uint16_t start;
+            memcpy(&start, starts + (size_t)p * 2, 2);
+            if (start == 0xFFFF) continue;
+            const uint64_t page_addr = sm->addr + (uint64_t)p * page_size;
+            if (page_addr >= seg_addr + seg_size || page_addr + page_size <= seg_addr) continue;
+            uint64_t addr = page_addr + start;
+            for (;;) {
+                const uint8_t* src = at(addr, 8);
+                if (!src) break;
+                uint64_t raw;
+                memcpy(&raw, src, 8);
+                uint64_t value;
+                if (raw >> 63) {                       // authenticated
+                    value = auth_value_add + (raw & 0xFFFFFFFFull);
+                } else {
+                    const uint64_t v = raw & 0x0007FFFFFFFFFFFFull;   // 51 bits
+                    const uint64_t top8 = v & 0x0007F80000000000ull;
+                    const uint64_t bottom43 = v & 0x000007FFFFFFFFFFull;
+                    value = (top8 << 13) | bottom43;
+                }
+                if (addr >= seg_addr && addr + 8 <= seg_addr + seg_size)
+                    memcpy(dst + (addr - seg_addr), &value, 8);
+                const uint64_t next = (raw >> 51) & 0x7FF;
+                if (!next) break;
+                addr += next * 8;
+                if (addr >= page_addr + page_size) break;    // a chain stays on its page
+            }
+        }
+    }
 }
 
 // ---- the image table --------------------------------------------------------
@@ -441,6 +558,9 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
                 ob_pad(&ob, 16384);
                 const size_t new_off = ob_put(&ob, src, sc.filesize);
                 pt->segs += sc.filesize;
+                // Undo the cache's pointer packing in the copy, which is the step
+                // that turns a library that loads into a library that runs.
+                apply_slide(ob.p + new_off, sc.vmaddr, sc.filesize);
                 // Patch this segment's fileoff, and every section's offset with it.
                 const uint64_t delta_from = sc.fileoff;
                 struct segment_command_64* dst =

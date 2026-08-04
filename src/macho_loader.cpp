@@ -30,6 +30,7 @@ constexpr uint32_t LC_SEGMENT_64 = 0x19, LC_LOAD_DYLINKER = 0x0E, LC_LOAD_DYLIB 
                    LC_MAIN = 0x80000028u, LC_UNIXTHREAD = 0x05,
                    LC_DYLD_INFO_ONLY = 0x80000022u, LC_DYLD_CHAINED_FIXUPS = 0x80000034u,
                    LC_DYLD_EXPORTS_TRIE = 0x80000033u, LC_LOAD_WEAK_DYLIB = 0x80000018u,
+                   LC_REEXPORT_DYLIB = 0x8000001Fu, LC_LOAD_UPWARD_DYLIB = 0x80000023u,
                    LC_RPATH = 0x8000001Cu;
 
 struct MachHeader64 {
@@ -93,6 +94,21 @@ bool macho_parse(const std::vector<uint8_t>& f, MachoImage* out, std::string* er
                     out->segs.push_back({name, sc.vmaddr, sc.vmsize, sc.fileoff, sc.filesize});
                     if (sc.vmaddr + sc.vmsize > out->vm_end) out->vm_end = sc.vmaddr + sc.vmsize;
                 }
+                // Initializer sections, found by section *type* rather than by name:
+                // __mod_init_func and __init_offsets are the conventional names but
+                // the type is what the loader is specified to look at.
+                for (uint32_t s = 0; s < sc.nsects; ++s) {
+                    const size_t so = o + sizeof sc + s * 80;
+                    if (so + 80 > f.size()) break;
+                    uint64_t addr, size;
+                    uint32_t sflags;
+                    std::memcpy(&addr, f.data() + so + 32, 8);
+                    std::memcpy(&size, f.data() + so + 40, 8);
+                    std::memcpy(&sflags, f.data() + so + 64, 4);
+                    const uint32_t type = sflags & 0xFF;
+                    if (type == 0x09) out->inits.push_back({addr, size, false});
+                    else if (type == 0x16) out->inits.push_back({addr, size, true});
+                }
                 // __TEXT starts at the mach_header, so its vmaddr is the image base.
                 if (name == "__TEXT") out->text_vmaddr = sc.vmaddr;
                 break;
@@ -113,9 +129,17 @@ bool macho_parse(const std::vector<uint8_t>& f, MachoImage* out, std::string* er
             case LC_ID_DYLIB:
                 out->install_name = lc_string(f.data(), o, cmdsize, 8);
                 break;
+            // All four kinds go into one list, in order: `lib_ordinal` in a chained
+            // import indexes this sequence, so skipping a kind renumbers the rest.
             case LC_LOAD_DYLIB:
             case LC_LOAD_WEAK_DYLIB:
+            case LC_REEXPORT_DYLIB:
+            case LC_LOAD_UPWARD_DYLIB:
                 out->dylibs.push_back(lc_string(f.data(), o, cmdsize, 8));
+                out->dylib_kind.push_back(
+                    cmd == LC_LOAD_DYLIB ? MachoImage::kLoad :
+                    cmd == LC_LOAD_WEAK_DYLIB ? MachoImage::kWeak :
+                    cmd == LC_REEXPORT_DYLIB ? MachoImage::kReexport : MachoImage::kUpward);
                 out->needs_dyld = true;
                 break;
             case LC_RPATH:

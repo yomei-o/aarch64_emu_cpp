@@ -83,9 +83,17 @@ int main(int argc, char** argv) {
                     img.exports_size, img.nsyms, img.fixups_size);
         for (const std::string& d : img.dylibs) std::printf("  needs %s\n", d.c_str());
         for (int k = i + 1; k < argc; ++k) {
-            const uint64_t a = macho_lookup_export(img, argv[k]);
-            if (a) std::printf("  %-40s -> %012llX\n", argv[k], static_cast<unsigned long long>(a));
-            else   std::printf("  %-40s -> not exported\n", argv[k]);
+            const MachoExport e = macho_lookup_export(img, argv[k]);
+            if (e.found && e.reexport)
+                std::printf("  %-40s -> re-exported from %s as %s\n", argv[k],
+                            e.ordinal >= 1 && e.ordinal <= img.dylibs.size()
+                                ? img.dylibs[e.ordinal - 1].c_str() : "?",
+                            e.import_name.empty() ? argv[k] : e.import_name.c_str());
+            else if (e.found)
+                std::printf("  %-40s -> +%llX from the header\n", argv[k],
+                            static_cast<unsigned long long>(e.offset));
+            else
+                std::printf("  %-40s -> not exported\n", argv[k]);
         }
         return 0;
     }
@@ -212,6 +220,36 @@ int main(int argc, char** argv) {
 
     int rc = 0;
     try {
+        // Darwin: dyld runs every image's initializers before calling main, and
+        // libSystem's are what create malloc's zones, the stdio streams and the
+        // pthread machinery. Skipping them gets as far as printf and then branches
+        // through a null pointer 57 instructions in, which is where this started.
+        //
+        // Each is called as init(argc, argv, envp, apple) with X30 pointing at an
+        // address the guest never executes, so "it returned" is detectable.
+        if (!img.initializers.empty()) {
+            constexpr uint64_t kInitReturn = 0x0000'0000'DEAD'1000ull;
+            const uint64_t sp0 = cpu.sp;
+            const uint64_t argc_g = mem.read<uint64_t>(sp0);
+            const uint64_t argv_g = sp0 + 8;
+            const uint64_t envp_g = argv_g + (argc_g + 1) * 8;
+            uint64_t apple_g = envp_g;
+            while (mem.read<uint64_t>(apple_g)) apple_g += 8;
+            apple_g += 8;
+            for (size_t k = 0; k < img.initializers.size(); ++k) {
+                cpu.sp = sp0;
+                cpu.pc = img.initializers[k];
+                cpu.setx(0, argc_g);
+                cpu.setx(1, argv_g);
+                cpu.setx(2, envp_g);
+                cpu.setx(3, apple_g);
+                cpu.setx(30, kInitReturn);
+                while (!cpu.halted && cpu.pc != kInitReturn) cpu.step();
+                if (cpu.halted) break;
+            }
+            cpu.sp = sp0;
+            cpu.pc = start_pc ? start_pc : img.entry;
+        }
         cpu.run();
         rc = cpu.exit_code;
     } catch (const CpuError& e) {

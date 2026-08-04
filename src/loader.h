@@ -15,6 +15,10 @@ struct LoadedImage {
     uint64_t brk = 0;            // first page above the image: where the heap starts
     std::string interp;          // non-empty for a dynamically linked binary
     uint64_t tls_vaddr = 0, tls_filesz = 0, tls_memsz = 0, tls_align = 0;
+    // Mach-O only: the image initializers, deepest dependency first. On Darwin the
+    // loader must call these before the entry point; on Linux the guest's own ld.so
+    // does it, which is why the ELF path leaves this empty.
+    std::vector<uint64_t> initializers;
 };
 
 // `base` is where to place an ET_DYN (PIE or shared object) image; ignored for
@@ -62,9 +66,25 @@ struct MachoImage {
     bool has_main = false;
     bool needs_dyld = false;         // has imports, not merely an LC_LOAD_DYLINKER
     std::string dylinker, install_name;
-    std::vector<std::string> dylibs, rpaths;
+    // Every dylib-referencing load command, **in load-command order**, because a
+    // chained import's `lib_ordinal` is a 1-based index into exactly that sequence.
+    // Leaving LC_REEXPORT_DYLIB or LC_LOAD_UPWARD_DYLIB out of it does not merely
+    // lose a dependency, it shifts every later ordinal and binds symbols to the
+    // wrong library.
+    std::vector<std::string> dylibs;
+    enum DylibKind : uint8_t { kLoad, kWeak, kReexport, kUpward };
+    std::vector<uint8_t> dylib_kind;      // parallel to `dylibs`
+    std::vector<std::string> rpaths;
     struct Seg { std::string name; uint64_t vmaddr, vmsize, fileoff, filesize; };
     std::vector<Seg> segs;
+    // Where an image's initializers live. dyld runs these before main, and libSystem's
+    // are what create malloc's zones, the stdio streams and the pthread machinery --
+    // so a program that skips them reaches printf and branches through a null pointer.
+    // Two encodings, both in use: a list of 64-bit pointers (S_MOD_INIT_FUNC_POINTERS,
+    // rebased like any other pointer) or a list of 32-bit offsets from the mach_header
+    // (S_INIT_FUNC_OFFSETS, which is what the current toolchain emits).
+    struct InitSec { uint64_t addr = 0, size = 0; bool offsets = false; };
+    std::vector<InitSec> inits;
     uint32_t fixups_off = 0, fixups_size = 0;
     uint32_t exports_off = 0, exports_size = 0;
     uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
@@ -81,7 +101,19 @@ struct MachoImage {
 
 bool macho_parse(const std::vector<uint8_t>& f, MachoImage* out, std::string* err);
 void macho_map(const MachoImage& img, Memory& mem);
-uint64_t macho_lookup_export(const MachoImage& img, const std::string& sym);
+
+// The result of an export-trie lookup. A hit is not always an address: a library can
+// export a name by *re-exporting* it from another, which is how libSystem exports
+// the whole of libc while containing almost no code. The caller has to follow that
+// edge, so the lookup reports it instead of pretending the symbol is absent.
+struct MachoExport {
+    bool found = false;
+    uint64_t offset = 0;          // from the mach_header, not a virtual address
+    bool reexport = false;
+    unsigned ordinal = 0;         // into the exporting image's `dylibs`
+    std::string import_name;      // the name in that library, when renamed
+};
+MachoExport macho_lookup_export(const MachoImage& img, const std::string& sym);
 
 // Loads a dynamically linked Mach-O and everything it needs, then does dyld's job:
 // walks LC_DYLD_CHAINED_FIXUPS and writes the rebased and bound pointers. Apple's

@@ -227,7 +227,25 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // which is what `OBJC_METACLASS_$_NSObject`'s data field is in: its `bits` field
         // decodes to nonsense read as an ordinary pointer, and only four slots in the
         // whole of libobjc's data have the top bit set, so it is not an unpacked pointer.
-        case 118: return static_cast<int64_t>(objc_opt_ro_);
+        // _dyld_for_objc_header_opt_ro. The name means what it says and it took a while to
+        // hear: the **header**-opt table, not the `objc_opt_t` header. libobjc binary-searches
+        // what it gets back — `map_images_nolock` loads a count and an entry size from the
+        // first two words and bisects on a mach_header address — so handing it the opt header
+        // made it read version 16 as a count of 16 and flags 6 as an entry size of 6, and
+        // search a table that does not exist. `headeropt_ro` is at the opt header's +12
+        // offset, holds 2,799 entries of 24 bytes, and entry 0 is libobjc at 0x180078000,
+        // which is exactly where the loader put it.
+        case 118: {
+            if (!objc_opt_ro_) return 0;
+            const int32_t off = static_cast<int32_t>(mem_.read<uint32_t>(objc_opt_ro_ + 12));
+            const uint64_t hdr = off ? objc_opt_ro_ + static_cast<uint64_t>(static_cast<int64_t>(off)) : 0;
+            if (trace)
+                std::fprintf(stderr, "[objc] headeropt_ro -> %012llX (count=%u entsize=%u)\n",
+                             static_cast<unsigned long long>(hdr),
+                             hdr ? mem_.read<uint32_t>(hdr) : 0,
+                             hdr ? mem_.read<uint32_t>(hdr + 4) : 0);
+            return static_cast<int64_t>(hdr);
+        }
         // _dyld_get_objc_selector(const char* name) -> SEL, or 0 if the cache has no such
         // selector. This is how libobjc uniques a selector when it believes it is running
         // against a shared cache — and having told it that (slot 63), the host owes it a
@@ -585,6 +603,41 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
             if (reply_cap && size > reply_cap) return kKernFailure;
             reply_header(size);
             mem_.write<uint32_t>(data + 32, 0);              // RetCode
+            return kKernSuccess;
+        }
+        // task_info(task, flavor, out, &outCnt). libxpc's `bootstrap_look_up3` asks for the
+        // **audit token** and aborts without one, in `_bootstrap_look_up3.cold.1`, with
+        // another message that never reaches the terminal:
+        //
+        //     Configuration error: failed to fetch our own audit token
+        //
+        // An `audit_token_t` is eight words identifying who the process is, and the values
+        // are the ones the syscall layer already answers with (pid and uid 1000) rather than
+        // new inventions — a token that disagrees with `getpid()` would be worse than none.
+        // Unknown flavours are refused rather than answered with zeros: a caller told
+        // "success, here is nothing" has no way to notice.
+        case 3405: {
+            const uint32_t flavor = mem_.read<uint32_t>(data + 32);
+            constexpr uint32_t kTaskAuditToken = 15;
+            if (flavor != kTaskAuditToken) {
+                const uint32_t size = 24 + 8 + 4;
+                if (reply_cap && size > reply_cap) return kKernFailure;
+                reply_header(size);
+                mem_.write<uint32_t>(data + 32, 4);          // KERN_INVALID_ARGUMENT
+                if (trace)
+                    std::fprintf(stderr, "[mac] task_info flavor %u refused (only the audit "
+                                         "token is answered)\n", flavor);
+                return kKernSuccess;
+            }
+            //   val[0] auid  [1] euid  [2] egid  [3] ruid  [4] rgid
+            //   val[5] pid   [6] asid  [7] pidversion
+            const uint32_t tok[8] = { 1000, 1000, 1000, 1000, 1000, 1000, 1, 1 };
+            const uint32_t size = 24 + 8 + 4 + 4 + sizeof tok;
+            if (reply_cap && size > reply_cap) return kKernFailure;
+            reply_header(size);
+            mem_.write<uint32_t>(data + 32, 0);              // RetCode
+            mem_.write<uint32_t>(data + 36, 8);              // task_info_outCnt
+            for (int k = 0; k < 8; ++k) mem_.write<uint32_t>(data + 40 + k * 4, tok[k]);
             return kKernSuccess;
         }
         // _host_page_size(host, &out).

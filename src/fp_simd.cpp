@@ -14,6 +14,7 @@
 #include "cpu.h"
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 
 namespace a64 {
 
@@ -36,6 +37,7 @@ void set_velem(V128& v, unsigned esize, unsigned idx, uint64_t val) {
 }  // namespace
 
 void Cpu::exec_fp_simd(uint32_t insn) {
+    if (exec_crypto(insn)) return;
     // ---- FMOV between a general register and a vector register ----------------
     if (((insn >> 24) & 0x1F) == 0x1E && ((insn >> 21) & 1) && ((insn >> 10) & 0x3F) == 0) {
         const bool sf = (insn >> 31) & 1;
@@ -108,6 +110,49 @@ void Cpu::exec_fp_simd(uint32_t insn) {
         return;
     }
 
+    // ---- EXT: a byte window across a pair of registers -------------------------
+    // Neither operand of EXT nor TBL sets bit 21, which is what keeps them out of
+    // the three-same group below; they have to be tested first all the same,
+    // because their opcode fields overlap.
+    if ((insn & 0xBFE08400u) == 0x2E000000u) {
+        const bool q = (insn >> 30) & 1;
+        const unsigned imm4 = (insn >> 11) & 0xF;
+        const unsigned rm = (insn >> 16) & 0x1F, rn = (insn >> 5) & 0x1F, rd = insn & 0x1F;
+        const unsigned width = q ? 16u : 8u;
+        const V128 a = vreg[rn], b = vreg[rm];
+        V128 out{};
+        for (unsigned i = 0; i < width; ++i) {
+            const unsigned src = imm4 + i;
+            const uint64_t byte = (src < width) ? velem(a, 1, src) : velem(b, 1, src - width);
+            set_velem(out, 1, i, byte);
+        }
+        vreg[rd] = out;
+        return;
+    }
+
+    // ---- TBL / TBX: byte table lookup over one to four consecutive registers ----
+    if ((insn & 0xBF208C00u) == 0x0E000000u) {
+        const bool q = (insn >> 30) & 1;
+        const unsigned rm = (insn >> 16) & 0x1F, len = (insn >> 13) & 3;
+        const bool tbx = (insn >> 12) & 1;
+        const unsigned rn = (insn >> 5) & 0x1F, rd = insn & 0x1F;
+        const unsigned width = q ? 16u : 8u;
+        const unsigned table_bytes = (len + 1) * 16;
+        V128 out = tbx ? vreg[rd] : V128{};
+        for (unsigned i = 0; i < width; ++i) {
+            const unsigned idx = static_cast<unsigned>(velem(vreg[rm], 1, i));
+            if (idx < table_bytes) {
+                const V128& t = vreg[(rn + idx / 16) & 31];
+                set_velem(out, 1, i, velem(t, 1, idx % 16));
+            } else if (!tbx) {
+                set_velem(out, 1, i, 0);           // TBL zeroes out-of-range, TBX keeps
+            }
+        }
+        if (!q) out.hi = 0;
+        vreg[rd] = out;
+        return;
+    }
+
     // ---- Advanced SIMD, three registers of the same shape ----------------------
     if ((insn & 0x9F200400u) == 0x0E200400u) {
         const bool q = (insn >> 30) & 1, u = (insn >> 29) & 1;
@@ -157,13 +202,134 @@ void Cpu::exec_fp_simd(uint32_t insn) {
                                  : (((x & y) != 0) ? emask : 0); break;          // CMTST
                 case 0x0C: r = u ? (x > y ? x : y) : (sx(x) > sx(y) ? x : y); break;   // UMAX/SMAX
                 case 0x0D: r = u ? (x < y ? x : y) : (sx(x) < sx(y) ? x : y); break;   // UMIN/SMIN
-                case 0x06: r = u ? ((x >= y) ? emask : 0)                        // CMHS / CMGE
-                                 : ((sx(x) >= sx(y)) ? emask : 0); break;
-                case 0x07: r = u ? ((x > y) ? emask : 0)                         // CMHI / CMGT
+                // 0x06 is the strict comparison and 0x07 the inclusive one -- the
+                // other way round from the order they read in the manual's list, and
+                // easy to transcribe backwards.
+                case 0x06: r = u ? ((x > y) ? emask : 0)                         // CMHI / CMGT
                                  : ((sx(x) > sx(y)) ? emask : 0); break;
+                case 0x07: r = u ? ((x >= y) ? emask : 0)                        // CMHS / CMGE
+                                 : ((sx(x) >= sx(y)) ? emask : 0); break;
+                case 0x08: {                                                     // USHL / SSHL
+                    // The shift amount is a *signed* byte in the matching lane of
+                    // the second operand: negative means shift right.
+                    const int8_t sh = static_cast<int8_t>(y & 0xFF);
+                    if (sh >= 0) r = (sh >= static_cast<int>(esize * 8)) ? 0 : (x << sh);
+                    else {
+                        const unsigned k = static_cast<unsigned>(-sh);
+                        if (u) r = (k >= esize * 8) ? 0 : (x >> k);
+                        else {
+                            const int64_t sv = sx(x);
+                            r = static_cast<uint64_t>(sv >> (k >= esize * 8 ? esize * 8 - 1 : k));
+                        }
+                    }
+                    break;
+                }
+                case 0x0E: r = u ? (x > y ? x - y : y - x)                       // UABD / SABD
+                                 : static_cast<uint64_t>(sx(x) > sx(y) ? sx(x) - sx(y)
+                                                                       : sx(y) - sx(x)); break;
                 default: ok = false; break;
             }
             if (ok) set_velem(out, esize, i, r);
+        }
+        if (ok) { vreg[rd] = out; return; }
+    }
+
+    // ---- Advanced SIMD, three registers of different shapes --------------------
+    if ((insn & 0x9F200C00u) == 0x0E200000u) {
+        const bool q = (insn >> 30) & 1, u = (insn >> 29) & 1;
+        const unsigned size = (insn >> 22) & 3, opcode = (insn >> 12) & 0xF;
+        const unsigned rm = (insn >> 16) & 0x1F, rn = (insn >> 5) & 0x1F, rd = insn & 0x1F;
+        // The widening group: the second operand's lanes are half the width of the
+        // result's, and `q` selects which half of it to take.
+        if (opcode == 0x0 || opcode == 0x1 || opcode == 0x2 || opcode == 0x3 ||
+            opcode == 0xC) {
+            const unsigned esize = 1u << size;                  // the *narrow* element
+            const unsigned lanes = 8u / esize;
+            const unsigned base = q ? lanes : 0;
+            auto sxn = [&](uint64_t e) {
+                if (u) return e;
+                const uint64_t s = 1ull << (esize * 8 - 1);
+                return (e ^ s) - s;
+            };
+            V128 out{};
+            for (unsigned i = 0; i < lanes; ++i) {
+                const uint64_t wide = velem(vreg[rn], esize * 2, i);         // already wide
+                const uint64_t narrow = sxn(velem(vreg[rm], esize, base + i));
+                const uint64_t nn = sxn(velem(vreg[rn], esize, base + i));
+                uint64_t r = 0;
+                switch (opcode) {
+                    case 0x0: r = nn + narrow; break;                        // SADDL / UADDL
+                    case 0x1: r = wide + narrow; break;                      // SADDW / UADDW
+                    case 0x2: r = nn - narrow; break;                        // SSUBL / USUBL
+                    case 0x3: r = wide - narrow; break;                      // SSUBW / USUBW
+                    case 0xC: r = nn * narrow; break;                        // SMULL / UMULL
+                    default: r = 0; break;
+                }
+                set_velem(out, esize * 2, i, r);
+            }
+            vreg[rd] = out;
+            return;
+        }
+        if (opcode == 0xE && !u) {                              // PMULL / PMULL2
+            // Carry-less multiply: the same shape as an ordinary multiply with XOR
+            // where the additions would be. CRC32 and the hash code in a Python
+            // build reach it almost immediately.
+            const unsigned esize = 1u << size;
+            const unsigned lanes = 8u / esize;
+            const unsigned base = q ? lanes : 0;                // PMULL2 takes the top half
+            V128 out{};
+            for (unsigned i = 0; i < lanes; ++i) {
+                const uint64_t x = velem(vreg[rn], esize, base + i);
+                const uint64_t y = velem(vreg[rm], esize, base + i);
+                uint64_t lo = 0, hi = 0;
+                for (unsigned bit = 0; bit < esize * 8; ++bit) {
+                    if (!((y >> bit) & 1)) continue;
+                    lo ^= (bit ? (x << bit) : x);
+                    if (bit) hi ^= (x >> (64 - bit));
+                }
+                if (esize == 8) { out.lo = lo; out.hi = hi; }
+                else set_velem(out, esize * 2, i, lo);
+            }
+            vreg[rd] = out;
+            return;
+        }
+    }
+
+    // ---- ZIP / UZP / TRN: the permute group ------------------------------------
+    // 0 Q 001110 size 0 Rm 0 opcode 10 Rn Rd
+    if ((insn & 0xBF208C00u) == 0x0E000800u) {
+        const bool q = (insn >> 30) & 1;
+        const unsigned size = (insn >> 22) & 3, opcode = (insn >> 12) & 7;
+        const unsigned rm = (insn >> 16) & 0x1F, rn = (insn >> 5) & 0x1F, rd = insn & 0x1F;
+        const unsigned esize = 1u << size;
+        const unsigned lanes = (q ? 16u : 8u) / esize;
+        const V128 a = vreg[rn], b = vreg[rm];
+        V128 out{};
+        auto pick = [&](unsigned idx) {
+            return idx < lanes ? velem(a, esize, idx) : velem(b, esize, idx - lanes);
+        };
+        bool ok = true;
+        for (unsigned i = 0; i < lanes; ++i) {
+            uint64_t val = 0;
+            switch (opcode) {
+                case 1: val = pick(2 * i); break;                          // UZP1: even
+                case 5: val = pick(2 * i + 1); break;                      // UZP2: odd
+                case 2: val = (i & 1) ? velem(b, esize, i & ~1u)           // TRN1
+                                      : velem(a, esize, i);
+                        break;
+                case 6: val = (i & 1) ? velem(b, esize, i)                 // TRN2
+                                      : velem(a, esize, i | 1u);
+                        break;
+                case 3: val = (i & 1) ? velem(b, esize, i / 2)             // ZIP1
+                                      : velem(a, esize, i / 2);
+                        break;
+                case 7: val = (i & 1) ? velem(b, esize, lanes / 2 + i / 2) // ZIP2
+                                      : velem(a, esize, lanes / 2 + i / 2);
+                        break;
+                default: ok = false; break;
+            }
+            if (!ok) break;
+            set_velem(out, esize, i, val);
         }
         if (ok) { vreg[rd] = out; return; }
     }
@@ -197,6 +363,27 @@ void Cpu::exec_fp_simd(uint32_t insn) {
                 else                t = u ? (se < 0) : (se > 0);                 // CMLT / CMGT
                 set_velem(out, esize, i, t ? emask : 0);
             }
+            vreg[rd] = out; return;
+        }
+        // REV64 / REV32 / REV16: reverse the byte order of each element within a
+        // container of the given width. `size` is the element size and the opcode
+        // picks the container.
+        if (opcode == 0x00 || opcode == 0x01) {
+            const unsigned container = (opcode == 0x00) ? (u ? 32u : 64u) : 16u;
+            const unsigned per = container / (esize * 8);
+            V128 out{};
+            for (unsigned g = 0; g < lanes / per; ++g)
+                for (unsigned k = 0; k < per; ++k)
+                    set_velem(out, esize, g * per + k, velem(vreg[rn], esize, g * per + (per - 1 - k)));
+            vreg[rd] = out; return;
+        }
+        // XTN / XTN2: narrow each element to half its width, keeping the low bits.
+        // XTN2 writes the top half of the destination and leaves the bottom alone.
+        if (opcode == 0x12 && !u) {
+            const unsigned out_lanes = 8u / esize;
+            V128 out = q ? vreg[rd] : V128{};
+            for (unsigned i = 0; i < out_lanes; ++i)
+                set_velem(out, esize, q ? out_lanes + i : i, velem(vreg[rn], esize * 2, i));
             vreg[rd] = out; return;
         }
         if (opcode == 0x05 && u) {                              // NOT / MVN (size==00)
@@ -364,16 +551,28 @@ void Cpu::exec_fp_simd(uint32_t insn) {
                         else if (v == 0) q = v;
                         wrf(rd, q); return;
                     }
-                    case 0x4: {                                             // FCVT S -> D
-                        if (type == 0) { const double v = rdf(rn); uint64_t b;
-                                         std::memcpy(&b, &v, 8); vreg[rd] = {b, 0}; return; }
-                        break;
+                    // FCVT: the low two bits of the opcode are the *destination*
+                    // type, not the source — `fcvt s0, d0` is opcode 000100 with
+                    // type=01. Reading it the other way round converts the wrong
+                    // direction and produces a number, which is the worst outcome.
+                    case 0x4: {                                             // FCVT to single
+                        const float f = static_cast<float>(rdf(rn));
+                        uint32_t b; std::memcpy(&b, &f, 4);
+                        vreg[rd] = {b, 0}; return;
                     }
-                    case 0x5: {                                             // FCVT D -> S
-                        if (type == 1) { const float f = static_cast<float>(rdf(rn)); uint32_t b;
-                                         std::memcpy(&b, &f, 4); vreg[rd] = {b, 0}; return; }
-                        break;
+                    case 0x5: {                                             // FCVT to double
+                        const double d = rdf(rn);
+                        uint64_t b; std::memcpy(&b, &d, 8);
+                        vreg[rd] = {b, 0}; return;
                     }
+                    // The rounding family. All of them round to an integral value
+                    // and keep the floating-point type.
+                    case 0x8: wrf(rd, std::nearbyint(rdf(rn))); return;     // FRINTN
+                    case 0x9: wrf(rd, std::ceil(rdf(rn))); return;          // FRINTP
+                    case 0xA: wrf(rd, std::floor(rdf(rn))); return;         // FRINTM
+                    case 0xB: wrf(rd, std::trunc(rdf(rn))); return;         // FRINTZ
+                    case 0xC: wrf(rd, std::round(rdf(rn))); return;         // FRINTA
+                    case 0xE: case 0xF: wrf(rd, std::nearbyint(rdf(rn))); return;  // FRINTX/I
                     default: break;
                 }
             }
@@ -456,7 +655,7 @@ void Cpu::exec_fp_simd(uint32_t insn) {
         }
     }
 
-    if (on_undefined) on_undefined(insn, pc - 4);
+    if (on_undefined && on_undefined(insn, pc - 4)) return;
     fail("unimplemented FP/SIMD instruction", insn);
 }
 

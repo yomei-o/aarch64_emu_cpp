@@ -177,7 +177,7 @@ void Cpu::step() {
         case 0x5: case 0xD: exec_dp_register(insn); break;    // x101
         case 0x7: case 0xF: exec_fp_simd(insn); break;        // x111
         default:
-            if (on_undefined) on_undefined(insn, cur_pc_);
+            if (on_undefined && on_undefined(insn, cur_pc_)) return;
             fail("unallocated encoding", insn);
     }
 }
@@ -382,6 +382,11 @@ void Cpu::exec_branch(uint32_t insn) {
                 default: break;
             }
         }
+        // An unknown system register is the same situation as an unknown
+        // instruction: on a CPU without the feature it is undefined, and a library
+        // probing for one (OpenSSL asks for RNDR this way) wants the fault, not an
+        // invented value. Answering with a plausible zero would claim the feature.
+        if (on_undefined && on_undefined(insn, cur_pc_)) return;
         char buf[96];
         std::snprintf(buf, sizeof buf, "unimplemented system register s%u_%u_c%u_c%u_%u (%s)",
                       op0, op1, crn, crm, op2, l ? "read" : "write");
@@ -445,7 +450,7 @@ void Cpu::exec_loadstore(uint32_t insn) {
             case 0: setw(rt, mem_.read<uint32_t>(addr)); return;
             case 1: setx(rt, mem_.read<uint64_t>(addr)); return;
             case 2: setx(rt, sign_extend(mem_.read<uint32_t>(addr), 32)); return;
-            default: fail("PRFM literal not implemented", insn);
+            default: return;                              // PRFM literal: a hint, nothing to do
         }
     }
 
@@ -558,7 +563,9 @@ void Cpu::exec_loadstore(uint32_t insn) {
                 case 0: val = sign_extend(mem_.read<uint8_t>(addr), 8); break;
                 case 1: val = sign_extend(mem_.read<uint16_t>(addr), 16); break;
                 case 2: val = sign_extend(mem_.read<uint32_t>(addr), 32); break;
-                default: fail("PRFM not implemented", insn);
+                // size==3 with opc==2 is PRFM, not a load: it names a cache level and
+                // a policy and has no architectural effect. There is nothing to model.
+                default: return;
             }
             if (to32) setw(rt, static_cast<uint32_t>(val)); else setx(rt, val);
         }
@@ -575,30 +582,133 @@ void Cpu::exec_loadstore(uint32_t insn) {
         const bool post = (insn >> 23) & 1;
         const unsigned opcode = (insn >> 12) & 0xF, rm = (insn >> 16) & 0x1F;
         const unsigned rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
-        unsigned count;
+        // Two families share this encoding. LD1/ST1 move whole registers; LD2/LD3/LD4
+        // de-interleave — LD2 over 2s lanes puts elements 0,2,4… in the first register
+        // and 1,3,5… in the second. Treating an LD2 as two plain register loads reads
+        // the right bytes into the wrong places, which is invisible until the values
+        // are used.
+        unsigned count, stride;
         switch (opcode) {
-            case 0x7: count = 1; break;
-            case 0xA: count = 2; break;
-            case 0x6: count = 3; break;
-            case 0x2: count = 4; break;
+            case 0x7: count = 1; stride = 1; break;               // LD1/ST1 x1
+            case 0xA: count = 2; stride = 1; break;               // LD1/ST1 x2
+            case 0x6: count = 3; stride = 1; break;               // LD1/ST1 x3
+            case 0x2: count = 4; stride = 1; break;               // LD1/ST1 x4
+            case 0x8: count = 2; stride = 2; break;               // LD2/ST2
+            case 0x4: count = 3; stride = 3; break;               // LD3/ST3
+            case 0x0: count = 4; stride = 4; break;               // LD4/ST4
             default: fail("unimplemented SIMD structure load/store", insn);
         }
+        const unsigned size = (insn >> 10) & 3;
+        const unsigned esize = 1u << size;
         const unsigned bytes = q ? 16u : 8u;
+        const unsigned lanes = bytes / esize;
         uint64_t addr = xsp(rn);
-        for (unsigned k = 0; k < count; ++k) {
-            const unsigned r = (rt + k) & 31;
-            if (load) {
-                vreg[r].lo = mem_.read<uint64_t>(addr);
-                vreg[r].hi = q ? mem_.read<uint64_t>(addr + 8) : 0;
-            } else {
-                mem_.write<uint64_t>(addr, vreg[r].lo);
-                if (q) mem_.write<uint64_t>(addr + 8, vreg[r].hi);
+
+        if (stride == 1) {
+            for (unsigned k = 0; k < count; ++k) {
+                const unsigned r = (rt + k) & 31;
+                if (load) {
+                    vreg[r].lo = mem_.read<uint64_t>(addr);
+                    vreg[r].hi = q ? mem_.read<uint64_t>(addr + 8) : 0;
+                } else {
+                    mem_.write<uint64_t>(addr, vreg[r].lo);
+                    if (q) mem_.write<uint64_t>(addr + 8, vreg[r].hi);
+                }
+                addr += bytes;
             }
-            addr += bytes;
+        } else {
+            V128 tmp[4] = {};
+            if (load) {
+                for (unsigned e = 0; e < lanes; ++e)
+                    for (unsigned k = 0; k < count; ++k) {
+                        uint64_t val = 0;
+                        const uint64_t a = addr + (e * count + k) * esize;
+                        switch (esize) {
+                            case 1: val = mem_.read<uint8_t>(a); break;
+                            case 2: val = mem_.read<uint16_t>(a); break;
+                            case 4: val = mem_.read<uint32_t>(a); break;
+                            default: val = mem_.read<uint64_t>(a); break;
+                        }
+                        set_vlane(tmp[k], esize, e, val);
+                    }
+                for (unsigned k = 0; k < count; ++k) vreg[(rt + k) & 31] = tmp[k];
+            } else {
+                for (unsigned e = 0; e < lanes; ++e)
+                    for (unsigned k = 0; k < count; ++k) {
+                        const uint64_t val = get_vlane(vreg[(rt + k) & 31], esize, e);
+                        const uint64_t a = addr + (e * count + k) * esize;
+                        switch (esize) {
+                            case 1: mem_.write<uint8_t>(a, static_cast<uint8_t>(val)); break;
+                            case 2: mem_.write<uint16_t>(a, static_cast<uint16_t>(val)); break;
+                            case 4: mem_.write<uint32_t>(a, static_cast<uint32_t>(val)); break;
+                            default: mem_.write<uint64_t>(a, val); break;
+                        }
+                    }
+            }
+            addr += static_cast<uint64_t>(bytes) * count;
         }
         // Post-index: Rm == 31 means "advance by the transfer size", otherwise the
         // register holds the increment.
         if (post) setxsp(rn, xsp(rn) + (rm == 31 ? count * bytes : xr(rm)));
+        return;
+    }
+
+    // ---- Advanced SIMD load/store, single structure ----------------------------
+    // Two shapes: LD1R and friends, which load one element and replicate it across
+    // every lane; and the single-lane forms, which touch one lane and leave the rest
+    // of the register alone. The index is scattered across Q, S and size, which is
+    // the only fiddly part.
+    if ((insn & 0xBF000000u) == 0x0D000000u) {
+        const bool q = (insn >> 30) & 1, post = (insn >> 23) & 1;
+        const bool load = (insn >> 22) & 1, rbit = (insn >> 21) & 1;
+        const unsigned rm = (insn >> 16) & 0x1F, opcode = (insn >> 13) & 7;
+        const unsigned s = (insn >> 12) & 1, size = (insn >> 10) & 3;
+        const unsigned rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
+        const unsigned selem = (((opcode & 1) << 1) | (rbit ? 1u : 0u)) + 1;
+        const uint64_t addr0 = xsp(rn);
+        uint64_t addr = addr0;
+
+        auto rdmem = [&](uint64_t a, unsigned esz) -> uint64_t {
+            switch (esz) {
+                case 1: return mem_.read<uint8_t>(a);
+                case 2: return mem_.read<uint16_t>(a);
+                case 4: return mem_.read<uint32_t>(a);
+                default: return mem_.read<uint64_t>(a);
+            }
+        };
+        auto wrmem = [&](uint64_t a, unsigned esz, uint64_t v) {
+            switch (esz) {
+                case 1: mem_.write<uint8_t>(a, static_cast<uint8_t>(v)); break;
+                case 2: mem_.write<uint16_t>(a, static_cast<uint16_t>(v)); break;
+                case 4: mem_.write<uint32_t>(a, static_cast<uint32_t>(v)); break;
+                default: mem_.write<uint64_t>(a, v); break;
+            }
+        };
+
+        unsigned esize, index = 0;
+        bool replicate = false;
+        if ((opcode >> 1) == 3) { esize = 1u << size; replicate = true; }   // LD1R..LD4R
+        else if ((opcode >> 1) == 0) { esize = 1; index = (q << 3) | (s << 2) | size; }
+        else if ((opcode >> 1) == 1) { esize = 2; index = (q << 2) | (s << 1) | (size >> 1); }
+        else if ((size & 1) == 0)    { esize = 4; index = (q << 1) | s; }
+        else                         { esize = 8; index = q; }
+
+        for (unsigned k = 0; k < selem; ++k) {
+            const unsigned r = (rt + k) & 31;
+            if (replicate) {
+                const uint64_t val = rdmem(addr, esize);
+                V128 out{};
+                for (unsigned i = 0, lanes = (q ? 16u : 8u) / esize; i < lanes; ++i)
+                    set_vlane(out, esize, i, val);
+                vreg[r] = out;
+            } else if (load) {
+                set_vlane(vreg[r], esize, index, rdmem(addr, esize));
+            } else {
+                wrmem(addr, esize, get_vlane(vreg[r], esize, index));
+            }
+            addr += esize;
+        }
+        if (post) setxsp(rn, addr0 + (rm == 31 ? static_cast<uint64_t>(selem) * esize : xr(rm)));
         return;
     }
 

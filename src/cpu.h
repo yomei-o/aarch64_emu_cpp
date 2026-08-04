@@ -77,9 +77,34 @@ public:
 
     // SVC handler: the OS personality. Returns false to stop the machine.
     std::function<bool(uint32_t imm)> on_svc;
-    // Called for an instruction the decoder does not implement, before failing, so
-    // a host can log or count it.
-    std::function<void(uint32_t insn, uint64_t pc)> on_undefined;
+    // Called for an instruction the decoder does not implement. Returning true
+    // means the host dealt with it -- in practice by delivering SIGILL, which is
+    // not a workaround but the architecturally correct answer for a CPU that does
+    // not have the instruction. Returning false lets the emulator stop and print it.
+    std::function<bool(uint32_t insn, uint64_t pc)> on_undefined;
+
+    // Lane accessors on a V128, shared by the interpreter and the SIMD file.
+    static uint64_t get_vlane(const V128& v, unsigned esize, unsigned idx) {
+        const uint64_t half = (idx * esize >= 8) ? v.hi : v.lo;
+        const unsigned sh = ((idx * esize) % 8) * 8;
+        const uint64_t m = esize == 8 ? ~0ull : ((1ull << (esize * 8)) - 1);
+        return (half >> sh) & m;
+    }
+    static void set_vlane(V128& v, unsigned esize, unsigned idx, uint64_t val) {
+        uint64_t& half = (idx * esize >= 8) ? v.hi : v.lo;
+        const unsigned sh = ((idx * esize) % 8) * 8;
+        const uint64_t m = esize == 8 ? ~0ull : ((1ull << (esize * 8)) - 1);
+        half = (half & ~(m << sh)) | ((val & m) << sh);
+    }
+
+    // A plain register snapshot, for a signal frame.
+    struct Regs { uint64_t x[31], sp, pc; uint32_t nzcv; };
+    Regs save_regs() const {
+        Regs r{};
+        for (int i = 0; i < 31; ++i) r.x[i] = x[i];
+        r.sp = sp; r.pc = pc; r.nzcv = nzcv();
+        return r;
+    }
 
     void run() { while (!halted) step(); }
     void step();
@@ -119,6 +144,8 @@ private:
     void exec_loadstore(uint32_t insn);
     void exec_dp_register(uint32_t insn);
     void exec_fp_simd(uint32_t insn);
+    // SHA1/SHA256, in crypto.cpp. Returns false if the encoding is not one of them.
+    bool exec_crypto(uint32_t insn);
 };
 
 // DecodeBitMasks: the "N:immr:imms" form behind both the logical immediates and

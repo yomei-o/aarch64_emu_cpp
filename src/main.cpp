@@ -62,35 +62,90 @@ int main(int argc, char** argv) {
     cpu.sample_every = sample;
     Syscalls sys(cpu, mem);
     sys.trace = trace_sys;
+    // An instruction we do not implement is delivered to the guest as SIGILL when it
+    // has a handler. OpenSSL's CPU probes depend on exactly that.
+    cpu.on_undefined = [&sys](uint32_t, uint64_t at) { return sys.deliver_signal(4, at); };
+
+    // Where a PIE and the dynamic loader go. Linux picks addresses like these;
+    // nothing depends on the exact values, only that the two do not overlap each
+    // other, the mmap arena, or the stack.
+    constexpr uint64_t kPieBase = 0x0000'5555'5555'0000ull;
+    constexpr uint64_t kInterpBase = 0x0000'7F00'0000'0000ull;
+    // The mmap arena must not start where the interpreter lands. It did once, and
+    // the first library ld.so mapped landed on top of ld.so itself -- which showed
+    // up 90,000 instructions later as the loader executing zeroes, nowhere near the
+    // mmap that caused it.
+    constexpr uint64_t kMmapBase = 0x0000'7F40'0000'0000ull;
 
     LoadedImage img;
     std::string err;
-    if (!load_elf(file, mem, &img, &err)) {
+    if (!load_elf(file, mem, kPieBase, &img, &err)) {
         std::fprintf(stderr, "aarch64emu: %s\n", err.c_str());
         return 1;
     }
+
+    // A dynamically linked program is loaded exactly the way the kernel does it:
+    // map the program, map its interpreter, and start at the *interpreter's* entry
+    // with AT_BASE saying where it landed and AT_ENTRY where the program's is. The
+    // loader does everything after that — relocations, symbol binding, TLS. Writing
+    // our own linker instead would mean reimplementing musl's and getting the TLS
+    // model wrong in some new way; running the real one is both less work and more
+    // faithful.
+    uint64_t start_pc = 0, interp_base = 0;
     if (!img.interp.empty()) {
-        std::fprintf(stderr,
-                     "aarch64emu: %s is dynamically linked (needs %s).\n"
-                     "            Only static binaries run today -- see resume.md.\n",
-                     argv[i], img.interp.c_str());
-        return 1;
+        std::string ipath = img.interp;
+        if (!root.empty() && root != "." && !ipath.empty() && ipath[0] == '/') ipath = root + ipath;
+        const std::vector<uint8_t> ifile = read_file(ipath.c_str());
+        if (ifile.empty()) {
+            std::fprintf(stderr,
+                         "aarch64emu: %s needs the dynamic loader %s,\n"
+                         "            which is not under --root %s\n",
+                         argv[i], img.interp.c_str(), root.c_str());
+            return 1;
+        }
+        LoadedImage interp;
+        if (!load_elf(ifile, mem, kInterpBase, &interp, &err)) {
+            std::fprintf(stderr, "aarch64emu: loading %s: %s\n", img.interp.c_str(), err.c_str());
+            return 1;
+        }
+        interp_base = interp.base;
+        start_pc = interp.entry;
     }
 
     std::vector<std::string> guest_argv, guest_env = {
         "PATH=/usr/bin:/bin", "HOME=/", "LANG=C.UTF-8", "TERM=dumb",
+        "PYTHONDONTWRITEBYTECODE=1",
     };
-    for (int k = i; k < argc; ++k) guest_argv.push_back(argv[k]);
+    // argv[0] has to be the path *the guest* would see, not the host path we opened.
+    // Python finds its standard library by walking up from argv[0]; hand it a host
+    // path and it looks for the library in a directory that does not exist inside
+    // the guest, then dies with "Failed to import encodings module".
+    std::string guest_exe = argv[i];
+    {
+        auto fwd = [](std::string t) {
+            for (char& c : t) if (c == '\\') c = '/';
+            return t;
+        };
+        std::string p = fwd(guest_exe), r = fwd(root);
+        while (!r.empty() && r.back() == '/') r.pop_back();
+        if (!r.empty() && r != "." && p.size() > r.size() && p.compare(0, r.size(), r) == 0)
+            guest_exe = p.substr(r.size());
+        else if (!p.empty() && p[0] != '/') guest_exe = "/" + p;
+        else guest_exe = p;
+    }
+    guest_argv.push_back(guest_exe);
+    for (int k = i + 1; k < argc; ++k) guest_argv.push_back(argv[k]);
 
     // The stack sits just below the canonical Linux top. Nothing enforces the
     // address; it only has to be far from the image and the mmap arena.
     constexpr uint64_t kStackTop = 0x0000'7FFF'FFFF'F000ull;
     mem.set(kStackTop - (1u << 20), 0, 1u << 20);           // touch a MiB so it is there
-    cpu.sp = build_stack(mem, kStackTop, img, guest_argv, guest_env);
-    cpu.pc = img.entry;
+    cpu.sp = build_stack(mem, kStackTop, img, interp_base, guest_argv, guest_env);
+    cpu.pc = start_pc ? start_pc : img.entry;
     sys.set_brk(img.brk);
-    sys.exe_path = argv[i];
+    sys.exe_path = guest_exe;
     sys.files.set_root(root);
+    sys.set_mmap_base(kMmapBase);
 
     int rc = 0;
     try {

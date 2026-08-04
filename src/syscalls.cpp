@@ -61,6 +61,18 @@ bool Syscalls::svc(uint32_t imm) {
         case 214: r = sys_brk(a0); break;
         case 222: r = sys_mmap(a0, a1, a2, a3, static_cast<int>(a4), a5); break;
         case 215: r = 0; break;                                // munmap: the arena never shrinks
+        // mremap: the arena only grows, so "move it" is a fresh mapping plus a copy.
+        // Refusing instead makes musl fall back to a path that retries forever.
+        case 216: {
+            const uint64_t old_addr = a0, old_len = a1, new_len = a2;
+            if (new_len <= old_len) { r = static_cast<int64_t>(old_addr); break; }
+            const int64_t dst = sys_mmap(0, new_len, 0, 0x20, -1, 0);
+            std::vector<uint8_t> tmp(old_len);
+            mem_.read_bytes(old_addr, tmp.data(), old_len);
+            mem_.write_bytes(static_cast<uint64_t>(dst), tmp.data(), old_len);
+            r = dst;
+            break;
+        }
         case 226: r = 0; break;                                // mprotect: no protection modelled
         case 96: tid_address_ = a0; r = 1; break;              // set_tid_address -> our tid
         case 99: case 98: r = 0; break;                        // set_robust_list, futex-ish no-ops
@@ -83,6 +95,12 @@ bool Syscalls::svc(uint32_t imm) {
         // is why a guest that "never opens anything" is really just calling 56.
         case 56: r = files.open(guest_str(a1), static_cast<int>(a2), static_cast<int>(a3)); break;
         case 57: r = files.close(static_cast<int>(a0)); break;
+        case 61: {                                             // getdents64
+            std::vector<uint8_t> tmp(a2);
+            r = files.getdents64(static_cast<int>(a0), tmp.data(), a2);
+            if (r > 0) mem_.write_bytes(a1, tmp.data(), static_cast<uint64_t>(r));
+            break;
+        }
         case 62: r = files.lseek(static_cast<int>(a0), static_cast<int64_t>(a1),
                                  static_cast<int>(a2)); break;
         case 80: {                                             // fstat
@@ -119,7 +137,9 @@ bool Syscalls::svc(uint32_t imm) {
         // These must *succeed*. Refusing rt_sigprocmask is not neutral: musl's
         // startup treats the failure as fatal-ish and busybox's applet dispatch
         // came apart a few instructions later, ending up executing data.
-        case 134: case 135: case 132: case 133: r = 0; break;  // rt_sigaction/procmask/altstack
+        case 134: r = sys_rt_sigaction(static_cast<int>(a0), a1, a2); break;
+        case 139: return (void)sys_rt_sigreturn(), true;        // rt_sigreturn: no x0 write
+        case 135: case 132: case 133: r = 0; break;            // procmask / altstack / suspend
         case 129: case 130: case 131: r = 0; break;            // kill / tkill / tgkill
         case 178: r = 1000; break;                             // gettid
         // The set*id family. busybox drops privileges before dispatching an applet,
@@ -237,24 +257,42 @@ int64_t Syscalls::sys_brk(uint64_t addr) {
 // A bump allocator over a fixed mmap region. Real mmap semantics (MAP_FIXED,
 // unmapping, remap) are not modelled; what a libc needs at startup is a large
 // zeroed region at a stable address, and it gets one.
+// mmap, for real this time.
+//
+// A static guest only needs "give me a zeroed region somewhere". A *dynamic* one
+// needs the actual contract, because the dynamic loader builds every shared
+// library out of it: first one PROT_NONE anonymous reservation spanning the whole
+// object, then a MAP_FIXED file mapping over each segment at its own offset. Get
+// MAP_FIXED wrong, or ignore the file offset, and ld.so lays libc down in pieces
+// that do not join up.
+//
+// What is *not* modelled: protection (nothing here faults), sharing (a file
+// mapping is a private copy), and unmapping (the arena only grows). Those are
+// honest gaps rather than approximations — a guest that writes to a read-only
+// mapping gets away with it here, and one that expects MAP_SHARED to reach the
+// file will not see it happen.
 int64_t Syscalls::sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags,
                            int fd, uint64_t off) {
     (void)prot;
-    if (fd >= 0 && !(flags & 0x20 /*MAP_ANONYMOUS*/)) {
-        // A file mapping. Read the bytes in rather than share them: nothing here
-        // writes back, and CPython maps its own executable while importing.
-        const uint64_t base = mmap_next_;
+    constexpr uint64_t kMAP_FIXED = 0x10, kMAP_ANONYMOUS = 0x20;
+    const bool anon = (flags & kMAP_ANONYMOUS) || fd < 0;
+
+    uint64_t base;
+    if (addr && (flags & kMAP_FIXED)) {
+        base = addr;
+    } else {
+        base = mmap_next_;
         mmap_next_ = (mmap_next_ + len + 0xFFFF) & ~0xFFFFull;
-        if (file_read) {
-            std::vector<uint8_t> tmp(len);
-            const int64_t got = file_read(fd, tmp.data(), len, off);
-            if (got > 0) mem_.write_bytes(base, tmp.data(), static_cast<uint64_t>(got));
-        }
-        return static_cast<int64_t>(base);
     }
-    if (addr && (flags & 0x10 /*MAP_FIXED*/)) { mem_.set(addr, 0, len); return static_cast<int64_t>(addr); }
-    const uint64_t base = mmap_next_;
-    mmap_next_ = (mmap_next_ + len + 0xFFFF) & ~0xFFFFull;
+
+    // Every mapping starts zeroed, including the tail of a file mapping that runs
+    // past end-of-file — which is exactly how a .bss inside a PT_LOAD gets there.
+    mem_.set(base, 0, len);
+    if (!anon) {
+        std::vector<uint8_t> tmp(len);
+        const int64_t got = files.pread(fd, tmp.data(), len, off);
+        if (got > 0) mem_.write_bytes(base, tmp.data(), static_cast<uint64_t>(got));
+    }
     return static_cast<int64_t>(base);
 }
 

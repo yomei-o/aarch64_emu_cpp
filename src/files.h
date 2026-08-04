@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <map>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace a64 {
 
@@ -29,6 +31,9 @@ public:
     int64_t pread(int fd, void* dst, uint64_t len, uint64_t off);
     // Fills a Linux AArch64 `struct stat` (128 bytes). Returns 0 or -errno.
     int64_t fstat(int fd, void* statbuf);
+    // Emits linux_dirent64 records into a host buffer; returns bytes written, 0 at
+    // end of directory, or -errno.
+    int64_t getdents64(int fd, void* buf, uint64_t len);
     int64_t stat_path(const std::string& path, void* statbuf);
     int64_t access(const std::string& path);
     bool is_dir(const std::string& path) const;
@@ -37,7 +42,18 @@ public:
     std::string cwd = "/";
 
 private:
-    struct Entry { std::FILE* fp = nullptr; std::string path; bool used = false; };
+    struct Entry {
+        std::FILE* fp = nullptr;
+        std::string path;
+        bool used = false;
+        // A directory descriptor holds its listing instead of a file handle. Python's
+        // importlib opens every package directory with O_DIRECTORY and reads it with
+        // getdents64 to cache what is there before it tries to open any module, so a
+        // guest that cannot list a directory cannot import anything.
+        bool is_directory = false;
+        std::vector<std::pair<std::string, bool>> entries;   // name, is_dir
+        size_t pos = 0;
+    };
     std::map<int, Entry> open_;
     std::string root_;
     int next_fd_ = 3;

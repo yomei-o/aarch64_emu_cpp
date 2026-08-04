@@ -42,7 +42,8 @@ constexpr uint64_t AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5,
 
 }  // namespace
 
-bool load_elf(const std::vector<uint8_t>& f, Memory& mem, LoadedImage* out, std::string* err) {
+bool load_elf(const std::vector<uint8_t>& f, Memory& mem, uint64_t base,
+              LoadedImage* out, std::string* err) {
     if (f.size() < sizeof(Ehdr) || std::memcmp(f.data(), "\x7f" "ELF", 4) != 0) {
         *err = "not an ELF file"; return false;
     }
@@ -53,7 +54,11 @@ bool load_elf(const std::vector<uint8_t>& f, Memory& mem, LoadedImage* out, std:
     if (eh.machine != 183) { *err = "not an AArch64 image (EM_AARCH64 = 183)"; return false; }
     if (eh.type != 2 && eh.type != 3) { *err = "not an executable"; return false; }
 
-    out->entry = eh.entry;
+    // ET_EXEC says where it wants to live; ET_DYN (a PIE, or the dynamic loader
+    // itself) is placed wherever we choose and every address in it shifts by that.
+    if (eh.type == 2) base = 0;
+    out->base = base;
+    out->entry = eh.entry + base;
     out->phdr_addr = 0;
     out->phent = eh.phentsize;
     out->phnum = eh.phnum;
@@ -70,19 +75,19 @@ bool load_elf(const std::vector<uint8_t>& f, Memory& mem, LoadedImage* out, std:
             out->interp.assign(reinterpret_cast<const char*>(f.data() + ph.offset),
                                static_cast<size_t>(ph.filesz - 1));
         }
-        if (ph.type == PT_TLS) { out->tls_vaddr = ph.vaddr; out->tls_filesz = ph.filesz;
+        if (ph.type == PT_TLS) { out->tls_vaddr = base + ph.vaddr; out->tls_filesz = ph.filesz;
                                  out->tls_memsz = ph.memsz; out->tls_align = ph.align; }
         if (ph.type != PT_LOAD) continue;
         if (ph.offset + ph.filesz > f.size()) { *err = "PT_LOAD extends past the file"; return false; }
-        mem.write_bytes(ph.vaddr, f.data() + ph.offset, ph.filesz);
-        if (ph.memsz > ph.filesz) mem.set(ph.vaddr + ph.filesz, 0, ph.memsz - ph.filesz);  // .bss
-        if (ph.vaddr + ph.memsz > brk) brk = ph.vaddr + ph.memsz;
+        mem.write_bytes(base + ph.vaddr, f.data() + ph.offset, ph.filesz);
+        if (ph.memsz > ph.filesz) mem.set(base + ph.vaddr + ph.filesz, 0, ph.memsz - ph.filesz);  // .bss
+        if (base + ph.vaddr + ph.memsz > brk) brk = base + ph.vaddr + ph.memsz;
 
         // The program headers are usually inside the first PT_LOAD; a libc finds them
         // through AT_PHDR and walks them to locate its own PT_TLS and PT_DYNAMIC.
         if (!out->phdr_addr && ph.offset <= eh.phoff &&
             eh.phoff + static_cast<uint64_t>(eh.phnum) * eh.phentsize <= ph.offset + ph.filesz) {
-            out->phdr_addr = ph.vaddr + (eh.phoff - ph.offset);
+            out->phdr_addr = base + ph.vaddr + (eh.phoff - ph.offset);
         }
     }
     out->brk = (brk + 0xFFF) & ~0xFFFull;
@@ -90,6 +95,7 @@ bool load_elf(const std::vector<uint8_t>& f, Memory& mem, LoadedImage* out, std:
 }
 
 uint64_t build_stack(Memory& mem, uint64_t stack_top, const LoadedImage& img,
+                     uint64_t interp_base,
                      const std::vector<std::string>& argv,
                      const std::vector<std::string>& envp) {
     // Strings first, growing down from the top, then the pointer arrays below them.
@@ -116,7 +122,7 @@ uint64_t build_stack(Memory& mem, uint64_t stack_top, const LoadedImage& img,
 
     std::vector<std::pair<uint64_t, uint64_t>> aux = {
         {AT_PHDR, img.phdr_addr}, {AT_PHENT, img.phent}, {AT_PHNUM, img.phnum},
-        {AT_PAGESZ, 4096}, {AT_BASE, 0}, {AT_ENTRY, img.entry},
+        {AT_PAGESZ, 4096}, {AT_BASE, interp_base}, {AT_ENTRY, img.entry},
         {AT_UID, 1000}, {AT_EUID, 1000}, {AT_GID, 1000}, {AT_EGID, 1000},
         {AT_SECURE, 0}, {AT_CLKTCK, 100},
         // FP and ASIMD present. A libc reads this to pick memcpy variants; claiming

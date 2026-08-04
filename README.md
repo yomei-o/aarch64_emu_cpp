@@ -7,7 +7,17 @@ host — so an ARM binary runs on x86 Windows, on x86 Linux, and in a browser ta
 ```console
 $ ./aarch64emu tests/hello.elf
 hello from aarch64
+
+$ ./aarch64emu --root guests/sysroot guests/sysroot/opt/python/bin/python3.13       -c "import sys, platform, hashlib; print(sys.version.split()[0], platform.machine());           print(hashlib.sha256(b'aarch64_emu_cpp').hexdigest())"
+3.13.14 aarch64
+bffb6fd92e8571ee9842b4be91c59556fa99d85a203350610620d876755b4110
 ```
+
+That is a stock CPython built for `aarch64-unknown-linux-musl`, **dynamically
+linked**, running on x86 Windows: the emulator maps the program and its
+interpreter the way the kernel does and starts at the interpreter's entry, and the
+real musl `ld.so` does the relocation and symbol binding itself. The digest is the
+host's digest of the same bytes.
 
 Sibling of [x86_emu_cpp](https://github.com/yomei-o/x86_emu_cpp), pointed the other
 way: that one runs x86 guests on an ARM host, this one runs ARM guests on an x86
@@ -28,7 +38,9 @@ No dependencies beyond a C++17 standard library.
 | Linux syscalls: write, writev, read, brk, mmap, exit, uname, clock_gettime, getrandom … | ✅ |
 | FP and Advanced SIMD | scalar double/single arithmetic, compare, convert; DUP/INS/UMOV, the logical and compare vector ops, MOVI, shifts, CNT, across-lanes, LD1/ST1 |
 | A real guest: **Alpine's static aarch64-musl busybox** | ✅ |
-| Dynamic linking (`ld-linux-aarch64.so`) | ❌ next |
+| **Dynamic linking** — the real `ld-musl-aarch64.so.1` loads and relocates | ✅ |
+| Signal delivery (SIGILL frames, `rt_sigreturn`) | ✅ |
+| **A stock CPython 3.13 for ARM64 Linux** | ✅ |
 | Mach-O and Darwin syscalls (Apple Silicon guests) | ❌ planned |
 | WebAssembly build | ❌ planned |
 

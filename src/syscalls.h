@@ -42,6 +42,11 @@ private:
     // how a Mach-O guest traps -- so the two kernels coexist in one build and are
     // told apart at the instruction rather than by a mode flag.
     bool svc_darwin();
+    // Mach IPC, in darwin.cpp: enough of mach_msg2_trap and MIG to answer the kernel
+    // RPCs a libSystem startup makes.
+    int64_t mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
+                      uint64_t remote_local, uint64_t voucher_id,
+                      uint64_t desc_rcvname, uint64_t rcv_size);
     int64_t sys_write(int fd, uint64_t buf, uint64_t len);
     int64_t sys_read(int fd, uint64_t buf, uint64_t len);
     int64_t sys_writev(int fd, uint64_t iov, uint64_t cnt);

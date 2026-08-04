@@ -126,6 +126,120 @@ void Syscalls::setup_commpage() {
     fill(0x0000'000F'FFFF'4000ull);
 }
 
+// Mach IPC, enough of it to answer the kernel RPCs a libSystem startup makes.
+//
+// `mach_msg2_trap` passes the message *header* in registers rather than reading it from
+// the buffer — that is the point of the "2" — and packs two 32-bit fields into each
+// 64-bit argument:
+//
+//   x2 = msgh_bits        | send_size << 32
+//   x3 = msgh_remote_port | msgh_local_port << 32
+//   x4 = msgh_voucher     | msgh_id << 32
+//   x5 = desc_count       | rcv_name << 32
+//   x6 = rcv_size         | priority << 32
+//
+// With MACH64_SEND_MSG|MACH64_RCV_MSG set it is a synchronous RPC: the reply goes back
+// into the same buffer. Everything past the header is MIG — a generated protocol whose
+// request and reply layouts are fixed per routine, identified by `msgh_id`, with the
+// reply id being the request's plus 100.
+//
+// Only the routines that actually get called are answered. An unknown `msgh_id` prints
+// itself and fails, which is how the next one gets found: the guest's own libraries say
+// what they wanted, in their own words, as `BUG IN LIBPTHREAD: host_info() failed` did.
+int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
+                            uint64_t remote_local, uint64_t voucher_id,
+                            uint64_t desc_rcvname, uint64_t rcv_size) {
+    constexpr int64_t kKernSuccess = 0, kKernFailure = 5;
+    const uint32_t msgh_id = static_cast<uint32_t>(voucher_id >> 32);
+    const uint32_t remote = static_cast<uint32_t>(remote_local & 0xFFFFFFFF);
+    const uint32_t send_size = static_cast<uint32_t>(bits_size >> 32);
+    const uint32_t reply_cap = static_cast<uint32_t>(rcv_size & 0xFFFFFFFF);
+    (void)options; (void)desc_rcvname; (void)send_size;
+
+    // Every MIG reply starts the same way. `size` is the whole reply including this
+    // header, which MIG checks, so it is a parameter rather than a constant.
+    auto reply_header = [&](uint32_t size) {
+        mem_.write<uint32_t>(data + 0, 0);              // msgh_bits: simple, not complex
+        mem_.write<uint32_t>(data + 4, size);
+        mem_.write<uint32_t>(data + 8, 0);              // msgh_remote_port
+        mem_.write<uint32_t>(data + 12, 0);             // msgh_local_port
+        mem_.write<uint32_t>(data + 16, 0);             // msgh_voucher_port
+        mem_.write<uint32_t>(data + 20, msgh_id + 100); // the reply id, by MIG convention
+        // The NDR record is copied from the request rather than invented: it describes
+        // the caller's own byte order and it is right there.
+        uint8_t ndr[8];
+        mem_.read_bytes(data + 24, ndr, 8);
+        mem_.write_bytes(data + 24, ndr, 8);
+    };
+
+    switch (msgh_id) {
+        // host_info(host, flavor, out, &outCnt). libpthread asks for HOST_BASIC_INFO to
+        // learn the CPU count before it will start.
+        case 200: {
+            const uint32_t flavor = mem_.read<uint32_t>(data + 32);
+            // Every flavour answers with a run of 32-bit words, so one shape serves all
+            // of them: write the words, then the size MIG will check, which is the fixed
+            // reply struct minus the unused tail of its 15-word array.
+            uint32_t w[15] = {0};
+            uint32_t count = 0;
+            if (flavor == 1) {                           // HOST_BASIC_INFO
+                // host_basic_info_data_t. The last two words are one 64-bit max_mem,
+                // which lands 8-aligned because the array starts at data+40.
+                count = 12;
+                w[0] = 1;                                // max_cpus
+                w[1] = 1;                                // avail_cpus
+                w[2] = 0x80000000u;                      // memory_size (natural_t: 2 GiB)
+                w[3] = 0x0100000Cu;                      // cpu_type: CPU_TYPE_ARM64
+                w[4] = 0;                                // cpu_subtype: ARM64_ALL
+                w[5] = 0;                                // cpu_threadtype
+                w[6] = 1;                                // physical_cpu
+                w[7] = 1;                                // physical_cpu_max
+                w[8] = 1;                                // logical_cpu
+                w[9] = 1;                                // logical_cpu_max
+                w[10] = 0x00000000u;                     // max_mem, low half  (8 GiB)
+                w[11] = 0x00000002u;                     // max_mem, high half
+            } else if (flavor == 5) {                    // HOST_PRIORITY_INFO
+                // libpthread reads this to build its priority mapping, so the numbers
+                // are xnu's own bands rather than anything invented: a made-up maximum
+                // would silently rescale every thread priority the guest computes.
+                count = 8;
+                w[0] = 80;                               // kernel_priority  (MINPRI_KERNEL)
+                w[1] = 80;                               // system_priority
+                w[2] = 96;                               // server_priority  (MINPRI_RESERVED)
+                w[3] = 31;                               // user_priority    (BASEPRI_DEFAULT)
+                w[4] = 0;                                // depress_priority
+                w[5] = 0;                                // idle_priority
+                w[6] = 0;                                // minimum_priority (MINPRI_USER)
+                w[7] = 127;                              // maximum_priority (MAXPRI_RESERVED)
+            } else {
+                std::fprintf(stderr, "[mac] host_info flavor %u is not implemented\n", flavor);
+                return kKernFailure;
+            }
+            const uint32_t size = 24 + 8 + 4 + 4 + 15 * 4 - (15 - count) * 4;
+            if (reply_cap && size > reply_cap) return kKernFailure;
+            reply_header(size);
+            mem_.write<uint32_t>(data + 32, 0);          // RetCode
+            mem_.write<uint32_t>(data + 36, count);
+            for (uint32_t k = 0; k < count; ++k) mem_.write<uint32_t>(data + 40 + k * 4, w[k]);
+            return kKernSuccess;
+        }
+        // _host_page_size(host, &out).
+        case 202: {
+            const uint32_t size = 24 + 8 + 4 + 4;
+            if (reply_cap && size > reply_cap) return kKernFailure;
+            reply_header(size);
+            mem_.write<uint32_t>(data + 32, 0);          // RetCode
+            mem_.write<uint32_t>(data + 36, 16384);      // out_page_size
+            return kKernSuccess;
+        }
+        default:
+            std::fprintf(stderr,
+                         "[mac] MIG routine %u (to port %X) is not implemented, at PC %016llX\n",
+                         msgh_id, remote, static_cast<unsigned long long>(cpu_.pc - 4));
+            return kKernFailure;
+    }
+}
+
 // Returns false to stop the machine (only for exit).
 bool Syscalls::svc_darwin() {
     const int64_t nr = static_cast<int64_t>(cpu_.xr(16));
@@ -200,6 +314,7 @@ bool Syscalls::svc_darwin() {
             case 27: r = 0x103; break;                     // thread_self_trap
             case 28: r = 0x107; break;                     // task_self_trap
             case 29: r = 0x10B; break;                     // host_self_trap
+            case 47: r = mach_msg2(a0, a1, a2, a3, a4, a5, cpu_.xr(6)); break;   // mach_msg2
             case 61: case 62: r = kKernSuccess; break;     // swtch_pri, thread_switch
             case 89: {                                     // mach_timebase_info_trap
                 // numer/denom of 1/1 makes mach_absolute_time() nanoseconds, which
@@ -216,7 +331,6 @@ bool Syscalls::svc_darwin() {
                 r = kKernFailure;
                 break;
         }
-        (void)a5;
         cpu_.setx(0, static_cast<uint64_t>(r));
         cpu_.c = false;
         return true;

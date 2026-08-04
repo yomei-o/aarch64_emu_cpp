@@ -303,6 +303,25 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
     const std::string exe_dir = dirname_of(exe_path);
     uint64_t next_base = dylib_base, high = 0;
 
+    // A guest assembled out of a dyld shared cache needs one thing no dependency
+    // names. Recent caches coalesce GOT entries into shared islands that belong to no
+    // dylib at all -- libsystem_platform's __auth_stubs loads through 0x1E2465DB8,
+    // which is inside nothing -- so tools/dsc_extract collects those pages into
+    // /usr/lib/dsc_extras.dylib. Nothing imports it; it exists to be mapped. Loading
+    // it when it happens to be there costs a failed open otherwise.
+    {
+        const std::vector<uint8_t> extras = read_file("/usr/lib/dsc_extras.dylib");
+        if (!extras.empty()) {
+            MachoImage img;
+            std::string e;
+            if (macho_parse(extras, &img, &e)) {
+                img.slide = 0;                     // fixed cache addresses, like the rest
+                img.guest_path = "/usr/lib/dsc_extras.dylib";
+                images.push_back(std::move(img));
+            }
+        }
+    }
+
     // Breadth-first over the dependency graph, deduplicated by install name so a
     // diamond does not map the same library twice at two addresses — which would
     // silently give a library two copies of its own globals.

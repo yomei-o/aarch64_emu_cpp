@@ -758,6 +758,212 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
     return 1;
 }
 
+// ---- the regions no library owns ---------------------------------------------
+//
+// A per-library extraction is not quite enough, and the reason is worth stating.
+// Recent caches coalesce GOT entries into shared islands: `libsystem_platform`'s
+// `__auth_stubs` loads its function pointer from 0x1E2465DB8, which lies inside no
+// dylib's LC_SEGMENT_64 at all. Extract every library and that address is simply not
+// there, so the stub branches through a zero and the guest dies in a stub table
+// hundreds of instructions from anything that explains it.
+//
+// So: mark every page any *image in the cache* covers -- all of them, not just the
+// ones being extracted -- and whatever the slide information still rebases outside
+// that is cache-owned. Those pages are emitted as one synthetic MH_DYLIB with a
+// segment per contiguous run, which means the loader needs no new concept: it is just
+// another library, pre-linked at fixed addresses like every other.
+struct run { uint64_t addr; uint8_t* data; uint64_t size, cap; };
+#define MAX_RUNS 4096
+static struct run runs[MAX_RUNS];
+static int nruns;
+
+// The owned ranges are built once and merged. Asking every image about every page --
+// four thousand images against a hundred thousand pages -- is a few billion range
+// checks and takes long enough that it reads as a hang.
+struct range { uint64_t lo, hi; };
+static struct range* owned;
+static size_t n_owned;
+
+static int range_cmp(const void* a, const void* b) {
+    const uint64_t x = ((const struct range*)a)->lo, y = ((const struct range*)b)->lo;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+static void build_owned_ranges(void) {
+    size_t cap = 4096;
+    owned = malloc(cap * sizeof *owned);
+    if (!owned) die("out of memory");
+    for (uint32_t k = 0; k < images_count; ++k) {
+        const uint8_t* mh = at(image_addr((int)k), sizeof(struct mach_header_64));
+        if (!mh) continue;
+        struct mach_header_64 h;
+        memcpy(&h, mh, sizeof h);
+        size_t o = sizeof h;
+        for (uint32_t i = 0; i < h.ncmds; ++i) {
+            struct load_command lc;
+            memcpy(&lc, mh + o, sizeof lc);
+            if (lc.cmd == LC_SEGMENT_64) {
+                struct segment_command_64 sc;
+                memcpy(&sc, mh + o, sizeof sc);
+                if (sc.vmsize) {
+                    if (n_owned == cap) {
+                        cap *= 2;
+                        owned = realloc(owned, cap * sizeof *owned);
+                        if (!owned) die("out of memory");
+                    }
+                    owned[n_owned].lo = sc.vmaddr;
+                    owned[n_owned].hi = sc.vmaddr + sc.vmsize;
+                    n_owned++;
+                }
+            }
+            o += lc.cmdsize;
+        }
+    }
+    qsort(owned, n_owned, sizeof *owned, range_cmp);
+    // Merge, so a lookup can stop at the first range that starts past the page.
+    size_t w = 0;
+    for (size_t r = 0; r < n_owned; ++r) {
+        if (w && owned[r].lo <= owned[w - 1].hi) {
+            if (owned[r].hi > owned[w - 1].hi) owned[w - 1].hi = owned[r].hi;
+        } else {
+            owned[w++] = owned[r];
+        }
+    }
+    n_owned = w;
+}
+
+static int page_owned_by_any_image(uint64_t page, uint64_t page_size) {
+    size_t lo = 0, hi = n_owned;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (owned[mid].hi <= page) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < n_owned && owned[lo].lo < page + page_size;
+}
+
+static void run_add(uint64_t addr, const uint8_t* data, uint64_t size) {
+    // Merge into the previous run when adjacent: the islands are contiguous stretches
+    // of pointer table, so this collapses thousands of pages into a handful of
+    // segments.
+    if (nruns && runs[nruns - 1].addr + runs[nruns - 1].size == addr) {
+        struct run* r = &runs[nruns - 1];
+        if (r->size + size > r->cap) {
+            r->cap = (r->size + size) * 2;
+            r->data = realloc(r->data, r->cap);
+            if (!r->data) die("out of memory");
+        }
+        memcpy(r->data + r->size, data, size);
+        r->size += size;
+        return;
+    }
+    if (nruns >= MAX_RUNS) die("too many cache-owned regions");
+    struct run* r = &runs[nruns++];
+    r->addr = addr;
+    r->cap = size * 2;
+    r->data = malloc(r->cap);
+    if (!r->data) die("out of memory");
+    memcpy(r->data, data, size);
+    r->size = size;
+}
+
+// Emit the runs as a Mach-O dylib. Nothing reads its symbol table; it exists to be
+// mapped at the addresses it names.
+static void write_extras(const char* outdir, const char* install_name) {
+    if (!nruns) return;
+    const uint32_t ncmds = (uint32_t)nruns;
+    uint32_t sizeofcmds = ncmds * (uint32_t)sizeof(struct segment_command_64);
+    // LC_ID_DYLIB, so the loader can find this by name like any other library.
+    const uint32_t idsize = (uint32_t)((24 + strlen(install_name) + 1 + 7) & ~7u);
+    sizeofcmds += idsize;
+
+    struct outbuf ob = {0};
+    struct mach_header_64 h = {0xFEEDFACF, 0x0100000C, 0, 6 /*MH_DYLIB*/, ncmds + 1,
+                               sizeofcmds, 0, 0};
+    h.ncmds = ncmds + 1;
+    ob_put(&ob, &h, sizeof h);
+    const size_t cmds_at = ob.len;
+    for (int i = 0; i < nruns; ++i) {
+        struct segment_command_64 sc;
+        memset(&sc, 0, sizeof sc);
+        sc.cmd = LC_SEGMENT_64;
+        sc.cmdsize = sizeof sc;
+        snprintf(sc.segname, sizeof sc.segname, "__DSC%d", i);
+        sc.vmaddr = runs[i].addr;
+        sc.vmsize = (runs[i].size + 0x3FFF) & ~0x3FFFull;
+        sc.filesize = runs[i].size;
+        sc.maxprot = sc.initprot = 3;                 // read/write
+        ob_put(&ob, &sc, sizeof sc);
+    }
+    {
+        uint8_t idcmd[512];
+        memset(idcmd, 0, sizeof idcmd);
+        const uint32_t cmd = LC_ID_DYLIB;
+        memcpy(idcmd, &cmd, 4);
+        memcpy(idcmd + 4, &idsize, 4);
+        const uint32_t nameoff = 24;
+        memcpy(idcmd + 8, &nameoff, 4);
+        memcpy(idcmd + nameoff, install_name, strlen(install_name) + 1);
+        ob_put(&ob, idcmd, idsize);
+    }
+    for (int i = 0; i < nruns; ++i) {
+        ob_pad(&ob, 16384);
+        const size_t at_off = ob_put(&ob, runs[i].data, runs[i].size);
+        struct segment_command_64* sc =
+            (struct segment_command_64*)(ob.p + cmds_at + (size_t)i * sizeof *sc);
+        sc->fileoff = at_off;
+    }
+
+    char full[2048];
+    snprintf(full, sizeof full, "%s%s", outdir, install_name);
+    for (char* s = full + strlen(outdir) + 1; *s; ++s) {
+        if (*s != '/') continue;
+        *s = 0;
+        mkdir(full, 0755);
+        *s = '/';
+    }
+    FILE* f = fopen(full, "wb");
+    if (!f) die("cannot write %s: %s", full, strerror(errno));
+    fwrite(ob.p, 1, ob.len, f);
+    fclose(f);
+    uint64_t bytes = 0;
+    for (int i = 0; i < nruns; ++i) bytes += runs[i].size;
+    printf("\ncache-owned regions: %d run(s), %.1f MiB, written as %s\n",
+           nruns, bytes / 1048576.0, install_name);
+    free(ob.p);
+}
+
+// Walk the slide information and collect every rebased page that no image owns.
+static void collect_extras(void) {
+    build_owned_ranges();
+    printf("cache images own %zu merged address range(s)\n", n_owned);
+    for (int m = 0; m < C.nslides; ++m) {
+        const struct slidemap* sm = &C.slide[m];
+        uint32_t version, page_size, page_count;
+        memcpy(&version, sm->info, 4);
+        memcpy(&page_size, sm->info + 4, 4);
+        memcpy(&page_count, sm->info + 8, 4);
+        if (version != 3 && version != 5) continue;
+        const uint8_t* starts = sm->info + 24;
+        if (24 + (size_t)page_count * 2 > sm->info_size) continue;
+        for (uint32_t p = 0; p < page_count; ++p) {
+            uint16_t start;
+            memcpy(&start, starts + (size_t)p * 2, 2);
+            if (start == 0xFFFF) continue;
+            const uint64_t page_addr = sm->addr + (uint64_t)p * page_size;
+            if (page_owned_by_any_image(page_addr, page_size)) continue;
+            const uint8_t* src = at(page_addr, page_size);
+            if (!src) continue;
+            uint8_t* tmp = malloc(page_size);
+            if (!tmp) die("out of memory");
+            memcpy(tmp, src, page_size);
+            apply_slide(tmp, page_addr, page_size);
+            run_add(page_addr, tmp, page_size);
+            free(tmp);
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     const char* outdir = NULL;
     int list = 0, i = 1;
@@ -861,6 +1067,10 @@ int main(int argc, char** argv) {
     // the cause.
     printf("unpacked %llu pointer(s) from the slide information\n",
            (unsigned long long)total_slid);
+    // The GOT islands. Not optional: without them a stub table loads a null and the
+    // guest dies hundreds of instructions away from the cause.
+    collect_extras();
+    write_extras(outdir, "/usr/lib/dsc_extras.dylib");
     if (libs_without_slide)
         printf("WARNING: %d librar%s with data segments had no pointers unpacked. The "
                "slide information was not applied, and the result will not run.\n",

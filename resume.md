@@ -27,18 +27,19 @@ Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agr
 byte over the whole macOS run, which is the best differential oracle here for anyone
 without a cross-compiler.
 
-Run the four suites before touching anything — they should be 9 / 10 / 9 / 7, plus 8 for
+Run the five suites before touching anything — they should be 9 / 10 / 9 / 7 / 4, plus 8 for
 `node web/test_node.mjs` if emscripten is around:
 
     sh tests/run_tests.sh    sh tests/run_macho.sh
     sh tests/run_busybox.sh  sh tests/run_python.sh
+    sh tests/run_macos.sh
 
 `EMU` is overridable, which is how the strict sweep is run and how a second build is
 compared:
 
     EMU="./aarch64emu --strict" sh tests/run_busybox.sh
 
-**Two of the four need only a download, not a cross-compiler**, which matters on a host
+**Two of the five need only a download, not a cross-compiler**, which matters on a host
 without one — `run_tests.sh` and `run_macho.sh` build their guests with
 `clang --target=aarch64…`, but busybox and CPython are prebuilt binaries:
 
@@ -50,7 +51,7 @@ without one — `run_tests.sh` and `run_macho.sh` build their guests with
     curl -Lo musl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/musl-1.2.5-r3.apk
     tar xzf musl.apk -C sysroot
 
-Those 16 tests plus the committed macOS guest are enough to work on any of this: they are
+Those 20 tests are enough to work on any of this: they are
 differential against the host's own tools, and between them they cover the integer core, the
 SIMD groups, threads, dynamic linking and both personalities. They are also how a
 compiler-portability change gets checked, since cl.exe and clang must agree.
@@ -88,13 +89,15 @@ Everything below is ordered by what that needs.
 
 ## State (verified against the host, not against expectations)
 
-Four suites, all differential — the oracle is always the host, never a recorded
-file:
+Five suites. Four are differential — the oracle is the host, never a recorded file. The
+fifth cannot be: no x86 host can run Apple's arm64 libraries, so it checks the macOS guest
+against *itself* under two memory modes, which turns out to be a sharp test (see below):
 
     sh tests/run_tests.sh      9 passed   freestanding C, built twice and diffed
     sh tests/run_macho.sh     10 passed   the same sources as arm64 Mach-O, plus a dylib
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
+    sh tests/run_macos.sh      4 passed   the macOS guest, permissive and --strict
     node web/test_node.mjs     8 passed   the same guests under WebAssembly
 
 What works:

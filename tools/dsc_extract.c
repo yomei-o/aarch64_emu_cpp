@@ -515,6 +515,10 @@ static void patch32(struct outbuf* b, size_t cmd_off, size_t field, uint32_t v) 
     memcpy(b->p + cmd_off + field, &v, 4);
 }
 
+// Defined further down with the rest of the patch-table machinery; needed here
+// because a library's own segments can be patch targets.
+static uint64_t apply_patches(uint8_t* dst, uint64_t lo, uint64_t size);
+
 // Rebuild one cache dylib as a standalone Mach-O file.
 static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes) {
     const int idx = find_image(path);
@@ -581,6 +585,9 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
                 // Undo the cache's pointer packing in the copy, which is the step
                 // that turns a library that loads into a library that runs.
                 pt->slid += apply_slide(ob.p + new_off, sc.vmaddr, sc.filesize);
+                // A library's own GOT slots can be patch targets too, so the same fill
+                // applies here and not only to the islands.
+                apply_patches(ob.p + new_off, sc.vmaddr, sc.filesize);
                 if (strncmp(sc.segname, "__TEXT", 6) != 0) pt->data_bytes += sc.filesize;
                 // Patch this segment's fileoff, and every section's offset with it.
                 // Taken after the appends above, never before: see patch32.
@@ -1072,6 +1079,134 @@ static int page_is_referenced(uint64_t page) {
     return lo < n_refpage && refpage[lo] == page;
 }
 
+// ---- the cache patch table ---------------------------------------------------
+//
+// The last thing dyld does that a copy of the bytes cannot: fill in GOT slots the
+// cache deliberately leaves null.
+//
+// libsystem_platform loads `&vm_page_size` from a slot at 0x1E7FEC378, which is inside
+// no dylib's segments and which the slide information never rebases -- it is zero in
+// the file. The cache records, for every exported symbol of every dylib, the list of
+// slots referencing it, so that dyld can fill them (and refill them if something
+// interposes). Reading that table and writing the addresses in is exactly dyld's job,
+// and doing it here means the emulator sees an already-linked cache.
+//
+// This is a lot of nested structure to get right without the header, so the parse
+// checks itself: the table carries the symbol *names*, and the run prints a few. If
+// they read as `_vm_page_size` and `_mach_task_self_`, the walk is right; if they are
+// garbage, it is wrong and obviously so.
+struct patch_target { uint64_t addr; uint64_t value; };
+#define MAX_PATCHES 65536
+static struct patch_target* patches;
+static size_t n_patches;
+
+static void read_patch_table(void) {
+    uint64_t info_addr = 0, info_size = 0;
+    memcpy(&info_addr, C.main + 0x98, 8);
+    memcpy(&info_size, C.main + 0xA0, 8);
+    if (!info_addr || info_size < 112) { printf("patch table: absent\n"); return; }
+    const uint8_t* pi = at(info_addr, 112);
+    if (!pi) { printf("patch table: at %llx, unmapped\n", (unsigned long long)info_addr); return; }
+
+    uint32_t table_version, loc_version;
+    memcpy(&table_version, pi, 4);
+    memcpy(&loc_version, pi + 4, 4);
+    if (table_version != 2 && table_version != 3 && table_version != 4) {
+        printf("patch table: version %u is not implemented; GOT slots the cache leaves "
+               "null will stay null\n", table_version);
+        return;
+    }
+    uint64_t f[12];
+    for (int i = 0; i < 12; ++i) memcpy(&f[i], pi + 8 + i * 8, 8);
+    const uint64_t images_addr = f[0], images_n = f[1];
+    const uint64_t exports_addr = f[2], exports_n = f[3];
+    const uint64_t clients_addr = f[4], clients_n = f[5];
+    const uint64_t cl_exports_addr = f[6], cl_exports_n = f[7];
+    const uint64_t locs_addr = f[8], locs_n = f[9];
+    const uint64_t names_addr = f[10], names_size = f[11];
+    printf("patch table: v%u/%u  %llu images, %llu exports, %llu clients, %llu locations\n",
+           table_version, loc_version, (unsigned long long)images_n,
+           (unsigned long long)exports_n, (unsigned long long)clients_n,
+           (unsigned long long)locs_n);
+
+    const uint8_t* images = at(images_addr, images_n * 16);
+    const uint8_t* exports = at(exports_addr, exports_n * 8);
+    const uint8_t* clients = at(clients_addr, clients_n * 12);
+    const uint8_t* cl_exports = at(cl_exports_addr, cl_exports_n * 12);
+    const uint8_t* locs = at(locs_addr, locs_n * 8);
+    const uint8_t* names = at(names_addr, names_size);
+    if (!images || !exports || !clients || !cl_exports || !locs || !names) {
+        printf("patch table: one of its arrays is not mapped; skipped\n");
+        return;
+    }
+
+    patches = malloc(MAX_PATCHES * sizeof *patches);
+    if (!patches) die("out of memory");
+    int shown = 0;
+    for (uint64_t im = 0; im < images_n && im < images_count; ++im) {
+        uint32_t clients_start, clients_count, exports_start, exports_count;
+        memcpy(&clients_start, images + im * 16 + 0, 4);
+        memcpy(&clients_count, images + im * 16 + 4, 4);
+        memcpy(&exports_start, images + im * 16 + 8, 4);
+        memcpy(&exports_count, images + im * 16 + 12, 4);
+        (void)exports_start; (void)exports_count;
+        const uint64_t impl_base = image_addr((int)im);
+
+        for (uint32_t c = 0; c < clients_count; ++c) {
+            const uint64_t ci = clients_start + c;
+            if (ci >= clients_n) break;
+            uint32_t client_index, ce_start, ce_count;
+            memcpy(&client_index, clients + ci * 12 + 0, 4);
+            memcpy(&ce_start, clients + ci * 12 + 4, 4);
+            memcpy(&ce_count, clients + ci * 12 + 8, 4);
+            if (client_index >= images_count) continue;
+            const uint64_t client_base = image_addr((int)client_index);
+
+            for (uint32_t e = 0; e < ce_count; ++e) {
+                const uint64_t ei = ce_start + e;
+                if (ei >= cl_exports_n) break;
+                uint32_t export_index, loc_start, loc_count;
+                memcpy(&export_index, cl_exports + ei * 12 + 0, 4);
+                memcpy(&loc_start, cl_exports + ei * 12 + 4, 4);
+                memcpy(&loc_count, cl_exports + ei * 12 + 8, 4);
+                if (export_index >= exports_n) continue;
+                uint32_t impl_off, name_and_kind;
+                memcpy(&impl_off, exports + export_index * 8 + 0, 4);
+                memcpy(&name_and_kind, exports + export_index * 8 + 4, 4);
+                const uint32_t name_off = name_and_kind & 0x0FFFFFFF;
+                const char* sym = name_off < names_size ? (const char*)names + name_off : "?";
+                if (shown < 6) {
+                    printf("    e.g. %s  ->  %llu location(s) in image %u\n", sym,
+                           (unsigned long long)loc_count, client_index);
+                    shown++;
+                }
+                for (uint32_t l = 0; l < loc_count; ++l) {
+                    const uint64_t li = loc_start + l;
+                    if (li >= locs_n || n_patches >= MAX_PATCHES) break;
+                    uint32_t use_off, bits;
+                    memcpy(&use_off, locs + li * 8 + 0, 4);
+                    memcpy(&bits, locs + li * 8 + 4, 4);
+                    const uint32_t addend = (bits >> 7) & 0x1F;
+                    patches[n_patches].addr = client_base + use_off;
+                    patches[n_patches].value = impl_base + impl_off + addend;
+                    n_patches++;
+                }
+            }
+        }
+    }
+    printf("patch table: %zu slot(s) to fill\n", n_patches);
+}
+
+static uint64_t apply_patches(uint8_t* dst, uint64_t lo, uint64_t size) {
+    uint64_t n = 0;
+    for (size_t i = 0; i < n_patches; ++i) {
+        if (patches[i].addr < lo || patches[i].addr + 8 > lo + size) continue;
+        memcpy(dst + (patches[i].addr - lo), &patches[i].value, 8);
+        n++;
+    }
+    return n;
+}
+
 // Walk the slide information and collect every rebased page that no image owns.
 static void collect_extras(void) {
     build_owned_ranges();
@@ -1102,9 +1237,32 @@ static void collect_extras(void) {
             if (!tmp) die("out of memory");
             memcpy(tmp, src, page_size);
             apply_slide(tmp, page_addr, page_size);
+            apply_patches(tmp, page_addr, page_size);
             run_add(page_addr, tmp, page_size);
             free(tmp);
         }
+    }
+
+    // And the pages the patch table writes into, which the slide information never
+    // mentions -- they are zero in the file, which is the whole reason dyld has to fill
+    // them. Without this the GOT island holding `&vm_page_size` is never collected at
+    // all, because there is nothing in it to rebase.
+    for (size_t i = 0; i < n_patches; ++i) {
+        const uint64_t page = patches[i].addr & ~0x3FFFull;
+        if (page_owned_by_any_image(page, 0x4000)) continue;
+        int already = 0;
+        for (int r = 0; r < nruns && !already; ++r)
+            if (page >= runs[r].addr && page < runs[r].addr + runs[r].size) already = 1;
+        if (already) continue;
+        const uint8_t* src = at(page, 0x4000);
+        if (!src) continue;
+        uint8_t* tmp = malloc(0x4000);
+        if (!tmp) die("out of memory");
+        memcpy(tmp, src, 0x4000);
+        apply_slide(tmp, page, 0x4000);
+        apply_patches(tmp, page, 0x4000);
+        run_add(page, tmp, 0x4000);
+        free(tmp);
     }
 }
 
@@ -1174,6 +1332,10 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+
+    // The patch table before anything is written: a library's own segments can be
+    // patch targets, so the fills have to be known while they are being copied.
+    read_patch_table();
 
     if (i < argc) for (; i < argc; ++i) want_add(argv[i]);
     else want_add("/usr/lib/libSystem.B.dylib");

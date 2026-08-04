@@ -30,6 +30,28 @@ Run the four suites before touching anything — they should be 9 / 10 / 9 / 7, 
     sh tests/run_tests.sh    sh tests/run_macho.sh
     sh tests/run_busybox.sh  sh tests/run_python.sh
 
+`EMU` is overridable, which is how the strict sweep is run and how a second build is
+compared:
+
+    EMU="./aarch64emu --strict" sh tests/run_busybox.sh
+
+**Two of the four need only a download, not a cross-compiler**, which matters on a host
+without one — `run_tests.sh` and `run_macho.sh` build their guests with
+`clang --target=aarch64…`, but busybox and CPython are prebuilt binaries:
+
+    cd guests
+    curl -Lo bb.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/busybox-static-1.36.1-r31.apk
+    tar xzf bb.apk && mv bin/busybox.static busybox
+    curl -Lo py.tgz https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-aarch64-unknown-linux-musl-install_only_stripped.tar.gz
+    mkdir -p sysroot/opt && tar xzf py.tgz -C sysroot/opt
+    curl -Lo musl.apk https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/musl-1.2.5-r3.apk
+    tar xzf musl.apk -C sysroot
+
+Those 16 tests plus the committed macOS guest are enough to work on any of this: they are
+differential against the host's own tools, and between them they cover the integer core, the
+SIMD groups, threads, dynamic linking and both personalities. They are also how a
+compiler-portability change gets checked, since cl.exe and clang must agree.
+
 The tools built for this, all of which take addresses straight out of a trace:
 
     --trace-sys              syscalls, Mach traps, MIG routines, [init]/[objc]/[call]
@@ -277,13 +299,19 @@ What works:
 3. **A trimmed Python for the browser demo.** The page can run CPython today, but the
    guest tree is 45 MB into MEMFS. Dropping the stdlib to what a script actually
    imports would make a shippable Pages demo.
-4. **Speed.** ~48M instructions/sec interpreted. A decode cache keyed on the PC (the
-   instruction word is fixed-width, so a table of decoded handlers is cheap) is the
-   obvious next step if it ever matters. Measure first — CPython startup is 66M
-   instructions, which is already about a second.
-5. **`--strict` memory.** Unmapped reads return zero and unmapped writes allocate, so a
-   wild pointer is invisible. Faulting instead would have caught the mmap/interpreter
-   address collision immediately rather than 90,000 instructions later.
+4. **Speed.** ~48M instructions/sec interpreted where that was measured; **41.4M/s** on the
+   host this was last checked on (clang -O2, 393,385,201 instructions in 9.5 s — CPython
+   summing `i*i` over 200,000 iterations, which is a useful benchmark because the answer is
+   checkable: 2666646666700000, the same as the host's own Python). A decode cache keyed on
+   the PC (the instruction word is fixed-width, so a table of decoded handlers is cheap) is
+   the obvious next step if it ever matters, and it is a real refactor of `step()` rather
+   than a local change — worth measuring where the time actually goes first.
+5. ✅ **`--strict` memory** is in. Unmapped guest reads and writes stop the run and name the
+   address instead of reading zero and allocating. It found two bugs in the first 5,000
+   instructions of the macOS guest the day it was written (the missing thread pointer and the
+   missing `ProgramVars`), and both Linux suites pass under it, which says the Linux side
+   makes no wild accesses at all. Only *guest* accesses are checked; `Memory::map()` is how
+   the host declares the regions it synthesises.
 
 ## What running a real macOS binary needed, in the order it was needed
 

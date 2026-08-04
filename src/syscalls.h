@@ -120,6 +120,8 @@ private:
     Cpu& cpu_;
     Memory& mem_;
     uint64_t brk_ = 0, brk_start_ = 0;
+    // What KERN_BOOTTIME reports, taken the first time it is asked and then fixed.
+    uint64_t boot_time_ = 0;
     // Set by the host, which owns the address-space layout. The default is only a
     // fallback; main.cpp places it clear of the image, the interpreter and the stack.
     uint64_t mmap_next_ = 0x0000'7F40'0000'0000ull;
@@ -153,6 +155,15 @@ private:
     std::vector<std::string> objc_image_paths_;
     std::vector<uint64_t> objc_image_headers_;
     std::vector<LoadedImage::ImageSeg> image_segs_;
+    // The guest-visible path string for an image, by mach_header. dyld hands these out as
+    // `const char*`, and the host's copy of the list is std::strings -- so they are copied
+    // into guest memory the first time one is asked for. `map_images` also writes paths,
+    // but only if libobjc asked for them, and this cannot depend on that having happened.
+    uint64_t image_path_addr(uint64_t header);
+    std::unordered_map<uint64_t, uint64_t> path_addr_;
+    static constexpr uint64_t kPathArena = 0x0000'0003'0300'0000ull;
+    static constexpr uint64_t kPathArenaSize = 1u << 16;
+    uint64_t path_next_ = 0;
     // Where map_images's two arrays and their path strings go.
     static constexpr uint64_t kObjcArena = 0x0000'0003'0100'0000ull;
 };

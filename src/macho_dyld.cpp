@@ -693,6 +693,24 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
         if (a) { out->dyld_gapis = img.slide + a; break; }
     }
 
+    // Where the crt globals live. On a Mac `NXArgc`, `NXArgv`, `environ` and `__progname`
+    // are defined in libdyld.dylib, and *dyld* writes them before any initializer runs --
+    // libsystem_c's `environ` and Swift's environment reader are binds against this same
+    // storage, not copies of it. Having replaced dyld, the host has to write them, so the
+    // loader reports where they are. (Filling in only the ProgramVars struct is not
+    // enough: libsystem_c copies from it into these same variables, but anything that
+    // reads them *before* libsystem_c's initializer runs -- or that never goes through
+    // libsystem_c at all, which is what libswiftCore does -- reads a zero.)
+    for (const MachoImage& img : images) {
+        const uint64_t argc = macho_lookup_symtab(img, "_NXArgc");
+        if (!argc) continue;
+        out->prog_vars.argc     = img.slide + argc;
+        if (const uint64_t a = macho_lookup_symtab(img, "_NXArgv"))     out->prog_vars.argv = img.slide + a;
+        if (const uint64_t a = macho_lookup_symtab(img, "_environ"))    out->prog_vars.env = img.slide + a;
+        if (const uint64_t a = macho_lookup_symtab(img, "___progname")) out->prog_vars.progname = img.slide + a;
+        break;
+    }
+
     const MachoImage& m = images[0];
     out->base = 0;
     out->entry = m.has_main ? (m.text_vmaddr + m.entry_off) : m.unixthread_pc;

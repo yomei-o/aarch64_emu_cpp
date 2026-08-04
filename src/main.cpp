@@ -330,15 +330,31 @@ int main(int argc, char** argv) {
                     if (!c) break;
                     if (c == '/') progname = s + 1;
                 }
-                mem.write<uint32_t>(kVars + 0x30, static_cast<uint32_t>(argc_g));
-                mem.write<uint64_t>(kVars + 0x38, argv_g);
-                mem.write<uint64_t>(kVars + 0x40, envp_g);
-                mem.write<uint64_t>(kVars + 0x48, progname);
+                // The words the struct points at. When libdyld is loaded these are *its*
+                // globals, because that is where they live on a Mac and every consumer --
+                // libsystem_c's `environ`, libswiftCore's environment reader -- is bound
+                // against that storage rather than handed a copy. The scratch words next
+                // to the struct are only the fallback for a guest without libdyld.
+                const uint64_t p_argc = img.prog_vars.argc     ? img.prog_vars.argc     : kVars + 0x30;
+                const uint64_t p_argv = img.prog_vars.argv     ? img.prog_vars.argv     : kVars + 0x38;
+                const uint64_t p_env  = img.prog_vars.env  ? img.prog_vars.env  : kVars + 0x40;
+                const uint64_t p_prog = img.prog_vars.progname ? img.prog_vars.progname : kVars + 0x48;
+                mem.write<uint32_t>(p_argc, static_cast<uint32_t>(argc_g));
+                mem.write<uint64_t>(p_argv, argv_g);
+                mem.write<uint64_t>(p_env, envp_g);
+                mem.write<uint64_t>(p_prog, progname);
                 mem.write<uint64_t>(kVars + 0x00, img.phdr_addr);   // the mach_header
-                mem.write<uint64_t>(kVars + 0x08, kVars + 0x30);
-                mem.write<uint64_t>(kVars + 0x10, kVars + 0x38);
-                mem.write<uint64_t>(kVars + 0x18, kVars + 0x40);
-                mem.write<uint64_t>(kVars + 0x20, kVars + 0x48);
+                mem.write<uint64_t>(kVars + 0x08, p_argc);
+                mem.write<uint64_t>(kVars + 0x10, p_argv);
+                mem.write<uint64_t>(kVars + 0x18, p_env);
+                mem.write<uint64_t>(kVars + 0x20, p_prog);
+                if (trace_sys)
+                    std::fprintf(stderr, "[mac] crt globals: NXArgc %llX NXArgv %llX "
+                                         "environ %llX __progname %llX\n",
+                                 static_cast<unsigned long long>(p_argc),
+                                 static_cast<unsigned long long>(p_argv),
+                                 static_cast<unsigned long long>(p_env),
+                                 static_cast<unsigned long long>(p_prog));
                 vars_g = kVars;
             }
             for (size_t k = 0; k < img.initializers.size(); ++k) {

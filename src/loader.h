@@ -45,6 +45,10 @@ struct LoadedImage {
     // highest segment swallows half the address space and every other library in it.
     struct ImageSeg { uint64_t lo = 0, hi = 0, header = 0; };
     std::vector<ImageSeg> image_segs;
+    // Where libdyld keeps the crt globals -- `NXArgc`, `NXArgv`, `environ`, `__progname`.
+    // Zero when no libdyld is loaded, in which case there is nothing to fill in.
+    struct ProgVars { uint64_t argc = 0, argv = 0, env = 0, progname = 0; };
+    ProgVars prog_vars;
 };
 
 // `base` is where to place an ET_DYN (PIE or shared object) image; ignored for

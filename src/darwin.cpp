@@ -17,6 +17,7 @@
 // The errno numbers themselves are mostly shared with Linux (both descend from
 // the same BSD table), so `Files` results pass through with two exceptions, fixed
 // up in `bsd_errno`.
+#include <ctime>
 #include "syscalls.h"
 #include <cstdio>
 #include <cstring>
@@ -124,6 +125,32 @@ void Syscalls::setup_commpage() {
     };
     fill(0x0000'000F'FFFF'C000ull);
     fill(0x0000'000F'FFFF'4000ull);
+}
+
+// The guest-visible path of an image, by mach_header, copied into guest memory the
+// first time it is asked for. The host holds the image list as std::strings and the
+// dyld APIs hand paths to the guest as `const char*`, so somebody has to put the bytes
+// where the guest can read them. Returns 0 for an image that is not in the list, which
+// is what a caller asking about an address in host-invented memory should get.
+uint64_t Syscalls::image_path_addr(uint64_t header) {
+    const auto it = path_addr_.find(header);
+    if (it != path_addr_.end()) return it->second;
+    if (!path_next_) {
+        mem_.map(kPathArena, kPathArenaSize);
+        mem_.set(kPathArena, 0, kPathArenaSize);
+        path_next_ = kPathArena;
+    }
+    std::string path;
+    for (size_t j = 0; j < objc_image_headers_.size() && j < objc_image_paths_.size(); ++j)
+        if (objc_image_headers_[j] == header) { path = objc_image_paths_[j]; break; }
+    uint64_t addr = 0;
+    if (!path.empty() && path_next_ + path.size() + 1 <= kPathArena + kPathArenaSize) {
+        addr = path_next_;
+        mem_.write_bytes(addr, path.c_str(), path.size() + 1);
+        path_next_ += path.size() + 1;
+    }
+    path_addr_[header] = addr;
+    return addr;
 }
 
 // A stand-in for `dyld4::gAPIs`, the object real dyld constructs to answer questions
@@ -235,6 +262,17 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
                 if (addr >= sg.lo && addr < sg.hi) { hdr = sg.header; break; }
             // Not in a library: the main executable, or genuinely nowhere.
             if (!hdr && addr && prog_header_ && addr >= prog_header_) hdr = prog_header_;
+            // The answer does not come back in x0 alone: the caller also passes a buffer
+            // and reads two things out of it afterwards. libsystem_c's `_os_assumes_log`
+            // does `add x1, sp, #0x30` before the call, then hands `[sp, #0x38]` to
+            // `_os_get_image_uuid` as a mach_header and `[sp, #0x30]` to `strrchr(…, '/')`
+            // -- so x0 is a success flag and the pair at x2 is `{path, header}`. Filling
+            // in x0 alone left both words zero; that was the null mach_header, and behind
+            // it a null path.
+            if (hdr && cpu_.xr(2) && mem_.is_mapped(cpu_.xr(2))) {
+                mem_.write<uint64_t>(cpu_.xr(2) + 0, image_path_addr(hdr));
+                mem_.write<uint64_t>(cpu_.xr(2) + 8, hdr);
+            }
             if (trace)
                 std::fprintf(stderr, "[mac] image containing %012llX -> %012llX"
                              " (x2=%llX lr=%llX)\n",
@@ -929,6 +967,56 @@ bool Syscalls::svc_darwin() {
                 return 0;
             };
             constexpr uint32_t CTL_KERN = 1, CTL_HW = 6;
+            // Some of the sysctls a libSystem startup reads are *dynamically registered*
+            // nodes: they have no fixed MIB even on a real kernel, which assigns a number
+            // when the node registers and hands it out through sysctlbyname(3). So this
+            // assigns them too, out of a private range. Which numbers they are does not
+            // matter; that name2oid and the numeric lookup below agree does.
+            enum : uint32_t { kOidBootargs = 0x101, kOidOsVariant = 0x102,
+                              kOidEphemeral = 0x103 };
+            static const struct { const char* name; uint32_t mib[2]; } kNamed[] = {
+                {"kern.boottime",         {CTL_KERN, 21}},   // these two have real MIBs
+                {"kern.osversion",        {CTL_KERN, 65}},
+                {"kern.bootargs",         {0, kOidBootargs}},
+                {"kern.osvariant_status", {0, kOidOsVariant}},
+                {"hw.ephemeral_storage",  {0, kOidEphemeral}},
+            };
+            // {0, 3} is name2oid, which is what sysctlbyname(3) is built on: the name
+            // comes in as a string in `newp` and the MIB goes back into `oldp`.
+            if (namelen == 2 && mib[0] == 0 && mib[1] == 3) {
+                const std::string want = guest_str(cpu_.xr(4));
+                const uint32_t* found = nullptr;
+                for (const auto& e : kNamed)
+                    if (want == e.name) { found = e.mib; break; }
+                if (!found) goto sysctl_unknown;
+                if (oldlenp) mem_.write<uint64_t>(oldlenp, 8);
+                if (oldp) {
+                    mem_.write<uint32_t>(oldp, found[0]);
+                    mem_.write<uint32_t>(oldp + 4, found[1]);
+                }
+                if (trace)
+                    std::fprintf(stderr, "[mac]   name2oid(\"%s\") -> {%u, %u}\n",
+                                 want.c_str(), found[0], found[1]);
+                r = 0;
+                break;
+            }
+            if (namelen == 2 && mib[0] == 0) {
+                switch (mib[1]) {
+                    // No boot arguments, which is also what a machine nobody has
+                    // reconfigured reports.
+                    case kOidBootargs: r = give_str(""); break;
+                    // os_variant(3)'s cache: two bits per property, 2 meaning "no". All
+                    // "no" is a stock customer machine -- no internal content, no internal
+                    // diagnostics, not a recovery or DarwinOS system. Failing the call
+                    // instead is survivable, because os_variant then goes and looks for
+                    // /AppleInternal itself and this filesystem does not have one, but the
+                    // answer is the same and this way it does not have to.
+                    case kOidOsVariant: r = give_int(0xAAAA'AAAA'AAAA'AAAAull, 8); break;
+                    case kOidEphemeral: r = give_int(0, 4); break;
+                    default: goto sysctl_unknown;
+                }
+                break;
+            }
             // Where main.cpp actually put the stack, so the answer is the truth rather
             // than a plausible constant.
             constexpr uint64_t kStackTop = 0x0000'7FFF'FFFF'F000ull;
@@ -952,6 +1040,22 @@ bool Syscalls::svc_darwin() {
                     // arm64 main-thread stack sits. Nothing else it could be asking for.
                     case 59: case 70: r = give_int(kStackTop, 8); break;
                     case 35: r = give_int(kStackTop, 4); break;   // KERN_USRSTACK32
+                    case 65: r = give_str("24G84"); break;        // KERN_OSVERSION: build
+                    // KERN_BOOTTIME, a struct timeval. Taken once, the first time it is
+                    // asked: the guest subtracts it from the current time to get the
+                    // uptime, and a boot time that moved between two calls would make
+                    // that go backwards. From the guest's side this machine did just
+                    // come up, so the first ask is the truth.
+                    case 21: {
+                        if (!boot_time_) boot_time_ = static_cast<uint64_t>(std::time(nullptr));
+                        if (oldlenp) mem_.write<uint64_t>(oldlenp, 16);
+                        if (oldp) {
+                            mem_.write<uint64_t>(oldp, boot_time_);
+                            mem_.write<uint64_t>(oldp + 8, 0);
+                        }
+                        r = 0;
+                        break;
+                    }
                     default: goto sysctl_unknown;
                 }
                 break;
@@ -967,6 +1071,12 @@ bool Syscalls::svc_darwin() {
                 break;
             }
         sysctl_unknown:
+            // {0, 3} is "name2oid", the call underneath sysctlbyname(3): the name arrives
+            // as a string in `newp` and the MIB is written back into `oldp`. Report the
+            // name, because the numbers alone say nothing about what was wanted.
+            if (namelen == 2 && mib[0] == 0 && mib[1] == 3)
+                std::fprintf(stderr, "[mac]   name2oid(\"%s\")\n",
+                             guest_str(cpu_.xr(4)).c_str());
             std::fprintf(stderr, "[mac] sysctl not implemented:");
             for (uint32_t k = 0; k < namelen && k < 8; ++k) std::fprintf(stderr, " %u", mib[k]);
             std::fprintf(stderr, "   (namelen %u, at PC %016llX)\n", namelen,
@@ -979,6 +1089,44 @@ bool Syscalls::svc_darwin() {
         case 92: case 406: r = 0; break;                   // fcntl[_nocancel]
         case 294: err = kBsdEINVAL; break;                 // shared_region_check_np: no cache
         case 336: err = kBsdEINVAL; break;                 // proc_info
+        // The code-signing status of a process, which libSystem consults before it
+        // decides whether library validation, the debugger interfaces or the hardened
+        // runtime apply. CS_OPS_STATUS is the only query it needs an answer to; the blob
+        // queries (entitlements, team id, cdhash) have no answer for a binary that is
+        // not signed, and ENOENT is what the kernel returns for them then -- so callers
+        // are already written for it.
+        case 169:                                          // csops(pid, ops, addr, size)
+        case 170: {                                        // csops_audittoken(+ token)
+            constexpr uint32_t CS_OPS_STATUS = 0;
+            constexpr uint32_t CS_VALID = 0x1, CS_ADHOC = 0x2;
+            if (a1 == CS_OPS_STATUS && a2 && a3 >= 4) {
+                mem_.write<uint32_t>(a2, CS_VALID | CS_ADHOC);
+                r = 0;
+            } else {
+                err = kBsdENOENT;
+            }
+            break;
+        }
+        // System Integrity Protection's configuration. Nothing here relaxes any part of
+        // it, which is also what a stock machine reports, so the bitmask is zero and the
+        // call *succeeds* -- failing it instead makes a caller assume the opposite.
+        case 483: {                                        // csrctl(op, addr, size)
+            if (a1 && a2 >= 4) mem_.write<uint32_t>(a1, 0);
+            r = 0;
+            break;
+        }
+        // POSIX shared memory. There is no shm namespace here; ENOENT is what an absent
+        // object gives, and notify(3) then asks its daemon each time instead of reading
+        // a shared page.
+        case 266: err = kBsdENOENT; break;                 // shm_open
+        // The bulk filesystem-attribute call. ENOTSUP is what a filesystem that does not
+        // implement it returns, and callers carry a stat(2) fallback for exactly that
+        // case -- which is a path this emulator does implement.
+        case 220: err = 45; break;                         // getattrlist: ENOTSUP
+        // socket(2). There is no networking here, and the one the guest actually asks for
+        // is AF_UNIX/SOCK_DGRAM: libsystem_c's syslog fallback, on its way to
+        // /var/run/syslog. EPERM is the answer a sandboxed process gets.
+        case 97: err = 1; break;                           // socket: EPERM
         default:
             if (unknown) unknown(static_cast<uint64_t>(nr));
             std::fprintf(stderr, "[mac] unimplemented syscall %lld at PC %016llX\n",

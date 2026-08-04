@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 #include "cpu.h"
@@ -43,6 +44,8 @@ public:
     void set_objc_opt_ro(uint64_t addr) { objc_opt_ro_ = addr; }
     // The main executable's mach_header, which _dyld_get_prog_image_header returns.
     void set_prog_header(uint64_t addr) { prog_header_ = addr; }
+    // Where the cache-derived libraries live, for `_dyld_get_shared_cache_range`.
+    void set_cache_range(uint64_t lo, uint64_t hi) { cache_lo_ = lo; cache_hi_ = hi; }
     // Non-zero once libobjc has handed over its callbacks. The host then has to call
     // `map_images` the way dyld does, or no class is ever registered.
     uint64_t objc_callbacks() const { return objc_callbacks_; }
@@ -120,6 +123,9 @@ private:
     // fails only if it is zero. Handing out the same one twice would make two
     // different things compare equal.
     uint32_t next_port_ = 0x1103;
+    // A task's special ports (TASK_BOOTSTRAP_PORT and friends), by `which_port`. The same
+    // port every time it is asked for, because that is what it is.
+    std::map<uint32_t, uint32_t> special_ports_;
     // Where the synthesised dyld vtable and its stubs live: clear of the image, the
     // libraries, the arena and the stack.
     static constexpr uint64_t kDyldStubBase = 0x0000'0003'0000'0000ull;
@@ -131,6 +137,7 @@ private:
     // Where libobjc left its callbacks, so the host can call them the way dyld would.
     uint64_t objc_callbacks_ = 0;
     uint64_t objc_opt_ro_ = 0, objc_opt_rw_ = 0, prog_header_ = 0;
+    uint64_t cache_lo_ = 0, cache_hi_ = 0;
     static constexpr uint64_t kObjcOptRw = 0x0000'0003'0200'0000ull;
     static constexpr uint64_t kObjcOptRwSize = 1u << 20;
     std::vector<std::string> objc_image_paths_;

@@ -615,6 +615,16 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
             // Dependency order puts libobjc before libdispatch, which is what dyld does.
             out->image_paths.push_back(im.guest_path);
             out->image_headers.push_back(im.load_addr());
+            // ...and the span they cover, which is what `_dyld_get_shared_cache_range`
+            // reports. Only the *libraries* that kept the cache's own addresses count.
+            // images[0] is the main executable, which is not in any cache and sits at
+            // 0x100000000 — including it stretched the reported range down to there and
+            // made libobjc treat the program's own image as preoptimized.
+            if (idx != 0 && im.slide == 0) {
+                const uint64_t lo = im.load_addr(), hi = im.slide + im.vm_end;
+                if (!out->cache_lo || lo < out->cache_lo) out->cache_lo = lo;
+                if (hi > out->cache_hi) out->cache_hi = hi;
+            }
             for (const MachoImage::InitSec& sec : im.inits) {
                 const uint64_t at = im.slide + sec.addr;
                 if (sec.offsets) {

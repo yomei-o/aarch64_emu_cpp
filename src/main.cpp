@@ -244,6 +244,7 @@ int main(int argc, char** argv) {
         sys.set_objc_images(img.image_paths, img.image_headers);
         sys.set_objc_opt_ro(img.objc_opt_ro);
         sys.set_prog_header(img.phdr_addr);
+        sys.set_cache_range(img.cache_lo, img.cache_hi);
     }
 
     int rc = 0;
@@ -294,6 +295,21 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         std::fprintf(stderr, "\naarch64emu: %s  [%llu instructions]\n", e.what.c_str(),
                      static_cast<unsigned long long>(cpu.insns));
+        // The registers, because where a guest stopped is rarely as informative as what it
+        // was holding when it did. A branch to zero says nothing on its own; x30 names the
+        // caller and x16/x17 hold whatever the PAC-signed indirect branch had just loaded,
+        // which is where the zero came from. Printed as one block rather than on request,
+        // since by the time the question comes up the run is already over.
+        for (int k = 0; k < 32; k += 4) {
+            std::fprintf(stderr, "  ");
+            for (int j = k; j < k + 4; ++j)
+                std::fprintf(stderr, "x%-2d=%016llX ", j,
+                             static_cast<unsigned long long>(cpu.xr(j)));
+            std::fputc('\n', stderr);
+        }
+        std::fprintf(stderr, "  sp =%016llX pc =%016llX\n",
+                     static_cast<unsigned long long>(cpu.sp),
+                     static_cast<unsigned long long>(cpu.pc));
         rc = 1;
     }
     std::fflush(stdout);

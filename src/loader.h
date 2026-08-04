@@ -24,6 +24,11 @@ struct LoadedImage {
     // dyld, the host has to stand in for it.
     uint64_t dyld_gapis = 0;
     uint64_t objc_opt_ro = 0;
+    // The span the cache-derived libraries occupy, for `_dyld_get_shared_cache_range`.
+    // They keep the addresses the cache assigned them, so this really is where the cache
+    // was mapped — measured from the images rather than written down, because a different
+    // extraction or a different OS moves it.
+    uint64_t cache_lo = 0, cache_hi = 0;
     // Every loaded image, in load order: the path the guest should see and where its
     // mach_header landed. libobjc's `map_images` wants exactly these two arrays, and
     // nothing else in the emulator has the list.

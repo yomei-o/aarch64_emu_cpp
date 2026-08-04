@@ -223,6 +223,35 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // decodes to nonsense read as an ordinary pointer, and only four slots in the
         // whole of libobjc's data have the top bit set, so it is not an unpacked pointer.
         case 118: return static_cast<int64_t>(objc_opt_ro_);
+        // _dyld_get_shared_cache_range(size_t* length) -> const void* base.
+        //
+        // Answering zero here said "this process has no shared cache" while slot 118 was
+        // handing libobjc the cache's own optimisation table, and the class objects it
+        // reads *are* in cache form. That contradiction is the reason this is the first
+        // slot to fill: libobjc asks whether an address is in the cache before it will
+        // treat the data at that address as preoptimized.
+        //
+        // The range is measured, not written down. Cache libraries keep the addresses the
+        // cache gave them, so the span the loader mapped them into is the span the cache
+        // occupied; a different extraction or OS moves it, and hardcoding 0x180000000
+        // would be right until it silently was not.
+        // The out-pointer is in **x1**, not x0: these slots are virtual methods on dyld's
+        // APIs object, so x0 is `this` and the arguments start one register along. Writing
+        // the length through x0 overwrites the object's vtable pointer with it, and the
+        // next dispatch through that object branches to a length — which lands at PC 0 and
+        // says "unimplemented FP/SIMD instruction" 50,000 instructions before the real
+        // problem. Slot 107 reads x1 for the same reason.
+        case 63: {
+            if (!cache_hi_) return 0;                     // no cache libraries: honest zero
+            const uint64_t p = cpu_.xr(1);
+            if (p) mem_.write<uint64_t>(p, cache_hi_ - cache_lo_);
+            if (trace)
+                std::fprintf(stderr, "[mac] shared cache range %012llX..%012llX (%llu MiB)\n",
+                             static_cast<unsigned long long>(cache_lo_),
+                             static_cast<unsigned long long>(cache_hi_),
+                             static_cast<unsigned long long>((cache_hi_ - cache_lo_) >> 20));
+            return static_cast<int64_t>(cache_lo_);
+        }
         // _dyld_for_objc_header_opt_rw. The writable half of the same pair: dyld allocates
         // it and libobjc writes its per-launch state there. A zeroed region is the honest
         // starting state -- dyld's is fresh too -- and it has to be *somewhere*, because
@@ -417,9 +446,32 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
         // be distinct and non-zero -- and it is handed out from the same counter as every
         // other port, so two of them never compare equal.
         case 206:
-        case 3418: {
+        case 3418:
+        // task_get_special_port(task, which_port, &special_port) — same reply shape, since
+        // what comes back is also a port right. libxpc's initializer asks for
+        // TASK_BOOTSTRAP_PORT (4) and aborts without one:
+        //
+        //     Kernel bug: Could not obtain task bootstrap port.
+        //
+        // That message never reaches the terminal — the abort is a BRK in
+        // `_libxpc_initializer.cold.1` — so it was read out of the library, from the string
+        // the ADRP/ADD pair two instructions earlier points at. The guest names its own
+        // problem even when it does not get to say so.
+        case 3409: {
             const uint32_t size = 24 + 4 + 12;
             if (reply_cap && size > reply_cap) return kKernFailure;
+            // A task's special ports are the *same* ports each time it asks, and a client
+            // keeps the one it gets in a global and compares it later, so the name has to
+            // be remembered rather than handed out fresh. The other two routines here
+            // genuinely do create something new every call.
+            uint32_t name;
+            if (msgh_id == 3409) {
+                uint32_t& slot = special_ports_[mem_.read<uint32_t>(data + 32)];
+                if (!slot) slot = next_port_++;
+                name = slot;
+            } else {
+                name = next_port_++;
+            }
             mem_.write<uint32_t>(data + 0, 0x80000000u);     // msgh_bits: COMPLEX
             mem_.write<uint32_t>(data + 4, size);
             mem_.write<uint32_t>(data + 8, 0);
@@ -427,7 +479,7 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
             mem_.write<uint32_t>(data + 16, 0);
             mem_.write<uint32_t>(data + 20, msgh_id + 100);
             mem_.write<uint32_t>(data + 24, 1);              // msgh_descriptor_count
-            mem_.write<uint32_t>(data + 28, next_port_++);   // the new port's name
+            mem_.write<uint32_t>(data + 28, name);           // the port's name
             mem_.write<uint32_t>(data + 32, 0);              // pad1
             // pad2:16, disposition:8, type:8 — MOVE_SEND (17), PORT_DESCRIPTOR (0).
             mem_.write<uint32_t>(data + 36, 17u << 16);

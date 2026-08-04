@@ -243,6 +243,7 @@ int main(int argc, char** argv) {
         sys.setup_dyld_apis(img.dyld_gapis);
         sys.set_objc_images(img.image_paths, img.image_headers);
         sys.set_objc_opt_ro(img.objc_opt_ro);
+        sys.set_prog_header(img.phdr_addr);
     }
 
     int rc = 0;

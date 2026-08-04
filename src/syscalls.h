@@ -41,6 +41,8 @@ public:
     // libobjc's `__objc_opt_ro`, which dyld hands back from
     // `_dyld_for_objc_header_opt_ro` and libobjc needs to read the cache's class layout.
     void set_objc_opt_ro(uint64_t addr) { objc_opt_ro_ = addr; }
+    // The main executable's mach_header, which _dyld_get_prog_image_header returns.
+    void set_prog_header(uint64_t addr) { prog_header_ = addr; }
     // Non-zero once libobjc has handed over its callbacks. The host then has to call
     // `map_images` the way dyld does, or no class is ever registered.
     uint64_t objc_callbacks() const { return objc_callbacks_; }
@@ -128,7 +130,9 @@ private:
     uint64_t dyld_vtable_ = 0;
     // Where libobjc left its callbacks, so the host can call them the way dyld would.
     uint64_t objc_callbacks_ = 0;
-    uint64_t objc_opt_ro_ = 0;
+    uint64_t objc_opt_ro_ = 0, objc_opt_rw_ = 0, prog_header_ = 0;
+    static constexpr uint64_t kObjcOptRw = 0x0000'0003'0200'0000ull;
+    static constexpr uint64_t kObjcOptRwSize = 1u << 20;
     std::vector<std::string> objc_image_paths_;
     std::vector<uint64_t> objc_image_headers_;
     // Where map_images's two arrays and their path strings go.

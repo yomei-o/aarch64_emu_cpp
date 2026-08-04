@@ -211,6 +211,10 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // _dyld_get_active_platform. PLATFORM_MACOS is 1; returning 0 would be
         // PLATFORM_UNKNOWN, and libSystem branches on it.
         case 66: return 1;
+        // _dyld_get_prog_image_header: the main executable's mach_header. Zero is simply
+        // wrong -- it is the one image whose address is never in doubt.
+        case 94:
+            return static_cast<int64_t>(objc_image_headers_.empty() ? 0 : prog_header_);
         // _dyld_for_objc_header_opt_ro. On this OS the shared cache's ObjC optimisation
         // header lives inside libobjc itself, in `__TEXT,__objc_opt_ro` -- so unlike the
         // rest of the cache's tables, it is *present* in an extracted library and only
@@ -219,6 +223,18 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // decodes to nonsense read as an ordinary pointer, and only four slots in the
         // whole of libobjc's data have the top bit set, so it is not an unpacked pointer.
         case 118: return static_cast<int64_t>(objc_opt_ro_);
+        // _dyld_for_objc_header_opt_rw. The writable half of the same pair: dyld allocates
+        // it and libobjc writes its per-launch state there. A zeroed region is the honest
+        // starting state -- dyld's is fresh too -- and it has to be *somewhere*, because
+        // returning null makes libobjc conclude there is no optimisation data at all after
+        // it has already been told there is.
+        case 117: {
+            if (!objc_opt_rw_) {
+                objc_opt_rw_ = kObjcOptRw;
+                mem_.set(objc_opt_rw_, 0, kObjcOptRwSize);
+            }
+            return static_cast<int64_t>(objc_opt_rw_);
+        }
         // _dyld_objc_register_callbacks. libobjc hands dyld the functions it wants called
         // when images are mapped -- `map_images` is what registers every class in every
         // loaded image, so without it the first `objc_msgSend` finds an unknown class:

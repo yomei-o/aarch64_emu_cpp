@@ -3,6 +3,52 @@
 Working notes for picking the project back up. The README says what the emulator
 *is*; this says what is unfinished and what is known about it.
 
+## Handoff — start here
+
+**Everything needed is in the repository. No Mac is required to continue.**
+
+    git pull
+    sh build.sh
+    sh prebuilt/unpack.sh                # 48 macOS libraries, 21 MB packed
+    ./aarch64emu --root guests/macos guests/macos/hello
+
+That runs **78,474 instructions of Apple's own arm64 code** and stops inside the ObjC
+runtime. Everything up to that point works: the libraries load and link, the emulator
+does dyld's job, initializers run in dyld's order, malloc and stdio come up, and libobjc
+registers its images. The open problem is one class encoding, described in item 1 below,
+with the evidence already gathered so it does not have to be re-derived.
+
+Run the four suites before touching anything — they should be 9 / 10 / 9 / 7, plus 8 for
+`node web/test_node.mjs` if emscripten is around:
+
+    sh tests/run_tests.sh    sh tests/run_macho.sh
+    sh tests/run_busybox.sh  sh tests/run_python.sh
+
+The tools built for this, all of which take addresses straight out of a trace:
+
+    --trace-sys              syscalls, Mach traps, MIG routines, [init]/[objc]/[call]
+    --sample N               print the PC every N instructions
+    --watch LO:HI            log every guest access in a range, with the PC
+    --macho-info FILE [sym…] what a Mach-O contains; look symbols up in its export trie
+    tools/whichlib.py        address -> library and nearest symbol
+    tools/dis_macho.py       disassemble at a virtual address in a cache-extracted library
+    tools/dyld_slots.py      names 98 of dyld's API vtable slots
+    tools/profile_pcs.py     a --sample trace -> a per-function profile
+    tools/dsc_extract.c      re-extract from a Mac's shared cache (only if the OS changes)
+
+Two habits this project runs on, both earned the hard way and both worth keeping:
+
+- **The guest usually names its own problem.** Every wall since the loader was diagnosed
+  by a message libSystem, libpthread or libobjc printed itself, once `write` worked. When
+  something fails silently, the first move is to find the string the code stashes before
+  it aborts (`--watch` a wide range, filter to accesses where the address is not the PC).
+- **Measure instead of reasoning about which structure "should" hold the value.** Three
+  separate rounds were lost to plausible explanations of a zero. `--watch`, `--dump` in
+  dsc_extract, and `profile_pcs.py` all exist because of that.
+
+The Linux side (CPython 3.13, threads, WebAssembly) is finished and green; nothing below
+touches it.
+
 ## The goal
 
 Run a **stock CPython for ARM Linux, and then for Apple Silicon, on an x86 host and
@@ -52,7 +98,7 @@ What works:
 
 ## ⏭ Next, in order
 
-1. **A real macOS binary — 78,465 instructions in, inside the ObjC runtime.** This is
+1. **A real macOS binary — 78,474 instructions in, inside the ObjC runtime.** This is
    the live front, and the guest tree for it is committed:
 
        sh prebuilt/unpack.sh                # 48 files, 85 MB unpacked, 21 MB packed
@@ -84,9 +130,37 @@ What works:
 
    That table is not lost: on this OS it lives *inside libobjc*, in `__TEXT,__objc_opt_ro`
    (16 KiB), so an extracted library has it. `_dyld_for_objc_header_opt_ro` (slot 118) now
-   returns its address, which moved the guest 75,035 -> 78,465. The next step is the
-   matching `_dyld_for_objc_header_opt_rw` (117) -- a *writable* table dyld allocates,
-   which nothing here does yet -- and then whatever libobjc asks for next.
+   returns its address, which moved the guest 75,035 -> 78,465.
+
+   **The exact list of dyld API slots still answered with zero**, which is the shortest
+   route to the next move -- `tools/dyld_slots.py` supplies the names, and these are the
+   ones the run actually calls:
+
+       44  _dyld_get_image_slide          0 is correct: cache addresses, no slide
+       51  dyld_process_is_restricted     0 is correct
+       61  _dyld_is_memory_immutable      0 is conservative; libobjc caches less
+       63  _dyld_get_shared_cache_range   0 says "no shared cache" -- and the class
+                                          encodings *are* the cache's, so this is a
+                                          contradiction worth resolving first. The
+                                          libraries span roughly 0x180000000..0x2E0000000.
+       69  dyld_sdk_at_least              0 = false, which enables libobjc's legacy paths
+       71  dyld_program_sdk_at_least      0 = false, same
+       84  _dyld_get_objc_selector        0 = "not in the cache's selector table"
+       111 _dyld_lookup_section_info      0 makes libobjc fall back to getsegmentdata,
+                                          which works -- 16% of the run is spent there
+       117 _dyld_for_objc_header_opt_rw   answered with a zeroed 1 MiB region; not called
+
+   Order of attack: **63** (tell libobjc the cache range, since its data is in cache
+   form), then **69/71** (claim a current SDK, since the program was built with one), then
+   **61**. Each is a one-line change in `dyld_api_stub` in `src/darwin.cpp`, and each run
+   takes seconds -- the loop is fast, which is the point of having got this far.
+
+   If that runs out, the fallback is the opposite direction: make libobjc treat the
+   libraries as *ordinary* images rather than cache ones. The `OPTIMIZED_BY_DYLD` bit is
+   already cleared; what remains is whatever else tells it these are preoptimized. The
+   `bits` encoding suggests that may not be possible without rewriting the class objects
+   at extraction time -- which `dsc_extract` is the right place for, and which is a
+   bigger job than the slots above.
 
    `tools/dyld_slots.py` now names 98 of the vtable slots by scanning libdyld for the
    dispatch shape, so any unimplemented one is a name rather than a number. The ones

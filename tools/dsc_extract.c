@@ -1282,11 +1282,20 @@ static void collect_extras(void) {
             memcpy(&start, starts + (size_t)p * 2, 2);
             if (start == 0xFFFF) continue;
             const uint64_t page_addr = sm->addr + (uint64_t)p * page_size;
-            if (page_owned_by_any_image(page_addr, page_size)) continue;
             // The scan above says which outside pages the extracted code reaches. A
             // page it never names belongs to some other library and is 301 MiB of
             // nobody's business.
             if (!page_is_referenced(page_addr)) continue;
+            // Deliberately *not* skipping pages that overlap an extracted library.
+            // The cache packs many libraries' small __DATA_CONST segments into one
+            // page, so a page is routinely part owned and part not -- and skipping the
+            // whole thing loses the unowned part. 0x1E7FEC378 held `&mach_task_self_`
+            // in the cache the entire time; it shares a 16 KiB page with some other
+            // library's data, that library was in the extraction, and so the page was
+            // judged "owned" and dropped.
+            //
+            // Collecting the whole page is safe: the overlapping bytes are the same
+            // bytes, decoded the same way, so the library's own copy and this one agree.
             const uint8_t* src = at(page_addr, page_size);
             if (!src) continue;
             uint8_t* tmp = malloc(page_size);
@@ -1305,7 +1314,6 @@ static void collect_extras(void) {
     // all, because there is nothing in it to rebase.
     for (size_t i = 0; i < n_patches; ++i) {
         const uint64_t page = patches[i].addr & ~0x3FFFull;
-        if (page_owned_by_any_image(page, 0x4000)) continue;
         int already = 0;
         for (int r = 0; r < nruns && !already; ++r)
             if (page >= runs[r].addr && page < runs[r].addr + runs[r].size) already = 1;

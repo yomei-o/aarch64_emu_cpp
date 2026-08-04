@@ -303,25 +303,6 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
     const std::string exe_dir = dirname_of(exe_path);
     uint64_t next_base = dylib_base, high = 0;
 
-    // A guest assembled out of a dyld shared cache needs one thing no dependency
-    // names. Recent caches coalesce GOT entries into shared islands that belong to no
-    // dylib at all -- libsystem_platform's __auth_stubs loads through 0x1E2465DB8,
-    // which is inside nothing -- so tools/dsc_extract collects those pages into
-    // /usr/lib/dsc_extras.dylib. Nothing imports it; it exists to be mapped. Loading
-    // it when it happens to be there costs a failed open otherwise.
-    {
-        const std::vector<uint8_t> extras = read_file("/usr/lib/dsc_extras.dylib");
-        if (!extras.empty()) {
-            MachoImage img;
-            std::string e;
-            if (macho_parse(extras, &img, &e)) {
-                img.slide = 0;                     // fixed cache addresses, like the rest
-                img.guest_path = "/usr/lib/dsc_extras.dylib";
-                images.push_back(std::move(img));
-            }
-        }
-    }
-
     // Breadth-first over the dependency graph, deduplicated by install name so a
     // diamond does not map the same library twice at two addresses — which would
     // silently give a library two copies of its own globals.
@@ -382,6 +363,30 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
         macho_map(img, mem);
         const uint64_t end = img.slide + img.vm_end;
         if (end > high) high = end;
+    }
+
+    // A guest assembled out of a dyld shared cache needs one thing no dependency names.
+    // The cache coalesces GOT entries into pages that belong to no dylib, so
+    // tools/dsc_extract collects those pages into /usr/lib/dsc_extras.dylib. Nothing
+    // imports it; it exists to be mapped.
+    //
+    // Mapped **last**, and that matters. The cache packs several libraries' small
+    // segments into one page, so these pages overlap real libraries -- and a library
+    // whose vmsize exceeds its filesize zero-fills the difference, which would wipe a
+    // GOT island mapped before it. The overlapping bytes are identical either way, so
+    // going last is safe and going earlier is not.
+    {
+        const std::vector<uint8_t> extras = read_file("/usr/lib/dsc_extras.dylib");
+        if (!extras.empty()) {
+            MachoImage img;
+            std::string e;
+            if (macho_parse(extras, &img, &e)) {
+                img.slide = 0;                     // fixed cache addresses, like the rest
+                img.guest_path = "/usr/lib/dsc_extras.dylib";
+                macho_map(img, mem);
+                if (img.vm_end > high) high = img.vm_end;
+            }
+        }
     }
 
     // Now the binds. An ordinal is a 1-based index into *this* image's LC_LOAD_DYLIB

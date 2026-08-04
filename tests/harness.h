@@ -121,3 +121,17 @@ static void say(const char* s) {
     while (s[n]) n++;
     out(s, n);
 }
+// Signed decimal. Shared rather than copied per test, because the first two copies
+// both put the newline where the last digit goes -- and since the host build ran
+// the *same* formatter, the diff agreed and said nothing. A bug in the harness is
+// invisible to differential testing; only the harness itself can be read.
+static void dec(int64_t v) {
+    char b[25];
+    int i = 24;
+    b[24] = '\n';
+    uint64_t u = v < 0 ? (uint64_t)(-v) : (uint64_t)v;
+    if (!u) b[--i] = '0';
+    while (u) { b[--i] = (char)('0' + (u % 10)); u /= 10; }
+    if (v < 0) b[--i] = '-';
+    out(b + i, (uint64_t)(25 - i));
+}

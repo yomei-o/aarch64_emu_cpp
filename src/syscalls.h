@@ -49,6 +49,30 @@ private:
     int64_t sys_rt_sigreturn();
     static uint64_t host_nanos();
 
+    // Threads, in threads.cpp. One emulated CPU running one guest thread at a time,
+    // switched at futex/yield/exit and by preemption. These write x0 themselves,
+    // because the thread that made the call may not be the one running on return.
+    struct Thread {
+        Cpu::Context ctx;
+        uint64_t tid = 0;
+        uint64_t clear_child_tid = 0;   // musl's join word: cleared and woken on exit
+        uint64_t wait_addr = 0;
+        bool waiting = false;           // blocked in futex(WAIT)
+        bool exited = false;
+    };
+    std::vector<Thread> threads_;       // empty until the first clone
+    size_t cur_thread_ = 0;
+    uint64_t next_tid_ = 1001;
+
+    void ensure_main_thread();
+    void switch_to(size_t idx);
+    bool schedule(bool must_move);
+    uint64_t current_tid() const;
+    int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t ptid, uint64_t tls, uint64_t ctid);
+    int64_t sys_futex(uint64_t addr, int op, uint32_t val);
+    int64_t sys_sched_yield();
+    void thread_exit(int status);
+
     struct Handler { uint64_t func = 0, flags = 0, restorer = 0; };
     Handler handlers_[64];
     struct SigFrame { uint64_t frame; Cpu::Regs saved; };

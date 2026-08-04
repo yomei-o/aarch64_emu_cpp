@@ -628,6 +628,44 @@ void Cpu::exec_fp_simd(uint32_t insn) {
             }
         }
 
+        // Conversions between FP and **fixed**-point. The same four operations as
+        // the integer group below, distinguished only by bit 21 being 0, with a
+        // scale field where that group has zeros: the value is read or written as
+        // if the binary point sat `fbits` places up from the bottom.
+        //
+        // CPython reaches this converting a float timeout into a lock deadline, so
+        // it turns up the moment a program waits on anything.
+        if ((insn & 0x5F200000u) == 0x1E000000u) {
+            const bool sf = (insn >> 31) & 1;
+            const unsigned rmode = (insn >> 19) & 3, opcode = (insn >> 16) & 7;
+            const unsigned scale = (insn >> 10) & 0x3F;
+            const unsigned fbits = 64 - scale;               // 1..64
+            // ldexp rather than a shift: fbits reaches 64, and 1ull << 64 is
+            // undefined -- on x86 it is a shift by 0, which would make the scale
+            // vanish and the answer merely wrong.
+            const double factor = std::ldexp(1.0, static_cast<int>(fbits));
+            if (rmode == 0 && (opcode == 2 || opcode == 3)) {    // SCVTF / UCVTF
+                const double raw = (opcode == 2)
+                    ? static_cast<double>(sf ? static_cast<int64_t>(xr(rn))
+                                             : static_cast<int64_t>(static_cast<int32_t>(wr(rn))))
+                    : static_cast<double>(sf ? xr(rn) : static_cast<uint64_t>(wr(rn)));
+                wrf(rd, raw / factor);
+                return;
+            }
+            if (rmode == 3 && (opcode == 0 || opcode == 1)) {    // FCVTZS / FCVTZU
+                const double val = rdf(rn) * factor;
+                if (opcode == 0) {
+                    const int64_t iv = static_cast<int64_t>(val);
+                    if (sf) setx(rd, static_cast<uint64_t>(iv));
+                    else setw(rd, static_cast<uint32_t>(static_cast<int32_t>(iv)));
+                } else {
+                    const uint64_t uv = val <= 0 ? 0 : static_cast<uint64_t>(val);
+                    if (sf) setx(rd, uv); else setw(rd, static_cast<uint32_t>(uv));
+                }
+                return;
+            }
+        }
+
         // Conversions between FP and integer, and rounding to integer.
         if ((insn & 0x5F20FC00u) == 0x1E200000u) {
             const bool sf = (insn >> 31) & 1;

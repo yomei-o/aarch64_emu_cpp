@@ -9,18 +9,6 @@
 // a corner case here; it is the point.
 #include "harness.h"
 
-static void dec(int64_t v) {
-    char b[24];
-    int i = 24;
-    int neg = v < 0;
-    uint64_t u = neg ? (uint64_t)(-v) : (uint64_t)v;
-    if (!u) b[--i] = '0';
-    while (u) { b[--i] = (char)('0' + (u % 10)); u /= 10; }
-    if (neg) b[--i] = '-';
-    b[23] = '\n';
-    out(b + i, (uint64_t)(23 - i + 1));
-}
-
 TEST_MAIN {
     int64_t h = t_open(TEST_DATA);
     if (h < 0) {

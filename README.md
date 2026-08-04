@@ -42,8 +42,8 @@ No dependencies beyond a C++17 standard library.
 | Signal delivery (SIGILL frames, `rt_sigreturn`) | ✅ |
 | **A stock CPython 3.13 for ARM64 Linux** | ✅ |
 | **Mach-O loading and Darwin syscalls** (Apple Silicon guests) | ✅ static binaries |
+| **Threads** — `clone`, `futex`, a scheduler, a real exclusive monitor | ✅ |
 | **WebAssembly** — the same guests, in a browser tab | ✅ |
-| Threads (`clone`) | ❌ planned |
 | Dynamically linked Mach-O (needs Apple's `dyld`) | ❌ planned |
 
 ## Correctness is a diff, not an opinion
@@ -58,9 +58,11 @@ $ sh tests/run_tests.sh
 ok   arith
 ok   control
 ok   file
+ok   fp_fixed
 ok   hello
 ok   mem
-5 passed, 0 failed
+ok   thread_linux
+7 passed, 0 failed
 ```
 
 The **same sources** are then built a third time, as arm64 **Mach-O**, and run
@@ -72,9 +74,10 @@ $ sh tests/run_macho.sh
 ok   macho arith
 ok   macho control
 ok   macho file
+ok   macho fp_fixed
 ok   macho hello
 ok   macho mem
-5 passed, 0 failed
+6 passed, 0 failed
 ```
 
 And a second suite runs a **real** guest — Alpine's static aarch64-musl busybox, a
@@ -120,12 +123,21 @@ ok   wasm: busybox echo
 ok   wasm: busybox uname
 ok   wasm: busybox sha256sum
 ok   wasm: cpython
-6 passed, 0 failed
+ok   wasm: cpython threading
+7 passed, 0 failed
 ```
 
-That last line is CPython 3.13 for ARM64 Linux, dynamically linked, running inside
-WebAssembly — three architectures deep, and the sha256sum above it still agrees
+Those last two are CPython 3.13 for ARM64 Linux, dynamically linked, running inside
+WebAssembly — three architectures deep, and the sha256sum above them still agrees
 with the host's.
+
+The threading one is worth a second look: four guest `pthread`s, a real mutex,
+8000 increments, and the count comes out exactly right — **without WebAssembly
+threads**. There is one wasm instance, so no `SharedArrayBuffer`, no cross-origin
+isolation, and no COOP/COEP headers — which static hosting like GitHub Pages
+cannot set anyway. The guest's threads are
+interleaved by the emulator's own scheduler, and from inside the guest that is
+indistinguishable from a single-core machine.
 
 ## Building
 
@@ -159,6 +171,9 @@ sh tests/run_tests.sh
 - `src/macho_loader.cpp`, `src/darwin.cpp` — the second personality. Not a fork of
   the first: the same CPU, the same memory, the same file layer, reached through
   `svc #0x80` instead of `svc #0`.
+- `src/threads.cpp` — `clone`, `futex`, and a scheduler. One emulated CPU running
+  one guest thread at a time, switched at futex/yield/exit and preempted every
+  20,000 instructions so a spin loop cannot keep the CPU.
 
 ## Two kernels, one build
 
@@ -191,3 +206,21 @@ always explicit.
 
 **A 32-bit result clears the top half.** Writing W0 zeroes bits 63..32 of X0,
 unlike x86 where a 16-bit write preserves them. Handled in one place.
+
+## The exclusive monitor is not optional once there are threads
+
+`LDXR`/`STXR` were a plain load and a store that always succeeded for as long as
+the emulator was single-threaded, and nothing could tell. The moment a second
+thread exists, "always succeeds" means two threads can both win the same
+compare-and-swap, and a counter incremented 100,000 times comes out at 67,000 —
+a number that looks like a plausible count and is simply wrong.
+
+So the monitor is real: `LDXR` arms it, `STXR` fails unless it is still armed for
+the same address, and a **context switch disarms it**, which is exactly what sends
+the loser back round its retry loop. `tests/thread_linux.c` is four threads racing
+on one counter through the compiler's atomics, and it is the only test in the
+suite that fails if any of that is missing.
+
+One trap in the same encoding: `LDAR`/`STLR` — the *ordered* accesses, bit 23 set —
+share this group with `LDXR`/`STXR` but have no monitor and no status register. A
+`STLR` routed through the exclusive path would start failing silently.

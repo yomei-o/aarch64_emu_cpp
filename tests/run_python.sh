@@ -39,5 +39,44 @@ check "python json" '{"a": 1, "b": [2, 3]}' \
 check "python str/re" "['a1', 'b22', 'c333']" \
       "$($EMU $PY -c 'import re;print(re.findall(r"[a-z]\d+", "a1 b22 c333"))' 2>/dev/null | norm)"
 
+# Threads. The interesting part is not that it prints a number, it is that the
+# number is exact: four threads and 8000 increments through a real pthread mutex,
+# which is clone, futex, per-thread TLS and the exclusive monitor all at once. A
+# lost update anywhere shows up here and nowhere else.
+check "python threading" "8000 4950 True" \
+      "$($EMU $PY -c '
+import threading, queue
+n=[0]; lock=threading.Lock()
+def w():
+    for _ in range(2000):
+        with lock: n[0]+=1
+ts=[threading.Thread(target=w) for _ in range(4)]
+[t.start() for t in ts]; [t.join() for t in ts]
+q=queue.Queue()
+def prod():
+    for i in range(100): q.put(i)
+    q.put(None)
+threading.Thread(target=prod).start()
+s=0
+while True:
+    v=q.get()
+    if v is None: break
+    s+=v
+ev=threading.Event()
+threading.Thread(target=ev.set).start()
+ev.wait()
+print(n[0], s, ev.is_set())' 2>/dev/null | norm)"
+
+# A thread pool, which is where the fixed-point FP conversions turn up: a float
+# timeout becomes a lock deadline through FCVTZU with a scale.
+check "python thread pool" "20 5feceb66 9400f1b2" \
+      "$($EMU $PY -c '
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+def work(i): return hashlib.sha256(str(i).encode()).hexdigest()[:8]
+with ThreadPoolExecutor(max_workers=4) as ex:
+    r=list(ex.map(work, range(20)))
+print(len(r), r[0], r[-1])' 2>/dev/null | norm)"
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

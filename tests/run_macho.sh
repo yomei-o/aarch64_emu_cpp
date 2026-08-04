@@ -20,6 +20,11 @@ MACHO="--target=arm64-apple-macos11 -ffreestanding -nostdlib -fno-stack-protecto
 pass=0; fail=0
 for src in *.c; do
     name=${src%.c}
+    # Sources named *_linux.c use an interface Darwin does not have (clone, futex).
+    # Skipping them out loud beats a build that quietly covers less than it looks like.
+    case "$name" in
+        *_linux) echo "skip $name (Linux-only interface)"; continue ;;
+    esac
     if ! $CLANG $MACHO -DA64_DARWIN -O2 -I. -o "$name.macho" "$src" 2>"$name.cerr"; then
         echo "SKIP $name (no arm64-apple-macos target: $(head -1 "$name.cerr"))"
         continue

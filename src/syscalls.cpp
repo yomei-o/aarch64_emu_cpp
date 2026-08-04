@@ -57,7 +57,10 @@ bool Syscalls::svc(uint32_t imm) {
         case 63: r = sys_read(static_cast<int>(a0), a1, a2); break;
         case 66: r = sys_writev(static_cast<int>(a0), a1, a2); break;
         case 65: r = sys_readv(static_cast<int>(a0), a1, a2); break;
-        case 93: case 94:                                      // exit, exit_group
+        // exit ends *this thread*; exit_group ends the process. They are the same
+        // thing right up until a second thread exists, and then they are not.
+        case 93: thread_exit(static_cast<int>(a0 & 0xFF)); return true;
+        case 94:
             cpu_.exit_code = static_cast<int>(a0 & 0xFF);
             cpu_.halted = true;
             return true;
@@ -77,8 +80,29 @@ bool Syscalls::svc(uint32_t imm) {
             break;
         }
         case 226: r = 0; break;                                // mprotect: no protection modelled
-        case 96: tid_address_ = a0; r = 1; break;              // set_tid_address -> our tid
-        case 99: case 98: r = 0; break;                        // set_robust_list, futex-ish no-ops
+        // ---- threads ----------------------------------------------------------
+        // aarch64's clone argument order is flags, stack, parent_tid, **tls**,
+        // child_tid -- tls and child_tid are the other way round from x86-64, and
+        // swapping them hands the new thread a thread pointer that is really a
+        // pointer to a tid. These three write x0 themselves and return early: after
+        // a context switch the shared tail below would write it into the wrong
+        // thread.
+        case 220:
+            cpu_.setx(0, static_cast<uint64_t>(sys_clone(a0, a1, a2, a3, a4)));
+            return true;
+        case 98: sys_futex(a0, static_cast<int>(a1), static_cast<uint32_t>(a2)); return true;
+        case 124: sys_sched_yield(); return true;              // sched_yield
+        case 96:                                               // set_tid_address
+            tid_address_ = a0;
+            if (!threads_.empty()) threads_[cur_thread_].clear_child_tid = a0;
+            r = static_cast<int64_t>(current_tid());
+            break;
+        case 99: r = 0; break;                                 // set_robust_list
+        // membarrier. Guest threads are interleaved on one interpreter, never
+        // concurrent, so every barrier is already satisfied and 0 is the truth
+        // rather than a stub. CMD_QUERY (cmd 0) reads the same 0 as "no expedited
+        // commands available", which is also true, and CPython falls back cleanly.
+        case 283: r = 0; break;
         case 261: r = kEINVAL; break;                          // prlimit64
         case 278: {                                            // getrandom
             for (uint64_t i = 0; i < a1; ++i)
@@ -144,7 +168,7 @@ bool Syscalls::svc(uint32_t imm) {
         case 139: return (void)sys_rt_sigreturn(), true;        // rt_sigreturn: no x0 write
         case 135: case 132: case 133: r = 0; break;            // procmask / altstack / suspend
         case 129: case 130: case 131: r = 0; break;            // kill / tkill / tgkill
-        case 178: r = 1000; break;                             // gettid
+        case 178: r = static_cast<int64_t>(current_tid()); break;   // gettid
         // The set*id family. busybox drops privileges before dispatching an applet,
         // so refusing these stops it before it does anything at all.
         case 144: case 146: case 147: case 149: case 151: case 152: r = 0; break;

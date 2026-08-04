@@ -408,14 +408,26 @@ void Cpu::exec_branch(uint32_t insn) {
 void Cpu::exec_loadstore(uint32_t insn) {
     const unsigned grp = (insn >> 27) & 0x7;
 
-    if (grp == 1 && !((insn >> 26) & 1)) {                            // exclusive
+    if (grp == 1 && !((insn >> 26) & 1)) {                            // exclusive / ordered
         const unsigned size = (insn >> 30) & 3, l = (insn >> 22) & 1;
+        // Two flags split this group four ways, and both are easy to miss:
+        //   o2 (bit 23) = 1  ->  LDAR/STLR: *ordered*, not exclusive. No monitor, no
+        //                        status register, and a store must never fail.
+        //   o1 (bit 21) = 1  ->  the pair forms, LDXP/STXP, which are a different
+        //                        instruction and not decoded here.
+        const unsigned o2 = (insn >> 23) & 1, o1 = (insn >> 21) & 1;
         const unsigned rs = (insn >> 16) & 0x1F, rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
         const uint64_t addr = xsp(rn);
-        // Single-threaded: an exclusive load is a load and an exclusive store always
-        // succeeds. That is a real simplification, and it is written down rather than
-        // hidden — a threaded guest would need a monitor here.
+        if (o1) fail("LDXP/STXP (exclusive pair) not implemented", insn);
+
+        // A real exclusive monitor, because a threaded guest depends on it. The
+        // interpreter runs one thread at a time, so the only thing that can break an
+        // LL/SC pair is the scheduler switching between them — and clearing the
+        // monitor on a context switch is what makes the store fail, which is what
+        // sends the guest back round its retry loop. Always succeeding instead would
+        // let two threads both win the same compare-and-swap.
         if (l) {
+            if (!o2) { excl_valid_ = true; excl_addr_ = addr; }
             switch (size) {
                 case 0: setx(rt, mem_.read<uint8_t>(addr)); break;
                 case 1: setx(rt, mem_.read<uint16_t>(addr)); break;
@@ -423,13 +435,20 @@ void Cpu::exec_loadstore(uint32_t insn) {
                 default: setx(rt, mem_.read<uint64_t>(addr)); break;
             }
         } else {
+            if (!o2) {
+                if (!excl_valid_ || excl_addr_ != addr) {
+                    setx(rs, 1);                                      // failed; guest retries
+                    return;
+                }
+                excl_valid_ = false;
+            }
             switch (size) {
                 case 0: mem_.write<uint8_t>(addr, static_cast<uint8_t>(xr(rt))); break;
                 case 1: mem_.write<uint16_t>(addr, static_cast<uint16_t>(xr(rt))); break;
                 case 2: mem_.write<uint32_t>(addr, static_cast<uint32_t>(xr(rt))); break;
                 default: mem_.write<uint64_t>(addr, xr(rt)); break;
             }
-            setx(rs, 0);                                              // status: always success
+            if (!o2) setx(rs, 0);
         }
         return;
     }

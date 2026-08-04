@@ -106,7 +106,53 @@ public:
         return r;
     }
 
-    void run() { while (!halted) step(); }
+    // Everything a thread owns. Wider than `Regs`, which only carries what a signal
+    // frame needs: a context switch has to preserve the vector registers and the
+    // thread pointer too, and a switch that drops them corrupts whichever thread
+    // happens to be holding a value there.
+    struct Context {
+        uint64_t x[31] = {0};
+        uint64_t sp = 0, pc = 0, tpidr_el0 = 0;
+        V128 vreg[32] = {};
+        uint32_t fpcr = 0, fpsr = 0, nzcv = 0;
+    };
+    Context save_context() const {
+        Context c;
+        for (int i = 0; i < 31; ++i) c.x[i] = x[i];
+        for (int i = 0; i < 32; ++i) c.vreg[i] = vreg[i];
+        c.sp = sp; c.pc = pc; c.tpidr_el0 = tpidr_el0;
+        c.fpcr = fpcr; c.fpsr = fpsr; c.nzcv = nzcv();
+        return c;
+    }
+    void load_context(const Context& c) {
+        for (int i = 0; i < 31; ++i) x[i] = c.x[i];
+        for (int i = 0; i < 32; ++i) vreg[i] = c.vreg[i];
+        sp = c.sp; pc = c.pc; tpidr_el0 = c.tpidr_el0;
+        fpcr = c.fpcr; fpsr = c.fpsr; set_nzcv(c.nzcv);
+        // The monitor is not part of the context — it belongs to the CPU, and a
+        // switch is precisely the event a real one loses it to. Keeping it across a
+        // switch would let a thread's STXR succeed against a LDXR another thread
+        // made, which is the one thing the instruction exists to prevent.
+        clear_exclusive();
+    }
+    void clear_exclusive() { excl_valid_ = false; }
+
+    // Preemption, for a multi-threaded guest. Zero — the default — costs one
+    // predictable branch per instruction and never fires; the scheduler turns it on
+    // only once a second thread exists. Without it a guest that spins on a lock
+    // instead of blocking on a futex would never give the CPU back.
+    uint64_t preempt_every = 0, preempt_left = 0;
+    std::function<void()> on_preempt;
+
+    void run() {
+        while (!halted) {
+            step();
+            if (preempt_left && --preempt_left == 0) {
+                preempt_left = preempt_every;
+                if (on_preempt) on_preempt();
+            }
+        }
+    }
     void step();
 
     Memory& mem() { return mem_; }
@@ -132,6 +178,10 @@ private:
     // time a handler runs, and PC-relative forms (ADR, B, literal loads) need the
     // original — keeping it here beats threading it through every handler.
     uint64_t cur_pc_ = 0;
+
+    // The local exclusive monitor, set by LDXR and consumed by STXR.
+    bool excl_valid_ = false;
+    uint64_t excl_addr_ = 0;
 
     // Instruction groups, in the order the ARM ARM lists them (bits 28..25).
     void exec_pc_rel(uint32_t insn);

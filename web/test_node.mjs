@@ -116,6 +116,21 @@ if (fs.existsSync(path.join(pyRoot, 'opt/python/bin/python3.13'))) {
                 ['-c', 'import sys,platform;print(sys.version.split()[0],platform.machine())']);
   if (r.rc !== 0) console.log('     (emulator said: ' + M.UTF8ToString(M._emu_error()) + ')');
   check('wasm: cpython', '3.13.14 aarch64\n', r.out);
+
+  // Threads inside WebAssembly, with no WebAssembly threads involved: the guest's
+  // four pthreads are interleaved by the emulator's own scheduler on one wasm
+  // instance, so this needs neither SharedArrayBuffer nor COOP/COEP headers.
+  const t = run('/opt/python/bin/python3.13', ['-c',
+    'import threading\n' +
+    'n=[0]; lock=threading.Lock()\n' +
+    'def w():\n' +
+    '    for _ in range(2000):\n' +
+    '        with lock: n[0]+=1\n' +
+    'ts=[threading.Thread(target=w) for _ in range(4)]\n' +
+    '[t.start() for t in ts]; [t.join() for t in ts]\n' +
+    'print(n[0])']);
+  if (t.rc !== 0) console.log('     (emulator said: ' + M.UTF8ToString(M._emu_error()) + ')');
+  check('wasm: cpython threading', '8000\n', t.out);
 } else {
   console.log('skip cpython (guests/sysroot not built)');
 }

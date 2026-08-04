@@ -14,11 +14,11 @@ Everything below is ordered by what that needs.
 Four suites, all differential — the oracle is always the host, never a recorded
 file:
 
-    sh tests/run_tests.sh      5 passed   freestanding C, built twice and diffed
-    sh tests/run_macho.sh      5 passed   the same sources as arm64 Mach-O
+    sh tests/run_tests.sh      7 passed   freestanding C, built twice and diffed
+    sh tests/run_macho.sh      6 passed   the same sources as arm64 Mach-O
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
-    sh tests/run_python.sh     5 passed   CPython 3.13, dynamically linked
-    node web/test_node.mjs     6 passed   the same guests under WebAssembly
+    sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
+    node web/test_node.mjs     7 passed   the same guests under WebAssembly
 
 What works:
 
@@ -41,6 +41,10 @@ What works:
   `LC_SEGMENT_64` / `LC_MAIN` / `LC_UNIXTHREAD` and skips `__PAGEZERO`;
   `darwin.cpp` is the BSD syscall table plus the cheap Mach traps, reached through
   `svc #0x80`. Both run under WebAssembly too.
+- **Threads.** `clone`, `futex`, a round-robin scheduler with preemption, and a
+  real exclusive monitor. CPython's `threading`, `queue`, `Event` and
+  `ThreadPoolExecutor` all work — including inside WebAssembly, on one wasm
+  instance, with no `SharedArrayBuffer` and no COOP/COEP.
 - **WebAssembly** (`web/`), running all of the above.
 
 ## ⏭ Next, in order
@@ -58,17 +62,14 @@ What works:
    Either way the next concrete step is a **static** Mach-O built against a real
    libc, which is `clang -static` on a Mac — worth getting one binary of that to
    test against before touching dyld at all.
-2. **Threads.** `clone` is unimplemented, so anything that starts one stops. CPython
-   only needs it once you `import threading`; the sibling x86 project has the shape to
-   copy (per-thread stacks, a scheduler that runs one at a time).
-3. **A trimmed Python for the browser demo.** The page can run CPython today, but the
+2. **A trimmed Python for the browser demo.** The page can run CPython today, but the
    guest tree is 45 MB into MEMFS. Dropping the stdlib to what a script actually
    imports would make a shippable Pages demo.
-4. **Speed.** ~48M instructions/sec interpreted. A decode cache keyed on the PC (the
+3. **Speed.** ~48M instructions/sec interpreted. A decode cache keyed on the PC (the
    instruction word is fixed-width, so a table of decoded handlers is cheap) is the
    obvious next step if it ever matters. Measure first — CPython startup is 66M
    instructions, which is already about a second.
-5. **`--strict` memory.** Unmapped reads return zero and unmapped writes allocate, so a
+4. **`--strict` memory.** Unmapped reads return zero and unmapped writes allocate, so a
    wild pointer is invisible. Faulting instead would have caught the mmap/interpreter
    address collision immediately rather than 90,000 instructions later.
 
@@ -94,8 +95,22 @@ What works:
   mode that faults instead is worth having before chasing a hard bug.
 - **`long` is 64-bit on the guest and 32-bit on a Windows host**, so tests use
   fixed-width types only — otherwise a diff means nothing.
-- Load/store exclusive is a plain load/store and always succeeds. Single-threaded,
-  so nothing observes the difference; a threaded guest would need a real monitor.
+- **The exclusive monitor is real now, and it had to be.** With `STXR` always
+  succeeding, four threads racing on one counter produced 67,000 of 100,000
+  increments — a plausible-looking number. `LDXR` arms, `STXR` fails unless still
+  armed for the same address, and `load_context` disarms. Watch bit 23: `LDAR`/`STLR`
+  live in the same encoding group, are *not* exclusive, and must never fail.
+- **A bug in the test harness is invisible to differential testing.** `dec()` wrote
+  its newline over the last digit, so `100000` printed as `10000` — and because the
+  host build ran the same formatter, the diff agreed and said nothing. Found only by
+  reading the output during an unrelated experiment. Shared helpers deserve reading,
+  not just diffing.
+- **Preemption is what makes a lock test mean anything.** Switching only at syscalls
+  would let each thread run its whole loop uninterrupted, and the counter would come
+  out right no matter how broken the monitor was. `kPreemptEvery` in threads.cpp;
+  temporarily dropping it to ~100 is a good stress test.
+- **aarch64's `clone` argument order is flags, stack, parent_tid, tls, child_tid** —
+  tls and child_tid are swapped relative to x86-64.
 - **Darwin reports errors in the carry flag**, not as a negative return. Forgetting
   it is not a failed syscall, it is a *wrong answer*: `open` of a missing file comes
   back as 2, which is a valid file descriptor. `tests/file.c` exists to catch this,

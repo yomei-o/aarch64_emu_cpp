@@ -53,19 +53,13 @@ What works:
 ## ⏭ Next, in order
 
 1. **A real macOS binary — 35,424 instructions in, inside the ObjC runtime.** This is
-   the live front. Two guest trees matter:
+   the live front, and the guest tree for it is committed:
 
-       sh prebuilt/unpack.sh                      # 40 files, 10 MB -> 24,077 insns
+       sh prebuilt/unpack.sh                # 48 files, 85 MB unpacked, 21 MB packed
        ./aarch64emu --root guests/macos guests/macos/hello
 
-   and a larger one that has to be made on a Mac, because libobjc turned out not to be
-   optional (see below) — 45 libraries, 85 MB, which gets to 35,424:
-
-       ./dsc_extract --only /usr/lib/ -o out "$CACHE" \
-           /usr/lib/libSystem.B.dylib /usr/lib/libobjc.A.dylib
-
-   With the larger set the guest gets through malloc, stdio, and libobjc's own startup,
-   and stops with libobjc's own diagnostic:
+   The guest gets through malloc, stdio and libobjc's own startup, and stops with
+   libobjc's own diagnostic:
 
        objc[1000]: Attempt to use unknown class 0x1ee40b2e0.
 

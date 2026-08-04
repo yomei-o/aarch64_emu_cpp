@@ -47,7 +47,7 @@ No dependencies beyond a C++17 standard library.
 | **Pointer authentication** (arm64e): the PAC family, RETAA/BRAA/BLRAA | ✅ identity |
 | **Threads** — `clone`, `futex`, a scheduler, a real exclusive monitor | ✅ |
 | **WebAssembly** — the same guests, in a browser tab | ✅ |
-| A real macOS binary against libSystem (needs the dyld shared cache) | ❌ planned |
+| A real macOS binary against libSystem | ⏳ 35,424 instructions in, at the ObjC runtime |
 
 ## Correctness is a diff, not an opinion
 
@@ -145,6 +145,23 @@ isolation, and no COOP/COEP headers — which static hosting like GitHub Pages
 cannot set anyway. The guest's threads are
 interleaved by the emulator's own scheduler, and from inside the guest that is
 indistinguishable from a single-core machine.
+
+## A real macOS binary
+
+`prebuilt/` carries the 48 libraries an arm64 macOS executable actually needs — 21 MB
+packed, out of a 4.9 GB dyld shared cache, extracted by `tools/dsc_extract.c` on a Mac:
+
+```console
+$ sh prebuilt/unpack.sh
+$ ./aarch64emu --root guests/macos guests/macos/hello
+objc[1000]: Attempt to use unknown class 0x1ee40b2e0.
+```
+
+Not finished, and the message is the guest's own: 35,424 instructions of Apple's code
+run — the libraries link, dyld's job is done by `src/macho_dyld.cpp`, initializers run in
+dyld's order, malloc and stdio come up over Mach IPC and the commpage — and then libobjc
+wants the shared cache's pre-built class tables, which real dyld hands it and nothing here
+does yet. `resume.md` has the details.
 
 ## Building
 

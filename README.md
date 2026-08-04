@@ -1,8 +1,9 @@
 # aarch64_emu_cpp
 
-A user-mode AArch64 emulator in C++17. It loads an ARM64 Linux ELF, interprets the
-machine code instruction by instruction, and services the guest's syscalls on the
-host — so an ARM binary runs on x86 Windows, on x86 Linux, and in a browser tab.
+A user-mode AArch64 emulator in C++17. It loads an ARM64 binary — a Linux ELF or a
+macOS Mach-O — interprets the machine code instruction by instruction, and services
+the guest's syscalls on the host, so an ARM program runs on x86 Windows, on x86
+Linux, and in a browser tab.
 
 ```console
 $ ./aarch64emu tests/hello.elf
@@ -41,10 +42,11 @@ No dependencies beyond a C++17 standard library.
 | **Dynamic linking** — the real `ld-musl-aarch64.so.1` loads and relocates | ✅ |
 | Signal delivery (SIGILL frames, `rt_sigreturn`) | ✅ |
 | **A stock CPython 3.13 for ARM64 Linux** | ✅ |
-| **Mach-O loading and Darwin syscalls** (Apple Silicon guests) | ✅ static binaries |
+| **Mach-O loading and Darwin syscalls** (Apple Silicon guests) | ✅ |
+| **Dynamic linking on Darwin** — chained fixups and export tries, done by the emulator | ✅ |
 | **Threads** — `clone`, `futex`, a scheduler, a real exclusive monitor | ✅ |
 | **WebAssembly** — the same guests, in a browser tab | ✅ |
-| Dynamically linked Mach-O (needs Apple's `dyld`) | ❌ planned |
+| A real macOS binary against libSystem (needs the dyld shared cache) | ❌ planned |
 
 ## Correctness is a diff, not an opinion
 
@@ -77,7 +79,8 @@ ok   macho file
 ok   macho fp_fixed
 ok   macho hello
 ok   macho mem
-6 passed, 0 failed
+ok   macho dylib (bind + rebase)
+7 passed, 0 failed
 ```
 
 And a second suite runs a **real** guest — Alpine's static aarch64-musl busybox, a
@@ -119,12 +122,13 @@ $ sh web/build.sh          # needs emscripten
 $ node web/test_node.mjs
 ok   wasm: hello.elf
 ok   wasm: hello.macho (Darwin)
+ok   wasm: mach-o dylib (bind + rebase)
 ok   wasm: busybox echo
 ok   wasm: busybox uname
 ok   wasm: busybox sha256sum
 ok   wasm: cpython
 ok   wasm: cpython threading
-7 passed, 0 failed
+8 passed, 0 failed
 ```
 
 Those last two are CPython 3.13 for ARM64 Linux, dynamically linked, running inside
@@ -168,7 +172,8 @@ sh tests/run_tests.sh
   new program: argv, envp, and the auxiliary vector a libc reads before `main`.
 - `src/syscalls.cpp` — the kernel interface, AArch64's "generic" numbering (write
   is 64, not 1).
-- `src/macho_loader.cpp`, `src/darwin.cpp` — the second personality. Not a fork of
+- `src/macho_loader.cpp`, `src/macho_dyld.cpp`, `src/darwin.cpp` — the second
+  personality, including the loader that stands in for Apple's dyld. Not a fork of
   the first: the same CPU, the same memory, the same file layer, reached through
   `svc #0x80` instead of `svc #0`.
 - `src/threads.cpp` — `clone`, `futex`, and a scheduler. One emulated CPU running
@@ -196,6 +201,30 @@ Darwin then differs in three ways that all matter:
 The loader instead asks whether there is anything for dyld to *do* — any dylib,
 any bind opcode, any chained fixup — and runs the entry point directly when there
 is not, which is where dyld would arrive anyway.
+
+## Being dyld
+
+On the Linux side the guest's own `ld.so` runs and this emulator stays out of it —
+which is both less work and more faithful. Darwin gets the opposite treatment, for
+one reason: `/usr/lib/dyld` is not a file you can obtain without a Mac. So
+`src/macho_dyld.cpp` does dyld's job.
+
+For a binary built with chained fixups — the modern default — that job is narrower
+than dyld's reputation suggests:
+
+1. map the dependencies named by `LC_LOAD_DYLIB`, recursively and deduplicated;
+2. walk `LC_DYLD_CHAINED_FIXUPS`: a linked list of pointer slots threaded through
+   each page, where every slot is either a **rebase** (add the slide) or a **bind**
+   (write an imported symbol's address);
+3. resolve those symbols through the exporting image's **export trie**.
+
+Lazy binding, the old `LC_DYLD_INFO` opcode programs, and two-level namespace hints
+are all absent from that list, because a chained-fixups binary does not use them.
+An image that *does* use them is **refused**, not loaded — a rebase that never
+happened leaves a pointer that is merely somewhere else, and the guest gets a
+plausible answer instead of a crash. `tests/dylib/` builds a real `.dylib` and a
+program that imports a function, a variable, and a pointer needing a rebase, and
+diffs all three against the host.
 
 ## Two things about A64 that bite
 

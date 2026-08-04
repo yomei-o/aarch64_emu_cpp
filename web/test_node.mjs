@@ -73,6 +73,21 @@ if (fs.existsSync(macho)) {
   console.log('skip mach-o (run tests/run_macho.sh first)');
 }
 
+// ---- a dynamically linked Mach-O, where the emulator plays dyld: it loads the
+// dylib out of MEMFS, walks the chained fixups and binds the symbols itself.
+const dylMain = path.join(root, 'tests/dylib/main.macho');
+const dylLib = path.join(root, 'tests/dylib/libfoo.dylib');
+if (fs.existsSync(dylMain) && fs.existsSync(dylLib)) {
+  put('/main.macho', dylMain);
+  put('/libfoo.dylib', dylLib);
+  const want = fs.readFileSync(path.join(root, 'tests/dylib/expected'), 'utf8').replace(/\r/g, '');
+  const got = run('/main.macho', []);
+  if (got.rc !== 0) console.log('     (emulator said: ' + M.UTF8ToString(M._emu_error()) + ')');
+  check('wasm: mach-o dylib (bind + rebase)', want, got.out);
+} else {
+  console.log('skip mach-o dylib (run tests/run_macho.sh first)');
+}
+
 // ---- busybox, if it has been fetched
 const bb = path.join(root, 'guests/busybox');
 if (fs.existsSync(bb)) {

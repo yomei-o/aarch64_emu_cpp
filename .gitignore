@@ -12,3 +12,11 @@ tests/*.err
 guests/
 tests/*.macho
 tests/*.cerr
+tests/dylib/*.dylib
+tests/dylib/*.macho
+tests/dylib/*.native
+tests/dylib/expected
+tests/dylib/actual
+tests/dylib/err
+tests/dylib/cerr
+mo/

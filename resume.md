@@ -15,10 +15,10 @@ Four suites, all differential — the oracle is always the host, never a recorde
 file:
 
     sh tests/run_tests.sh      7 passed   freestanding C, built twice and diffed
-    sh tests/run_macho.sh      6 passed   the same sources as arm64 Mach-O
+    sh tests/run_macho.sh      7 passed   the same sources as arm64 Mach-O, plus a dylib
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
-    node web/test_node.mjs     7 passed   the same guests under WebAssembly
+    node web/test_node.mjs     8 passed   the same guests under WebAssembly
 
 What works:
 
@@ -37,10 +37,13 @@ What works:
   instruction or system register, and `rt_sigreturn`.
 - A file layer with directory descriptors and `getdents64`, and the syscalls
   busybox and CPython need.
-- **Mach-O and Darwin, for static binaries.** `macho_loader.cpp` handles
-  `LC_SEGMENT_64` / `LC_MAIN` / `LC_UNIXTHREAD` and skips `__PAGEZERO`;
-  `darwin.cpp` is the BSD syscall table plus the cheap Mach traps, reached through
-  `svc #0x80`. Both run under WebAssembly too.
+- **Mach-O and Darwin.** `macho_loader.cpp` handles `LC_SEGMENT_64` / `LC_MAIN` /
+  `LC_UNIXTHREAD` and skips `__PAGEZERO`; `darwin.cpp` is the BSD syscall table
+  plus the cheap Mach traps, reached through `svc #0x80`.
+- **Dynamic linking on Darwin, with the emulator playing dyld** (`macho_dyld.cpp`):
+  dependency loading, `LC_DYLD_CHAINED_FIXUPS` (rebases and binds), and export-trie
+  symbol resolution. Apple's dyld cannot be shipped, so unlike the Linux side there
+  is no real loader to run. Both run under WebAssembly too.
 - **Threads.** `clone`, `futex`, a round-robin scheduler with preemption, and a
   real exclusive monitor. CPython's `threading`, `queue`, `Event` and
   `ThreadPoolExecutor` all work — including inside WebAssembly, on one wasm
@@ -49,27 +52,38 @@ What works:
 
 ## ⏭ Next, in order
 
-1. **Dynamically linked Mach-O.** The hard half of the Darwin milestone is still
-   open, and it is hard for a reason that is not technical: a real macOS binary
-   links against `/usr/lib/dyld` and the dylibs in the shared cache, and neither is
-   a file you can obtain without a Mac. Two ways forward, and the second is
-   probably right:
-   - map the real dyld and the real dyld shared cache from a Mac (needs
-     `LC_DYLD_CHAINED_FIXUPS`, `shared_region_check_np`, and a lot of Mach);
-   - or *be* the loader for chained fixups only, and stub the handful of libSystem
-     entry points a plain program actually calls. Much less faithful, but it does
-     not need a Mac in the loop.
-   Either way the next concrete step is a **static** Mach-O built against a real
-   libc, which is `clang -static` on a Mac — worth getting one binary of that to
-   test against before touching dyld at all.
-2. **A trimmed Python for the browser demo.** The page can run CPython today, but the
+1. **A real macOS binary.** The linking machinery is done and tested against
+   locally built dylibs; what is missing is **libSystem**, and that is not a
+   technical problem. On macOS 11+ `/usr/lib/libSystem.B.dylib` and everything under
+   it do not exist as files — they live only inside the **dyld shared cache**, which
+   is several GB and only obtainable from a Mac.
+
+   Steps, in order:
+   - get the cache (`/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/
+     dyld_shared_cache_arm64e*`) and a real dynamically linked hello built by the
+     Mac's own clang;
+   - parse the cache header and map the dylibs out of it (they are pre-linked at
+     fixed addresses in one big mapping — mapping the cache wholesale is easier
+     than extracting individual libraries);
+   - fill in the Darwin syscalls and Mach traps a real libSystem startup makes.
+     Expect `shared_region_check_np`, `csops`, `proc_info`, `getrlimit`, `sysctl`
+     with real answers, and the commpage at `0xFFFFFC000`.
+
+   A macOS CPython is downloadable without a Mac (python-build-standalone publishes
+   `aarch64-apple-darwin`), so the cache is the only Mac-only dependency.
+2. **arm64e chained pointers.** Only `DYLD_CHAINED_PTR_64` and `_64_OFFSET` are
+   implemented. System binaries are arm64e and use authenticated pointers
+   (`DYLD_CHAINED_PTR_ARM64E`), where the slot carries a signing key and a
+   discriminator. The emulator can ignore the signature — it has no PAC — but must
+   read the different bit layout. Currently refused loudly.
+3. **A trimmed Python for the browser demo.** The page can run CPython today, but the
    guest tree is 45 MB into MEMFS. Dropping the stdlib to what a script actually
    imports would make a shippable Pages demo.
-3. **Speed.** ~48M instructions/sec interpreted. A decode cache keyed on the PC (the
+4. **Speed.** ~48M instructions/sec interpreted. A decode cache keyed on the PC (the
    instruction word is fixed-width, so a table of decoded handlers is cheap) is the
    obvious next step if it ever matters. Measure first — CPython startup is 66M
    instructions, which is already about a second.
-4. **`--strict` memory.** Unmapped reads return zero and unmapped writes allocate, so a
+5. **`--strict` memory.** Unmapped reads return zero and unmapped writes allocate, so a
    wild pointer is invisible. Faulting instead would have caught the mmap/interpreter
    address collision immediately rather than 90,000 instructions later.
 
@@ -128,3 +142,16 @@ What works:
   not 0x40. Passing them through unchanged silently asks for something else.
 - The Mach-O test build needs `-fno-stack-protector` — the Darwin target turns it
   on by default and there is no libc here to supply `__stack_chk_guard`.
+- **`segment_offset` in `dyld_chained_starts_in_segment` is measured from the
+  mach_header, not from the slide.** For a dylib preferring address 0 the two are
+  identical, so the bug only appears in an executable — where it puts the entire
+  chain walk 4 GiB low, in unmapped memory, and every fixup silently does nothing.
+- **An image with no chained fixups is not necessarily an image with no fixups.**
+  A dylib linked without `-fixup_chains` expresses the same work as `LC_DYLD_INFO`
+  opcode programs, which are not implemented. Skipping them looked like a clean
+  load and produced a rebased pointer that had never been rebased — pointing at a
+  zero byte, so the test printed an empty string instead of crashing. It is refused
+  loudly now.
+- MSYS rewrites a command-line argument that starts with `/` into a Windows path
+  before clang sees it, so `-install_name,/libfoo.dylib` becomes
+  `C:/Program Files/Git/libfoo.dylib`. The tests use `@executable_path/…`.

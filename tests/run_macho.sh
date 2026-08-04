@@ -40,5 +40,35 @@ for src in *.c; do
         echo "FAIL macho $name"; diff "$name.expected" "$name.actual" | head -10; fail=$((fail+1))
     fi
 done
+
+# ---- dynamic linking, where the emulator has to be dyld ----------------------
+#
+# A real .dylib and a program that imports from it, both arm64 Mach-O, both built
+# here. -fixup_chains is what modern Apple toolchains default to and what the
+# emulator implements; without it the linker emits lazy binding stubs that expect
+# dyld_stub_binder, which is a libSystem symbol and so unavailable off a Mac.
+#
+# The install name is @executable_path/... rather than an absolute path because
+# this script runs under MSYS on Windows, where a leading slash in a command-line
+# argument gets rewritten into a Windows path before clang ever sees it.
+if $CLANG $MACHO -dynamiclib -Wl,-install_name,@executable_path/libfoo.dylib \
+        -Wl,-fixup_chains -O2 -Idylib -o dylib/libfoo.dylib dylib/lib.c 2>dylib/cerr &&
+   $CLANG $MACHO -Wl,-e,_start -Wl,-fixup_chains -DA64_DARWIN \
+        -O2 -I. -Idylib -o dylib/main.macho dylib/main.c dylib/libfoo.dylib 2>>dylib/cerr; then
+    $HOSTCC -DA64_NATIVE -O2 -I. -Idylib -o dylib/main.native dylib/main.c dylib/lib.c
+    ./dylib/main.native > dylib/expected
+    if $EMU --root dylib dylib/main.macho > dylib/actual 2>dylib/err; then
+        if cmp -s dylib/expected dylib/actual; then
+            echo "ok   macho dylib (bind + rebase)"; pass=$((pass+1))
+        else
+            echo "FAIL macho dylib"; diff dylib/expected dylib/actual | head -10; fail=$((fail+1))
+        fi
+    else
+        echo "FAIL macho dylib (emulator stopped)"; sed 's/^/     /' dylib/err; fail=$((fail+1))
+    fi
+else
+    echo "SKIP macho dylib ($(head -1 dylib/cerr))"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

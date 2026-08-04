@@ -82,14 +82,27 @@ EMSCRIPTEN_KEEPALIVE int emu_run(const char* path, const char* argz, const char*
     // different loader and a different initial stack; the CPU underneath is the same.
     const bool darwin = is_macho(file);
 
+    std::vector<std::string> argv;
+    for (const char* p = argz; p && *p; p += std::strlen(p) + 1) argv.emplace_back(p);
+    if (argv.empty()) argv.emplace_back(path);
+
     LoadedImage img;
     std::string err;
     if (darwin) {
-        if (!load_macho(file, mem, 0, &img, &err)) { g_error = err; return -1; }
-        if (!img.interp.empty()) {
-            g_error = "dynamically linked Mach-O needs Apple's dyld, which is not supplied";
-            return -1;
-        }
+        // Apple's dyld cannot be shipped, so the emulator does its job: load the
+        // dependencies named by LC_LOAD_DYLIB out of MEMFS, walk the chained
+        // fixups, bind the symbols.
+        constexpr uint64_t kDylibBase = 0x0000'0002'0000'0000ull;
+        MachoImage probe;
+        if (!macho_parse(file, &probe, &err)) { g_error = err; return -1; }
+        auto read_guest = [&](const std::string& gp) {
+            return read_file(root && *root && !gp.empty() && gp[0] == '/' ? std::string(root) + gp
+                                                                          : gp);
+        };
+        const bool ok = probe.needs_dyld
+            ? macho_link(file, argv[0], mem, kDylibBase, read_guest, &img, &err)
+            : load_macho(file, mem, 0, &img, &err);
+        if (!ok) { g_error = err; return -1; }
     } else if (!load_elf(file, mem, kPieBase, &img, &err)) { g_error = err; return -1; }
 
     uint64_t interp_base = 0, start_pc = 0;
@@ -104,9 +117,6 @@ EMSCRIPTEN_KEEPALIVE int emu_run(const char* path, const char* argz, const char*
         start_pc = interp.entry;
     }
 
-    std::vector<std::string> argv;
-    for (const char* p = argz; p && *p; p += std::strlen(p) + 1) argv.emplace_back(p);
-    if (argv.empty()) argv.emplace_back(path);
     const std::vector<std::string> env = {
         "PATH=/usr/bin:/bin", "HOME=/", "LANG=C.UTF-8", "TERM=dumb",
         "PYTHONDONTWRITEBYTECODE=1",

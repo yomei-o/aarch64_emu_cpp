@@ -82,13 +82,48 @@ int main(int argc, char** argv) {
     // and `svc #0x80` instead of `svc #0` at run time.
     const bool darwin = is_macho(file);
 
+    // argv[0] has to be the path *the guest* would see, not the host path we opened.
+    // Python finds its standard library by walking up from argv[0]; hand it a host
+    // path and it looks for the library in a directory that does not exist inside
+    // the guest, then dies with "Failed to import encodings module". A Mach-O needs
+    // it even earlier, to resolve @executable_path in an install name.
+    auto to_guest_path = [&root](std::string p) {
+        auto fwd = [](std::string t) {
+            for (char& c : t) if (c == '\\') c = '/';
+            return t;
+        };
+        std::string r = fwd(root);
+        p = fwd(p);
+        while (!r.empty() && r.back() == '/') r.pop_back();
+        if (!r.empty() && r != "." && p.size() > r.size() && p.compare(0, r.size(), r) == 0)
+            return p.substr(r.size());
+        if (!p.empty() && p[0] != '/') return "/" + p;
+        return p;
+    };
+    const std::string guest_exe = to_guest_path(argv[i]);
+
     LoadedImage img;
     std::string err;
     if (darwin) {
-        if (!load_macho(file, mem, 0, &img, &err)) {
+        // Apple's dyld cannot be supplied from outside a Mac, so when a Mach-O has
+        // imports the emulator does dyld's job itself: load the dependencies, walk
+        // the chained fixups, bind the symbols. `dylib_base` is just somewhere the
+        // libraries can go that is clear of the program, the arena and the stack.
+        constexpr uint64_t kDylibBase = 0x0000'0002'0000'0000ull;
+        MachoImage probe;
+        if (!macho_parse(file, &probe, &err)) {
             std::fprintf(stderr, "aarch64emu: %s\n", err.c_str());
             return 1;
         }
+        auto read_guest = [&](const std::string& gp) {
+            std::string hp = gp;
+            if (!root.empty() && root != "." && !hp.empty() && hp[0] == '/') hp = root + hp;
+            return read_file(hp.c_str());
+        };
+        const bool ok = probe.needs_dyld
+            ? macho_link(file, guest_exe, mem, kDylibBase, read_guest, &img, &err)
+            : load_macho(file, mem, 0, &img, &err);
+        if (!ok) { std::fprintf(stderr, "aarch64emu: %s\n", err.c_str()); return 1; }
     } else if (!load_elf(file, mem, kPieBase, &img, &err)) {
         std::fprintf(stderr, "aarch64emu: %s\n", err.c_str());
         return 1;
@@ -102,17 +137,6 @@ int main(int argc, char** argv) {
     // model wrong in some new way; running the real one is both less work and more
     // faithful.
     uint64_t start_pc = 0, interp_base = 0;
-    if (darwin && !img.interp.empty()) {
-        // A Mach-O naming /usr/lib/dyld wants Apple's loader, and dyld is not a
-        // file you can supply from outside a Mac. Say so plainly rather than
-        // starting and failing somewhere unrecognisable.
-        std::fprintf(stderr,
-                     "aarch64emu: %s is dynamically linked against %s.\n"
-                     "            Only statically linked Mach-O is supported so far;\n"
-                     "            build with -static or -nostdlib.\n",
-                     argv[i], img.interp.c_str());
-        return 1;
-    }
     if (!darwin && !img.interp.empty()) {
         std::string ipath = img.interp;
         if (!root.empty() && root != "." && !ipath.empty() && ipath[0] == '/') ipath = root + ipath;
@@ -137,23 +161,6 @@ int main(int argc, char** argv) {
         "PATH=/usr/bin:/bin", "HOME=/", "LANG=C.UTF-8", "TERM=dumb",
         "PYTHONDONTWRITEBYTECODE=1",
     };
-    // argv[0] has to be the path *the guest* would see, not the host path we opened.
-    // Python finds its standard library by walking up from argv[0]; hand it a host
-    // path and it looks for the library in a directory that does not exist inside
-    // the guest, then dies with "Failed to import encodings module".
-    std::string guest_exe = argv[i];
-    {
-        auto fwd = [](std::string t) {
-            for (char& c : t) if (c == '\\') c = '/';
-            return t;
-        };
-        std::string p = fwd(guest_exe), r = fwd(root);
-        while (!r.empty() && r.back() == '/') r.pop_back();
-        if (!r.empty() && r != "." && p.size() > r.size() && p.compare(0, r.size(), r) == 0)
-            guest_exe = p.substr(r.size());
-        else if (!p.empty() && p[0] != '/') guest_exe = "/" + p;
-        else guest_exe = p;
-    }
     guest_argv.push_back(guest_exe);
     for (int k = i + 1; k < argc; ++k) guest_argv.push_back(argv[k]);
 

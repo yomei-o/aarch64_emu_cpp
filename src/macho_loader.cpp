@@ -1,4 +1,4 @@
-// Mach-O arm64 loader — Apple Silicon guests.
+// Mach-O arm64 loading — parsing the load commands and placing the segments.
 //
 // Structurally simpler than ELF: a header, then a list of load commands, of which
 // only LC_SEGMENT_64 actually places bytes. The differences that matter:
@@ -13,6 +13,9 @@
 //  - **The `apple[]` array.** Darwin's stack has a fourth NULL-terminated vector
 //    after envp carrying `executable_path=…` and friends. dyld reads it before
 //    anything else, so it is not optional for a real binary.
+//
+// Everything about *linking* — dependencies, chained fixups, symbol binding — is
+// in macho_dyld.cpp; this file only reads and places.
 #include "loader.h"
 #include <cstring>
 
@@ -23,9 +26,11 @@ namespace {
 constexpr uint32_t kMagic64 = 0xFEEDFACFu;
 constexpr int32_t  kCpuArm64 = 0x0100000Cu;
 constexpr uint32_t LC_SEGMENT_64 = 0x19, LC_LOAD_DYLINKER = 0x0E, LC_LOAD_DYLIB = 0x0C,
+                   LC_ID_DYLIB = 0x0D, LC_SYMTAB = 0x02,
                    LC_MAIN = 0x80000028u, LC_UNIXTHREAD = 0x05,
                    LC_DYLD_INFO_ONLY = 0x80000022u, LC_DYLD_CHAINED_FIXUPS = 0x80000034u,
-                   LC_LOAD_WEAK_DYLIB = 0x80000018u;
+                   LC_DYLD_EXPORTS_TRIE = 0x80000033u, LC_LOAD_WEAK_DYLIB = 0x80000018u,
+                   LC_RPATH = 0x8000001Cu;
 
 struct MachHeader64 {
     uint32_t magic; int32_t cputype, cpusubtype;
@@ -39,6 +44,15 @@ struct SegmentCommand64 {
     uint32_t nsects, flags;
 };
 
+// An lc_str is a 32-bit offset from the start of the load command.
+std::string lc_string(const uint8_t* f, size_t o, uint32_t cmdsize, size_t at) {
+    uint32_t off = 0;
+    std::memcpy(&off, f + o + at, 4);
+    if (off >= cmdsize) return {};
+    const char* p = reinterpret_cast<const char*>(f) + o + off;
+    return std::string(p, strnlen(p, cmdsize - off));
+}
+
 }  // namespace
 
 bool is_macho(const std::vector<uint8_t>& f) {
@@ -48,28 +62,16 @@ bool is_macho(const std::vector<uint8_t>& f) {
     return magic == kMagic64;
 }
 
-bool load_macho(const std::vector<uint8_t>& f, Memory& mem, uint64_t slide,
-                LoadedImage* out, std::string* err) {
+bool macho_parse(const std::vector<uint8_t>& f, MachoImage* out, std::string* err) {
     if (!is_macho(f)) { *err = "not a 64-bit Mach-O"; return false; }
     MachHeader64 mh{};
     std::memcpy(&mh, f.data(), sizeof mh);
     if (mh.cputype != kCpuArm64) { *err = "not an arm64 Mach-O"; return false; }
-    if (mh.filetype != 2 && mh.filetype != 8) {   // MH_EXECUTE, MH_DYLINKER
-        *err = "not an executable Mach-O"; return false;
+    // MH_EXECUTE, MH_DYLIB, MH_DYLINKER, MH_BUNDLE.
+    if (mh.filetype != 2 && mh.filetype != 6 && mh.filetype != 7 && mh.filetype != 8) {
+        *err = "not an executable or library Mach-O"; return false;
     }
-
-    out->interp.clear();
-    out->base = slide;
-    uint64_t text_vmaddr = 0, brk = 0, entry_off = 0, entry_abs = 0;
-    bool have_main = false;
-
-    // LC_LOAD_DYLINKER is present on *every* MH_EXECUTE, including one linked with
-    // -nostdlib that imports nothing at all — the linker emits it unconditionally.
-    // So its presence is not the question; whether the image has anything for dyld
-    // to do is. A binary with no dylibs and no bind opcodes needs no loader, and
-    // running it directly is exactly what dyld would arrive at after doing nothing.
-    std::string dylinker;
-    bool needs_dyld = false;
+    out->file = f;
 
     size_t o = sizeof mh;
     for (uint32_t i = 0; i < mh.ncmds; ++i) {
@@ -79,56 +81,105 @@ bool load_macho(const std::vector<uint8_t>& f, Memory& mem, uint64_t slide,
         std::memcpy(&cmdsize, f.data() + o + 4, 4);
         if (!cmdsize || o + cmdsize > f.size()) { *err = "bad load command size"; return false; }
 
-        if (cmd == LC_SEGMENT_64) {
-            SegmentCommand64 sc{};
-            std::memcpy(&sc, f.data() + o, sizeof sc);
-            const std::string name(sc.segname, strnlen(sc.segname, 16));
-            // __PAGEZERO is a 4 GiB guard hole, not memory. Everything else lands.
-            if (name != "__PAGEZERO" && sc.vmsize) {
-                const uint64_t va = slide + sc.vmaddr;
-                if (sc.filesize) {
-                    if (sc.fileoff + sc.filesize > f.size()) {
-                        *err = "segment extends past the file"; return false;
-                    }
-                    mem.write_bytes(va, f.data() + sc.fileoff, sc.filesize);
+        switch (cmd) {
+            case LC_SEGMENT_64: {
+                SegmentCommand64 sc{};
+                std::memcpy(&sc, f.data() + o, sizeof sc);
+                const std::string name(sc.segname, strnlen(sc.segname, 16));
+                if (sc.fileoff + sc.filesize > f.size()) {
+                    *err = "segment extends past the file"; return false;
                 }
-                if (sc.vmsize > sc.filesize) mem.set(va + sc.filesize, 0, sc.vmsize - sc.filesize);
-                if (va + sc.vmsize > brk) brk = va + sc.vmsize;
+                if (name != "__PAGEZERO" && sc.vmsize) {
+                    out->segs.push_back({name, sc.vmaddr, sc.vmsize, sc.fileoff, sc.filesize});
+                    if (sc.vmaddr + sc.vmsize > out->vm_end) out->vm_end = sc.vmaddr + sc.vmsize;
+                }
+                // __TEXT starts at the mach_header, so its vmaddr is the image base.
+                if (name == "__TEXT") out->text_vmaddr = sc.vmaddr;
+                break;
             }
-            if (name == "__TEXT") text_vmaddr = sc.vmaddr;
-        } else if (cmd == LC_MAIN) {
-            std::memcpy(&entry_off, f.data() + o + 8, 8);
-            have_main = true;
-        } else if (cmd == LC_UNIXTHREAD) {
-            // arm_thread_state64: 29 x-registers, fp, lr, sp, pc. The pc sits at
-            // offset 16 (cmd, cmdsize, flavor, count) + 32 * 8.
-            if (cmdsize >= 16 + 33 * 8) std::memcpy(&entry_abs, f.data() + o + 16 + 32 * 8, 8);
-        } else if (cmd == LC_LOAD_DYLINKER) {
-            uint32_t name_off = 0;
-            std::memcpy(&name_off, f.data() + o + 8, 4);
-            if (name_off < cmdsize) {
-                const char* p = reinterpret_cast<const char*>(f.data()) + o + name_off;
-                dylinker.assign(p, strnlen(p, cmdsize - name_off));
+            case LC_MAIN:
+                std::memcpy(&out->entry_off, f.data() + o + 8, 8);
+                out->has_main = true;
+                break;
+            case LC_UNIXTHREAD:
+                // arm_thread_state64: 29 x-registers, fp, lr, sp, pc. The pc sits at
+                // offset 16 (cmd, cmdsize, flavor, count) + 32 * 8.
+                if (cmdsize >= 16 + 33 * 8)
+                    std::memcpy(&out->unixthread_pc, f.data() + o + 16 + 32 * 8, 8);
+                break;
+            case LC_LOAD_DYLINKER:
+                out->dylinker = lc_string(f.data(), o, cmdsize, 8);
+                break;
+            case LC_ID_DYLIB:
+                out->install_name = lc_string(f.data(), o, cmdsize, 8);
+                break;
+            case LC_LOAD_DYLIB:
+            case LC_LOAD_WEAK_DYLIB:
+                out->dylibs.push_back(lc_string(f.data(), o, cmdsize, 8));
+                out->needs_dyld = true;
+                break;
+            case LC_RPATH:
+                out->rpaths.push_back(lc_string(f.data(), o, cmdsize, 8));
+                break;
+            case LC_SYMTAB:
+                std::memcpy(&out->symoff, f.data() + o + 8, 4);
+                std::memcpy(&out->nsyms, f.data() + o + 12, 4);
+                std::memcpy(&out->stroff, f.data() + o + 16, 4);
+                std::memcpy(&out->strsize, f.data() + o + 20, 4);
+                break;
+            case LC_DYLD_CHAINED_FIXUPS:
+                std::memcpy(&out->fixups_off, f.data() + o + 8, 4);
+                std::memcpy(&out->fixups_size, f.data() + o + 12, 4);
+                if (out->fixups_size) out->needs_dyld = true;
+                break;
+            case LC_DYLD_EXPORTS_TRIE:
+                std::memcpy(&out->exports_off, f.data() + o + 8, 4);
+                std::memcpy(&out->exports_size, f.data() + o + 12, 4);
+                break;
+            case LC_DYLD_INFO_ONLY: {
+                if (cmdsize < 48) break;
+                std::memcpy(&out->rebase_size, f.data() + o + 12, 4);
+                std::memcpy(&out->bind_size, f.data() + o + 20, 4);
+                std::memcpy(&out->lazy_bind_size, f.data() + o + 36, 4);
+                std::memcpy(&out->exports_off, f.data() + o + 40, 4);
+                std::memcpy(&out->exports_size, f.data() + o + 44, 4);
+                if (out->bind_size || out->lazy_bind_size) out->needs_dyld = true;
+                break;
             }
-        } else if (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB) {
-            needs_dyld = true;
-        } else if (cmd == LC_DYLD_INFO_ONLY && cmdsize >= 48) {
-            uint32_t bind_size = 0, lazy_bind_size = 0;
-            std::memcpy(&bind_size, f.data() + o + 20, 4);
-            std::memcpy(&lazy_bind_size, f.data() + o + 36, 4);
-            if (bind_size || lazy_bind_size) needs_dyld = true;
-        } else if (cmd == LC_DYLD_CHAINED_FIXUPS && cmdsize >= 16) {
-            uint32_t data_size = 0;
-            std::memcpy(&data_size, f.data() + o + 12, 4);
-            if (data_size) needs_dyld = true;
+            default: break;
         }
         o += cmdsize;
     }
-    if (needs_dyld) out->interp = dylinker.empty() ? "/usr/lib/dyld" : dylinker;
+    if (out->segs.empty()) { *err = "Mach-O has no loadable segment"; return false; }
+    return true;
+}
 
-    out->entry = have_main ? (slide + text_vmaddr + entry_off) : (slide + entry_abs);
-    out->brk = (brk + 0x3FFF) & ~0x3FFFull;      // Darwin's page is 16 KiB on arm64
-    out->phdr_addr = slide + text_vmaddr;        // dyld reads the header from here
+void macho_map(const MachoImage& img, Memory& mem) {
+    for (const MachoImage::Seg& s : img.segs) {
+        const uint64_t va = img.slide + s.vmaddr;
+        if (s.filesize) mem.write_bytes(va, img.file.data() + s.fileoff, s.filesize);
+        if (s.vmsize > s.filesize) mem.set(va + s.filesize, 0, s.vmsize - s.filesize);
+    }
+}
+
+bool load_macho(const std::vector<uint8_t>& f, Memory& mem, uint64_t slide,
+                LoadedImage* out, std::string* err) {
+    MachoImage img;
+    if (!macho_parse(f, &img, err)) return false;
+    img.slide = slide;
+    macho_map(img, mem);
+
+    // LC_LOAD_DYLINKER is present on *every* MH_EXECUTE, including one linked with
+    // -nostdlib that imports nothing at all — the linker emits it unconditionally.
+    // So its presence is not the question; whether the image has anything for dyld
+    // to do is. That question is answered in macho_parse, as `needs_dyld`.
+    out->interp = img.needs_dyld ? (img.dylinker.empty() ? "/usr/lib/dyld" : img.dylinker)
+                                 : std::string();
+    out->base = slide;
+    out->entry = img.has_main ? (slide + img.text_vmaddr + img.entry_off)
+                              : (slide + img.unixthread_pc);
+    out->brk = (slide + img.vm_end + 0x3FFF) & ~0x3FFFull;   // arm64 macOS pages are 16 KiB
+    out->phdr_addr = slide + img.text_vmaddr;
     out->phent = 0;
     out->phnum = 0;
     if (!out->entry) { *err = "Mach-O has no entry point"; return false; }

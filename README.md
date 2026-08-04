@@ -42,7 +42,7 @@ No dependencies beyond a C++17 standard library.
 | Signal delivery (SIGILL frames, `rt_sigreturn`) | ✅ |
 | **A stock CPython 3.13 for ARM64 Linux** | ✅ |
 | Mach-O and Darwin syscalls (Apple Silicon guests) | ❌ planned |
-| WebAssembly build | ❌ planned |
+| **WebAssembly** — the same guests, in a browser tab | ✅ |
 
 ## Correctness is a diff, not an opinion
 
@@ -86,6 +86,28 @@ out as a rotate on the first run — the number looked entirely reasonable, and 
 the diff against the host said otherwise. (The cause: the bitfield instructions
 need *two* masks from `DecodeBitMasks`, and approximating them with one is correct
 exactly when `imms >= immr`.)
+
+## In a browser
+
+`web/` is the same emulator compiled to WebAssembly, in one self-contained
+`aarch64emu.js` (the wasm is embedded), so it serves as static files. Drop an
+AArch64 ELF on the page and it runs; drop its loader and libraries alongside and a
+dynamically linked one runs too, because the guest's own `ld.so` does the linking.
+
+```console
+$ sh web/build.sh          # needs emscripten
+$ node web/test_node.mjs
+ok   wasm: hello.elf
+ok   wasm: busybox echo
+ok   wasm: busybox uname
+ok   wasm: busybox sha256sum
+ok   wasm: cpython
+5 passed, 0 failed
+```
+
+That last line is CPython 3.13 for ARM64 Linux, dynamically linked, running inside
+WebAssembly — three architectures deep, and the sha256sum above it still agrees
+with the host's.
 
 ## Building
 

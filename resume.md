@@ -9,49 +9,55 @@ Run a **stock CPython for ARM Linux, and then for Apple Silicon, on an x86 host 
 in a browser** — the mirror image of x86_emu_cpp, which runs x86 guests on ARM.
 Everything below is ordered by what that needs.
 
-## State (verified, byte for byte against native)
+## State (verified against the host, not against expectations)
 
-`sh tests/run_tests.sh` — 4 tests, each built twice from one source and diffed:
+Four suites, all differential — the oracle is always the host, never a recorded
+file:
 
-- A64 integer core: ALU immediate and register forms, shifts, bitfield
-  (SBFM/BFM/UBFM and all the aliases), EXTR, MADD/MSUB/MULH, UDIV/SDIV,
-  CSEL/CSINC/CSINV/CSNEG, CCMP/CCMN, RBIT/REV/CLZ/CLS
-- Branches: B/BL/B.cond/CBZ/CBNZ/TBZ/TBNZ/BR/BLR/RET, and jump tables
-- Loads and stores: every width, both extensions, unsigned-immediate,
-  unscaled, pre- and post-index, register offset with extend/scale, LDP/STP,
-  load-literal, SIMD Q-register forms, load/store exclusive
-- System registers: TPIDR_EL0 (the TLS base — a libc does not reach `main`
-  without it), FPCR/FPSR, NZCV, CTR_EL0, DCZID, MIDR
-- Static ELF64 loading and the Linux initial stack: argv, envp, and an auxiliary
-  vector with AT_PHDR/AT_ENTRY/AT_RANDOM/AT_HWCAP
-- Linux syscalls (AArch64 "generic" numbering): write, writev, read, brk, mmap,
-  exit/exit_group, uname, clock_gettime, getrandom, getpid and friends
+    sh tests/run_tests.sh      4 passed   freestanding C, built twice and diffed
+    sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
+    sh tests/run_python.sh     5 passed   CPython 3.13, dynamically linked
+    node web/test_node.mjs     5 passed   the same guests under WebAssembly
+
+What works:
+
+- The A64 integer core, branches, every load/store addressing mode, and the system
+  registers a userland guest reads.
+- FP and Advanced SIMD: scalar arithmetic/compare/convert/round/FMADD; the vector
+  three-same, three-different, two-misc, across-lanes, permute and shift groups;
+  DUP/INS/UMOV/SMOV, EXT, TBL/TBX, MOVI, XTN, REV, PMULL; LD1-LD4 including
+  de-interleaving, LD1R and the single-lane forms. SHA1 and SHA256 are implemented
+  exactly, in `crypto.cpp`, because hashlib uses them for real.
+- **Dynamic linking** by running the guest's own `ld.so`: map the program, map the
+  interpreter, start at the interpreter's entry with AT_BASE/AT_ENTRY set. This
+  needed a real mmap — MAP_FIXED honoured, file mappings at their offset, zero-fill
+  past EOF.
+- **Signal delivery**: an AArch64 signal frame, SIGILL for an unimplemented
+  instruction or system register, and `rt_sigreturn`.
+- A file layer with directory descriptors and `getdents64`, and the syscalls
+  busybox and CPython need.
+- **WebAssembly** (`web/`), running all of the above.
 
 ## ⏭ Next, in order
 
-1. **A real static musl guest.** Everything so far is freestanding code the tests
-   compile themselves; the first outside binary is the real bring-up. Get a static
-   `aarch64-linux-musl` hello and then busybox running. Expect to add: FP/SIMD used
-   by musl's `memcpy`/`strlen` (`LD1`/`ST1`, `CMEQ`, `UMINV`), `set_tid_address`
-   already stubbed, `ioctl` for isatty, `openat`/`close`/`fstat`/`lseek`.
-2. **Files.** `src/files.*` does not exist yet — syscalls are console-only. Port the
-   shape from x86_emu_cpp (`FileTable`, host path mapping, directory descriptors),
-   which already solved `getdents64` and `O_DIRECTORY`.
-3. **FP and SIMD properly.** Currently only what the tests reached: FMOV
-   general↔vector, CNT, UADDLV/SADDLV/ADDV. CPython needs scalar double arithmetic
-   (FADD/FSUB/FMUL/FDIV/FCMP/FCVT/SCVTF/FCVTZS) and the vector loads that a libc's
-   string functions use. Add on demand and let the decoder tell you what is missing
-   — `exec_fp_simd` prints the encoding.
-4. **Dynamic linking.** `ld-linux-aarch64.so.1` plus AArch64 relocations
-   (`R_AARCH64_RELATIVE`, `GLOB_DAT`, `JUMP_SLOT`, and the TLS ones). x86_emu_cpp
-   took the shortcut of a *static* CPython first and it was the right call — do the
-   same here and keep dynamic for later.
-5. **CPython.** Static musl build first, exactly as the x86 project did.
-6. **Mach-O / Darwin.** Apple Silicon guests: Mach-O arm64 loading, `svc #0x80`
-   with the BSD syscall numbering, and `commpage`/`mach_absolute_time`. A separate
-   personality alongside the Linux one, not a fork of it.
-7. **WebAssembly.** The emulator is plain C++17 with no host dependencies, so this
-   should be a build target rather than a port — but nothing has tried it yet.
+1. **Mach-O and Darwin** — Apple Silicon guests. Mach-O arm64 loading (`LC_SEGMENT_64`,
+   `LC_MAIN`, chained fixups), `svc #0x80` with the BSD syscall numbering, the commpage
+   and `mach_absolute_time`. A second personality *alongside* the Linux one in
+   `syscalls.cpp`, selected by the image format — not a fork of it. The CPU is done;
+   this is all kernel interface.
+2. **Threads.** `clone` is unimplemented, so anything that starts one stops. CPython
+   only needs it once you `import threading`; the sibling x86 project has the shape to
+   copy (per-thread stacks, a scheduler that runs one at a time).
+3. **A trimmed Python for the browser demo.** The page can run CPython today, but the
+   guest tree is 45 MB into MEMFS. Dropping the stdlib to what a script actually
+   imports would make a shippable Pages demo.
+4. **Speed.** ~48M instructions/sec interpreted. A decode cache keyed on the PC (the
+   instruction word is fixed-width, so a table of decoded handlers is cheap) is the
+   obvious next step if it ever matters. Measure first — CPython startup is 66M
+   instructions, which is already about a second.
+5. **`--strict` memory.** Unmapped reads return zero and unmapped writes allocate, so a
+   wild pointer is invisible. Faulting instead would have caught the mmap/interpreter
+   address collision immediately rather than 90,000 instructions later.
 
 ## Notes and gotchas
 

@@ -70,5 +70,51 @@ else
     echo "SKIP macho dylib ($(head -1 dylib/cerr))"
 fi
 
+
+# ---- the shared-cache extractor, round-tripped -------------------------------
+#
+# tools/dsc_extract.c has to be written without a Mac in reach, and the part most
+# likely to be quietly wrong is not the cache header -- that is a documented struct
+# -- but the Mach-O rewriting: packing a library's scattered segments into a fresh
+# file and patching every file offset in the load commands to match. Get that wrong
+# and the output still looks like a dylib and no longer loads.
+#
+# So: wrap the dylib built above in a synthetic one-image cache, extract it back
+# out, and run the *same* program against the extracted copy. It has to produce the
+# same bytes the host did. (This caught exactly one bug: LC_DYLD_CHAINED_FIXUPS was
+# copied with its old offset, and the stale offset parsed as a fixup header.)
+#
+# Not covered, because it only exists in a real cache: subcaches, the newer image
+# array location, and real addresses.
+if [ -f dylib/libfoo.dylib ] && command -v python >/dev/null 2>&1; then
+    $HOSTCC -O2 -o dylib/dsc_extract ../tools/dsc_extract.c 2>dylib/cerr2 || true
+    if [ -x dylib/dsc_extract ] || [ -f dylib/dsc_extract.exe ]; then
+        EX=./dylib/dsc_extract
+        rm -rf dylib/dsc
+        MSYS_NO_PATHCONV=1 python ../tools/make_fake_cache.py \
+            dylib/libfoo.dylib /libfoo.dylib dylib/fake.cache >/dev/null
+        MSYS_NO_PATHCONV=1 $EX -o dylib/dsc dylib/fake.cache /libfoo.dylib >dylib/dsc.log 2>&1
+        if [ -f dylib/dsc/libfoo.dylib ]; then
+            cp dylib/main.macho dylib/dsc/
+            if $EMU --root dylib/dsc dylib/dsc/main.macho > dylib/dsc.actual 2>dylib/dsc.err &&
+               cmp -s dylib/expected dylib/dsc.actual; then
+                echo "ok   macho dylib via dsc_extract (round trip)"; pass=$((pass+1))
+            else
+                echo "FAIL macho dylib via dsc_extract"
+                sed 's/^/     /' dylib/dsc.err 2>/dev/null | head -3
+                diff dylib/expected dylib/dsc.actual 2>/dev/null | head -6
+                fail=$((fail+1))
+            fi
+        else
+            echo "FAIL dsc_extract produced nothing"; sed 's/^/     /' dylib/dsc.log | head -5
+            fail=$((fail+1))
+        fi
+    else
+        echo "SKIP dsc_extract ($(head -1 dylib/cerr2 2>/dev/null))"
+    fi
+else
+    echo "SKIP dsc_extract (needs the dylib above and python)"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

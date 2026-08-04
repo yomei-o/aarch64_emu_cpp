@@ -20,3 +20,6 @@ tests/dylib/actual
 tests/dylib/err
 tests/dylib/cerr
 mo/
+tests/dylib/dsc*
+tests/dylib/fake.cache
+tests/dylib/expected

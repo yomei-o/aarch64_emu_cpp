@@ -257,10 +257,12 @@ static const uint8_t* at_linkedit(uint64_t seg_vmaddr, uint64_t seg_fileoff,
 // library's bytes and run into ours: the walk follows the whole chain and writes back
 // only the slots that fall inside this segment.
 static int slide_unsupported_version;
-static uint64_t total_still_packed;
+static uint64_t total_slid;
+static int libs_without_slide;
 static int slide_version_seen;
 
-static void apply_slide(uint8_t* dst, uint64_t seg_addr, uint64_t seg_size) {
+static uint64_t apply_slide(uint8_t* dst, uint64_t seg_addr, uint64_t seg_size) {
+    uint64_t rewrote = 0;
     for (int m = 0; m < C.nslides; ++m) {
         const struct slidemap* sm = &C.slide[m];
         if (seg_addr >= sm->addr + sm->size || seg_addr + seg_size <= sm->addr) continue;
@@ -315,8 +317,10 @@ static void apply_slide(uint8_t* dst, uint64_t seg_addr, uint64_t seg_size) {
                     const uint64_t bottom43 = v & 0x000007FFFFFFFFFFull;
                     value = (top8 << 13) | bottom43;
                 }
-                if (addr >= seg_addr && addr + 8 <= seg_addr + seg_size)
+                if (addr >= seg_addr && addr + 8 <= seg_addr + seg_size) {
                     memcpy(dst + (addr - seg_addr), &value, 8);
+                    rewrote++;
+                }
                 const uint64_t next = version == 5 ? ((raw >> 52) & 0x7FF)
                                                    : ((raw >> 51) & 0x7FF);
                 if (!next) break;
@@ -325,6 +329,7 @@ static void apply_slide(uint8_t* dst, uint64_t seg_addr, uint64_t seg_size) {
             }
         }
     }
+    return rewrote;
 }
 
 // ---- the image table --------------------------------------------------------
@@ -382,7 +387,7 @@ static int nwant;
 static int want_symbols = 1;
 // Where the bytes went, per library. Printed always: guessing which part is
 // oversized has already cost two round trips.
-struct parts { uint64_t segs, symtab, exports, other, still_packed; };
+struct parts { uint64_t segs, symtab, exports, other, slid, data_bytes; };
 
 static void want_add(const char* p) {
     for (int i = 0; i < nwant; ++i) if (strcmp(want[i], p) == 0) return;
@@ -518,7 +523,7 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
     const uint8_t* mh = at(mh_addr, sizeof(struct mach_header_64));
     if (!mh) { fprintf(stderr, "  ! unmapped: %s\n", path); return 0; }
 
-    struct parts pt_local = {0, 0, 0, 0, 0};
+    struct parts pt_local = {0, 0, 0, 0, 0, 0};
     struct parts* pt = &pt_local;
 
     struct mach_header_64 h;
@@ -575,32 +580,8 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
                 pt->segs += sc.filesize;
                 // Undo the cache's pointer packing in the copy, which is the step
                 // that turns a library that loads into a library that runs.
-                apply_slide(ob.p + new_off, sc.vmaddr, sc.filesize);
-                // Check the work rather than assume it. A slot that still has bit 63
-                // set *and* a plausible cache offset below it was never decoded --
-                // which is what an unimplemented slide-info version looks like, and
-                // it produced a guest that ran 24 instructions and branched to
-                // 0x80140000004377AC. Counting them here turns a silent miss into a
-                // number on the same line as the library.
-                if (strncmp(sc.segname, "__TEXT", 6) != 0) {
-                    for (uint64_t k = 0; k + 8 <= sc.filesize; k += 8) {
-                        uint64_t v;
-                        memcpy(&v, ob.p + new_off + k, 8);
-                        if ((v >> 63) && (v & 0xFFFFFFFFull) &&
-                            ((v >> 32) & 0x7FFFFFFF) < 0x10000)
-                            pt->still_packed++;
-                    }
-                }
-                // Patch this segment's fileoff, and every section's offset with it.
-                const uint64_t delta_from = sc.fileoff;
-                struct segment_command_64* dst =
-                    (struct segment_command_64*)(ob.p + o);
-                dst->fileoff = new_off;
-                struct section_64* sect = (struct section_64*)(ob.p + o + sizeof sc);
-                for (uint32_t s = 0; s < sc.nsects; ++s) {
-                    if (sect[s].offset)
-                        sect[s].offset = (uint32_t)(new_off + (sect[s].offset - delta_from));
-                }
+                pt->slid += apply_slide(ob.p + new_off, sc.vmaddr, sc.filesize);
+                if (strncmp(sc.segname, "__TEXT", 6) != 0) pt->data_bytes += sc.filesize;
             }
         }
         o += lc.cmdsize;
@@ -760,8 +741,9 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
     printf("  %-46s %7.0f KiB = code/data %.0f + syms %.0f + exports %.0f + other %.0f%s\n",
            path, ob.len / 1024.0, pt->segs / 1024.0, pt->symtab / 1024.0,
            pt->exports / 1024.0, pt->other / 1024.0,
-           pt->still_packed ? "   <-- POINTERS STILL PACKED" : "");
-    total_still_packed += pt->still_packed;
+           (pt->data_bytes && !pt->slid) ? "   <-- NO POINTERS UNPACKED" : "");
+    total_slid += pt->slid;
+    if (pt->data_bytes && !pt->slid) libs_without_slide++;
     *out_bytes += ob.len;
     free(ob.p);
     return 1;
@@ -861,14 +843,18 @@ int main(int argc, char** argv) {
     printf("\n%d of %d written, %.1f MiB total, into %s\n",
            done, nwant, total / 1048576.0, outdir);
     printf("slide info: %d mapping(s), version %d\n", C.nslides, slide_version_seen);
-    // The single most useful line in the output. A guest whose data pointers were
-    // never unpacked links perfectly and then branches to a signature field, tens of
-    // instructions in, nowhere near the cause.
-    if (total_still_packed)
-        printf("WARNING: %llu pointer(s) still look packed -- the slide information was "
-               "not fully applied, and the result will not run\n",
-               (unsigned long long)total_still_packed);
-    else
-        printf("all data pointers unpacked\n");
+    // Counted, not guessed -- and this is the single most useful line in the output.
+    // A heuristic scan cannot find an unpacked slot: an authenticated one hides
+    // behind a diversity field, and a *plain* one reads as an ordinary small integer,
+    // indistinguishable from data. So the check is how many slots the slide walk
+    // actually rewrote. A guest whose pointers were never unpacked links perfectly
+    // and then branches to a signature field tens of instructions in, nowhere near
+    // the cause.
+    printf("unpacked %llu pointer(s) from the slide information\n",
+           (unsigned long long)total_slid);
+    if (libs_without_slide)
+        printf("WARNING: %d librar%s with data segments had no pointers unpacked. The "
+               "slide information was not applied, and the result will not run.\n",
+               libs_without_slide, libs_without_slide == 1 ? "y" : "ies");
     return 0;
 }

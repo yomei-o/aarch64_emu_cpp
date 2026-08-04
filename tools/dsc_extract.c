@@ -710,14 +710,33 @@ static int extract_one(const char* path, const char* outdir, uint64_t* out_bytes
                 patch32(&ob, o, 8, 0);
                 patch32(&ob, o, 12, 0);
                 break;
-            // LC_DYSYMTAB's tables (indirect symbols, relocations, the local/extern
-            // symbol ranges) are all LINKEDIT offsets. They are not carried, because
-            // nothing that loads a pre-linked library reads them -- but the whole
-            // command has to be zeroed rather than left pointing at offsets that no
-            // longer mean anything.
-            case LC_DYSYMTAB:
+            // LC_DYSYMTAB. Zeroing all of this was wrong, and wrong in a way that took
+            // a while to see: a cache dylib's __got slots for *data* imports are left
+            // null for dyld to fill, and the indirect symbol table is what says which
+            // symbol each slot wants. Discard it and libsystem_platform reads a null
+            // pointer where `&vm_page_size` belongs, dereferences it, gets zero from
+            // an unmapped page, and asks the kernel for a zero-byte allocation.
+            //
+            // So the indirect symbols come along (four bytes an entry) and the rest of
+            // the command -- relocations, the module table, the per-module symbol
+            // ranges, none of which a loader needs -- is zeroed.
+            case LC_DYSYMTAB: {
+                uint32_t indirectoff, nindirect;
+                memcpy(&indirectoff, mh + o + 56, 4);
+                memcpy(&nindirect, mh + o + 60, 4);
+                const uint8_t* ind = at_linkedit(le_vmaddr, le_fileoff, indirectoff,
+                                                 (uint64_t)nindirect * 4);
                 for (uint32_t k = 2; k < lc.cmdsize / 4; ++k) patch32(&ob, o, k * 4, 0);
+                uint32_t sz = 0;
+                const uint32_t at_off = put_blob(&ob, ind, nindirect * 4,
+                                                 "the indirect symbol table", path, &sz);
+                if (sz) {
+                    patch32(&ob, o, 56, at_off);
+                    patch32(&ob, o, 60, sz / 4);
+                    pt->other += sz;
+                }
                 break;
+            }
             default: break;
         }
         o += lc.cmdsize;
@@ -990,10 +1009,23 @@ static void scan_text_for_references(uint64_t page_size) {
             if (lc.cmd == LC_SEGMENT_64) {
                 struct segment_command_64 sc;
                 memcpy(&sc, mh + o, sizeof sc);
-                if (strncmp(sc.segname, "__TEXT", 6) == 0 && sc.filesize >= 8) {
-                    const uint8_t* code = at(sc.vmaddr, sc.filesize);
+                // Per *section*, and only sections marked as instructions. Scanning the
+                // whole __TEXT segment reads __cstring and __const as code, and random
+                // bytes decode as ADRP with arbitrary immediates -- which named pages
+                // all over the cache and collected 316 MiB of other libraries' data.
+                for (uint32_t s = 0; s < sc.nsects; ++s) {
+                    const uint8_t* sect = mh + o + sizeof sc + (size_t)s * 80;
+                    uint64_t saddr, ssize;
+                    uint32_t sflags;
+                    memcpy(&saddr, sect + 32, 8);
+                    memcpy(&ssize, sect + 40, 8);
+                    memcpy(&sflags, sect + 64, 4);
+                    // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+                    if (!(sflags & 0x80000400u) || ssize < 8) continue;
+                    const uint8_t* code = at(saddr, ssize);
                     if (code) {
-                        for (uint64_t off = 0; off + 8 <= sc.filesize; off += 4) {
+                        const uint64_t base = saddr;
+                        for (uint64_t off = 0; off + 8 <= ssize; off += 4) {
                             uint32_t insn, next;
                             memcpy(&insn, code + off, 4);
                             memcpy(&next, code + off + 4, 4);
@@ -1004,7 +1036,7 @@ static void scan_text_for_references(uint64_t page_size) {
                             const uint64_t immhi = (insn >> 5) & 0x7FFFF;
                             int64_t imm = (int64_t)((immhi << 2) | immlo);
                             if (imm & (1 << 20)) imm -= (1 << 21);      // sign extend 21 bits
-                            uint64_t target = ((sc.vmaddr + off) & ~0xFFFull) +
+                            uint64_t target = ((base + off) & ~0xFFFull) +
                                               (uint64_t)(imm * 4096);
                             // ADD immediate, 64-bit: 1 00 100010 sh imm12 Rn Rd
                             if ((next >> 23) == 0x244 && ((next >> 5) & 0x1F) == rd) {

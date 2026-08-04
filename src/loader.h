@@ -93,6 +93,13 @@ struct MachoImage {
     // that has them must be *refused*, not quietly loaded with its pointers left
     // as written, which looks like a successful load and is not one.
     uint32_t rebase_size = 0, bind_size = 0, lazy_bind_size = 0;
+    // The classic indirect-symbol machinery, which a *pre-linked* library still needs
+    // for one thing: its __got slots for imported data are left null, and this is what
+    // says which symbol each null slot wants. `reserved1` on the section is the index
+    // where that section's run of indirect symbols begins.
+    uint32_t indirect_off = 0, indirect_count = 0;
+    struct GotSec { uint64_t addr = 0, size = 0; uint32_t first_indirect = 0; };
+    std::vector<GotSec> got_secs;
 
     // Where the mach_header actually landed. Chained rebases in the OFFSET format
     // are measured from here, not from the slide.

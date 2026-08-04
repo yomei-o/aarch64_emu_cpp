@@ -459,6 +459,54 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
         }
     }
 
+    // Bind the null __got slots of a pre-linked library.
+    //
+    // A library out of a shared cache has its cross-library *code* pointers already
+    // written, but the slots for imported *data* are left null for dyld to fill --
+    // libsystem_platform's `&vm_page_size` and `&mach_task_self_` are two of them. The
+    // slot says nothing about what it wants; the indirect symbol table does, indexed
+    // from the section's `reserved1`.
+    //
+    // Only zero slots are touched. A slot the cache already filled is correct and must
+    // not be second-guessed, and a symbol that resolves nowhere is left zero and
+    // reported, which is the same story a missing library gets.
+    for (const MachoImage& img : images) {
+        if (!img.indirect_count || !img.nsyms) continue;
+        for (const MachoImage::GotSec& sec : img.got_secs) {
+            for (uint64_t k = 0; k * 8 < sec.size; ++k) {
+                const uint64_t slot = img.load_addr() + sec.addr - img.text_vmaddr + k * 8;
+                const uint64_t at_slot = img.slide + sec.addr + k * 8;
+                (void)slot;
+                if (mem.read<uint64_t>(at_slot)) continue;          // already bound
+                const uint64_t idx = sec.first_indirect + k;
+                if (idx >= img.indirect_count) break;
+                uint32_t symidx;
+                std::memcpy(&symidx, img.file.data() + img.indirect_off + idx * 4, 4);
+                // INDIRECT_SYMBOL_LOCAL / _ABS: not an import, nothing to bind.
+                if (symidx == 0x80000000u || symidx == 0x40000000u ||
+                    symidx == 0xC0000000u || symidx >= img.nsyms) continue;
+                uint32_t strx;
+                std::memcpy(&strx, img.file.data() + img.symoff + symidx * 16, 4);
+                const char* name =
+                    reinterpret_cast<const char*>(img.file.data()) + img.stroff + strx;
+                if (!*name) continue;
+                uint64_t addr = 0;
+                for (size_t d = 0; d < img.dylibs.size() && !addr; ++d) {
+                    auto it = by_name.find(img.dylibs[d]);
+                    if (it != by_name.end()) addr = lookup_in(images[it->second], name, 0);
+                }
+                if (!addr)
+                    for (const MachoImage& o : images) {
+                        addr = lookup_in(o, name, 0);
+                        if (addr) break;
+                    }
+                if (addr) mem.write<uint64_t>(at_slot, addr);
+                else unresolved.push_back(std::string(name) + "  (a null __got slot in " +
+                                          img.guest_path + ")");
+            }
+        }
+    }
+
     // An absent library is a warning, not a failure. dyld would have loaded it, but
     // what matters here is whether anything actually *binds* to it -- and a guest
     // extracted from a shared cache will always be missing libraries it never calls.

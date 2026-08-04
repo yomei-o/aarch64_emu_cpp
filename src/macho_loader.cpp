@@ -26,7 +26,7 @@ namespace {
 constexpr uint32_t kMagic64 = 0xFEEDFACFu;
 constexpr int32_t  kCpuArm64 = 0x0100000Cu;
 constexpr uint32_t LC_SEGMENT_64 = 0x19, LC_LOAD_DYLINKER = 0x0E, LC_LOAD_DYLIB = 0x0C,
-                   LC_ID_DYLIB = 0x0D, LC_SYMTAB = 0x02,
+                   LC_ID_DYLIB = 0x0D, LC_SYMTAB = 0x02, LC_DYSYMTAB = 0x0B,
                    LC_MAIN = 0x80000028u, LC_UNIXTHREAD = 0x05,
                    LC_DYLD_INFO_ONLY = 0x80000022u, LC_DYLD_CHAINED_FIXUPS = 0x80000034u,
                    LC_DYLD_EXPORTS_TRIE = 0x80000033u, LC_LOAD_WEAK_DYLIB = 0x80000018u,
@@ -108,6 +108,14 @@ bool macho_parse(const std::vector<uint8_t>& f, MachoImage* out, std::string* er
                     const uint32_t type = sflags & 0xFF;
                     if (type == 0x09) out->inits.push_back({addr, size, false});
                     else if (type == 0x16) out->inits.push_back({addr, size, true});
+                    // S_NON_LAZY_SYMBOL_POINTERS / S_LAZY_SYMBOL_POINTERS: the __got
+                    // and __auth_got tables. reserved1 is where this section's run of
+                    // indirect symbols starts.
+                    else if (type == 0x06 || type == 0x07) {
+                        uint32_t reserved1 = 0;
+                        std::memcpy(&reserved1, f.data() + so + 68, 4);
+                        out->got_secs.push_back({addr, size, reserved1});
+                    }
                 }
                 // __TEXT starts at the mach_header, so its vmaddr is the image base.
                 if (name == "__TEXT") out->text_vmaddr = sc.vmaddr;
@@ -144,6 +152,12 @@ bool macho_parse(const std::vector<uint8_t>& f, MachoImage* out, std::string* er
                 break;
             case LC_RPATH:
                 out->rpaths.push_back(lc_string(f.data(), o, cmdsize, 8));
+                break;
+            case LC_DYSYMTAB:
+                if (cmdsize >= 64) {
+                    std::memcpy(&out->indirect_off, f.data() + o + 56, 4);
+                    std::memcpy(&out->indirect_count, f.data() + o + 60, 4);
+                }
                 break;
             case LC_SYMTAB:
                 std::memcpy(&out->symoff, f.data() + o + 8, 4);

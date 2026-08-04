@@ -508,10 +508,14 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
             // different question from one handed nothing.
             std::fprintf(stderr,
                          "[mac] dyld API vtable slot %u (+0x%X) is not implemented, "
-                         "returning 0; called from %012llX (x1=%llX x2=%llX)\n",
+                         "returning 0; called from %012llX "
+                         "(x1=%llX x2=%llX x3=%llX x4=%llX x5=%llX)\n",
                          slot, slot * 8, static_cast<unsigned long long>(cpu_.xr(30)),
                          static_cast<unsigned long long>(cpu_.xr(1)),
-                         static_cast<unsigned long long>(cpu_.xr(2)));
+                         static_cast<unsigned long long>(cpu_.xr(2)),
+                         static_cast<unsigned long long>(cpu_.xr(3)),
+                         static_cast<unsigned long long>(cpu_.xr(4)),
+                         static_cast<unsigned long long>(cpu_.xr(5)));
             return 0;
     }
 }

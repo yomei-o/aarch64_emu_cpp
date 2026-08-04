@@ -57,6 +57,12 @@ public:
     // Print PC every N instructions. A guest that stops making progress looks
     // exactly like one doing a lot of work; sampling tells them apart in seconds.
     uint64_t sample_every = 0, sample_left = 0;
+    // Stop at a *function* and show its arguments. `--sample` finds where the time goes
+    // and `--watch` finds who touched an address; this answers "what was it asked for",
+    // which is the question when a guest library is about to make a decision from a
+    // string. Zero disables it, so the cost is one compare against a register.
+    uint64_t pc_watch = 0;
+    std::function<void()> on_pc_watch;
 
     // Register 31 as zero (XZR): the common case.
     uint64_t xr(unsigned i) const { return i == 31 ? 0 : x[i]; }

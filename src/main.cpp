@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
     using namespace a64;
 
     bool trace_sys = false, stats = false, macho_info = false, strict = false;
-    uint64_t max_insns = 0, sample = 0, watch_lo = 0, watch_hi = 0;
+    uint64_t max_insns = 0, sample = 0, watch_lo = 0, watch_hi = 0, pc_watch = 0;
     // The guest sees this directory as "/". Defaulting to the host cwd means a
     // relative path from the guest lands where a user would expect it to.
     std::string root = ".";
@@ -59,6 +59,12 @@ int main(int argc, char** argv) {
                            ? watch_lo + 0x4000
                            : std::strtoull(spec.c_str() + colon + 1, nullptr, 16);
         }
+        // --pcwatch ADDR — every time the guest reaches ADDR, print x0..x5 and, for any of
+        // them that points at a printable NUL-terminated string, the string. Meant for the
+        // entry of a guest function: it answers "what was it asked for", which `--watch`
+        // and `--sample` cannot. Use `tools/whichlib.py` backwards -- `--macho-info` prints
+        // a symbol's offset from its header, and the header addresses are in `--trace-sys`.
+        else if (a == "--pcwatch" && i + 1 < argc) pc_watch = std::strtoull(argv[++i], nullptr, 16);
         else if (a == "--max" && i + 1 < argc) max_insns = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--sample" && i + 1 < argc) sample = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--root" && i + 1 < argc) root = argv[++i];
@@ -128,6 +134,32 @@ int main(int argc, char** argv) {
                          static_cast<unsigned long long>(addr),
                          static_cast<unsigned long long>(value),
                          static_cast<unsigned long long>(cpu.pc));
+        };
+    }
+    if (pc_watch) {
+        cpu.pc_watch = pc_watch;
+        cpu.on_pc_watch = [&cpu, &mem]() {
+            std::fprintf(stderr, "[pcwatch] %010llX lr=%010llX",
+                         static_cast<unsigned long long>(cpu.pc),
+                         static_cast<unsigned long long>(cpu.xr(30)));
+            for (unsigned r = 0; r <= 5; ++r) {
+                const uint64_t v = cpu.xr(r);
+                std::fprintf(stderr, "  x%u=%llX", r, static_cast<unsigned long long>(v));
+                // A register that points at a short printable string is almost always the
+                // interesting one -- a section name, a path, a symbol. Reading it needs the
+                // permissive path: this is a debugging aid and must not itself fault.
+                if (v < 0x1000) continue;
+                char s[40];
+                unsigned n = 0;
+                for (; n < sizeof s - 1; ++n) {
+                    const uint8_t c = mem.read<uint8_t>(v + n);
+                    if (!c) break;
+                    if (c < 0x20 || c > 0x7E) { n = 0; break; }
+                    s[n] = static_cast<char>(c);
+                }
+                if (n >= 2) { s[n] = 0; std::fprintf(stderr, "(\"%s\")", s); }
+            }
+            std::fprintf(stderr, "\n");
         };
     }
     // --strict: report the address and stop. A wild access is not something to hand the

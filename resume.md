@@ -61,6 +61,7 @@ The tools built for this, all of which take addresses straight out of a trace:
     --trace-sys              syscalls, Mach traps, MIG routines, [init]/[objc]/[call]
     --sample N               print the PC every N instructions
     --watch LO:HI            log every guest access in a range, with the PC
+    --pcwatch ADDR           at a guest function's entry, x0..x5 and any string they point at
     --macho-info FILE [sym…] what a Mach-O contains; look symbols up in its export trie
     tools/whichlib.py        address -> library and nearest symbol
     tools/dis_macho.py       disassemble at a virtual address in a cache-extracted library
@@ -199,17 +200,53 @@ What works:
    - **The dyld API slots still answered with zero** are down to two on this guest, and
      both are deliberate:
 
-     `_dyld_lookup_section_info` (111), 130-odd calls. The signature is legible from the
-     trace — x1 is a mach_header, x2 a per-image handle dyld precomputes, and the rest is
-     `(kind, uint64_t* offset, uint64_t* size)`. What is *not* legible is the order of the
-     `_dyld_section_location_kind` enum, and that is the whole answer: kind 5 is a section
-     name, and picking the wrong one returns the wrong section's contents with no
-     indication anything went wrong. Returning false is a *correct* answer — libobjc then
-     walks the load commands itself, which works — so this stays false until the enum can
-     be measured rather than recalled. The way to measure it is to log the
-     `getsectiondata(mh, seg, sect)` call libobjc makes immediately after each false, and
-     pair the strings with the kinds. It costs 16% of the run, which is the only reason to
-     want it, and item 4 is a better lever on the same problem.
+     **`_dyld_lookup_section_info` (111), 186 calls — half measured, and the half that is
+     measured is the half that looked impossible.** Pick this up here.
+
+     The blocker was the `_dyld_section_location_kind` enum: kind is a number, a wrong
+     mapping returns some *other* section's contents, and nothing about that looks like a
+     failure. It is now measured, not recalled, and the trick was that **the caller names
+     the kind**: libobjc has a separate method per section, and x30 plus
+     `tools/whichlib.py` reads them straight out of a trace. Reproduce with
+
+         ./aarch64emu --trace-sys --root guests/macos guests/macos/hello 2>&1 \
+           | grep "slot 111" | sed 's/.*called from \([0-9A-F]*\) .*x3=\([0-9A-F]*\).*/\1 kind=\2/' \
+           | sort | uniq -c
+
+     and put each address through `tools/whichlib.py guests/macos ADDR`:
+
+         kind  section              proved by
+          3    __swift5_replace     libswiftCore addImageCallback2Sections<…,Li3E,Li4E>
+          6    __objc_imageinfo     _map_images_nolock, for every image
+          7    __objc_selrefs       header_info::selrefs
+         12    __objc_classlist     header_info::classlist
+         13    __objc_nlclslist     header_info::nlclslist *and* _load_images+76
+         17    __objc_nlcatlist     _load_images+104, right after the non-lazy classes
+         18    __objc_protolist     header_info::protocollist
+
+     Seven values, and they cross-check: 13 arrives from two unrelated callers, the Swift
+     one appears as a *template argument* (`Li3E`) in the mangled name, and all seven fall
+     exactly where dyld's enum puts them (0–5 the swift5 sections, 6 objc_imageinfo, then
+     the __DATA ones from 7). Those seven cover all 186 calls on this guest, so answering
+     only the measured kinds and returning false for the rest gives up nothing — and
+     returning false stays correct, because libobjc then walks the load commands itself.
+
+     **What is still unknown is the argument layout, and the first reading of it was
+     wrong.** x3 is the kind and that is solid. But x1 is `100000000` on most calls — not a
+     mach_header — and x4/x5 are `3000106F0` and `300000378`, which are inside the *host's
+     own* synthesised vtable and stub area (`300000378` is slot 111's own stub, i.e. leftover
+     from the dispatch, not an argument). So this is not
+     `(mh, handle, kind, uint64_t* off, uint64_t* size)` in x1..x5. Do not implement it on
+     that assumption; measure first. `--pcwatch` (below) is the tool: point it at the
+     caller in libobjc and read the arguments it actually sets up.
+
+     The rest, once the layout is known: find the section by *name* by walking the
+     mach_header's LC_SEGMENT_64 commands in guest memory, ignoring the segment name (these
+     section names are unique, and it avoids the __DATA/__DATA_CONST/__AUTH_CONST question
+     entirely), and hand back the offset from the header plus the size.
+
+     It costs 16% of the run, which is the only reason to want it, and item 4 is a better
+     lever on the same problem.
 
      Slot 97, 18 calls from libobjc. Answering zero is not visibly wrong; it has not been
      identified because nothing has gone looking.

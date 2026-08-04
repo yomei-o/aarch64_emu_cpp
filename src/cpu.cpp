@@ -186,6 +186,8 @@ void Cpu::step() {
                     static_cast<unsigned long long>(insns));
     }
 
+    if (pc_watch && pc == pc_watch && on_pc_watch) on_pc_watch();
+
     cur_pc_ = pc;
     const uint32_t insn = mem_.read<uint32_t>(pc);
     pc += 4;

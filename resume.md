@@ -133,7 +133,8 @@ What works:
 
 ## ⏭ Next, in order
 
-1. ✅ **A real macOS binary runs.** `hello from real macOS`, 195,417 instructions, exit 0.
+1. ✅ **A real macOS binary runs.** `hello from real macOS`, 199,279 instructions, exit 0 — the
+   same count with `--strict`.
    The account of how the last walls fell is in "How the macOS milestone was reached" below,
    because every one of them was a case of the host telling the guest something almost true.
 
@@ -143,9 +144,37 @@ What works:
      interesting ones are a program that uses Foundation (needs CoreFoundation and
      Foundation extracted, which `dsc_extract` can do), and one that spawns a thread on
      Darwin (`bsdthread_create` is not implemented; the Linux side's scheduler is).
-   - **`--strict` still finds one thing on this guest**: an unmapped read at address 0x10,
-     141,988 instructions in — benign in permissive mode, so it is a real question about
-     which structure is missing a pointer rather than something that stops the run.
+   - ✅ **`--strict` is clean on this guest.** Permissive and strict now run the *same*
+     199,279 instructions, which is the result worth stating: no path through this guest
+     depends on reading unmapped memory. Getting there from the one remaining finding — an
+     unmapped read at address 0x10, 138,000 instructions in — went through three separate
+     gaps, each hidden behind the last, and the middle one was the interesting one:
+
+     1. **dyld API slot 12 answers through an out-parameter, not just x0.** libsystem_c's
+        `_os_assumes_log` does `add x1, sp, #0x30`, then hands `[sp, #0x38]` to
+        `_os_get_image_uuid` as a mach_header and `[sp, #0x30]` to `strrchr(…, '/')`. So x0
+        is a success flag and the buffer at x2 is `{path, header}`. The shape was read off
+        the caller rather than guessed: each version moved the fault a measurable distance
+        further along, which is what said the previous guess was only half right.
+     2. **`environ` was null.** `NXArgc`, `NXArgv`, `environ` and `__progname` live in
+        *libdyld.dylib* on a Mac, and dyld writes them before any initializer runs.
+        libsystem_c's `environ` and libswiftCore's environment reader are binds against
+        that same storage, not copies of it — so filling in a private `ProgramVars` struct,
+        which is what this did, satisfies libsystem_c's copy and nothing else. Every
+        `getenv` in the process answered "unset", and libswiftCore's
+        `runtime::environment::initialize` read `environ[0]` through a null pointer. The
+        loader now reports where libdyld's four globals are and `ProgramVars` points at
+        them. This one had been mis-diagnosed as fixed once already: an earlier pass added
+        `ProgramVars` and stopped there, because the guest printed.
+     3. Paths handed to the guest are `const char*` into guest memory, so
+        `image_path_addr` copies the host's `std::string`s in on demand.
+
+     Worth recording what was *not* the fix: closing every remaining syscall the trace
+     named on this guest — `csops`, `csops_audittoken`, `csrctl`, `shm_open`,
+     `getattrlist`, `socket`, and sysctl's `name2oid` form with the five names it asks for
+     — changed the fault by 15 instructions. They are all implemented now and the trace is
+     silent, but the temptation to claim them as the cause was real and the instruction
+     count is what refused it.
    - **The dyld API slots still answered with zero** are listed further down. Most are
      honest zeros now; `_dyld_lookup_section_info` (111) is called constantly and makes
      libobjc fall back to walking load commands, which works but costs 16% of the run.

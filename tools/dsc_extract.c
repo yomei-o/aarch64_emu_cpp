@@ -1322,15 +1322,107 @@ static void collect_extras(void) {
     }
 }
 
+// --dump ADDR: everything known about one address in the cache.
+//
+// Reached after three readings of "the slot is zero" that each had a different
+// explanation. What is actually wanted is the raw bytes, whether the page is in a slide
+// mapping at all, and what that page's chain says -- because "zero in the file" and
+// "never copied" are indistinguishable from the guest's side, and so are "no slide
+// information" and "a slide chain that skips this slot".
+static void dump_address(uint64_t addr) {
+    printf("address %012llX\n", (unsigned long long)addr);
+    for (int m = 0; m < C.nmaps; ++m)
+        if (addr >= C.map[m].addr && addr < C.map[m].addr + C.map[m].size)
+            printf("  in mapping %d  %012llX + %llu\n", m,
+                   (unsigned long long)C.map[m].addr, (unsigned long long)C.map[m].size);
+    const uint8_t* p = at(addr, 8);
+    if (!p) { printf("  not mapped by any cache file\n"); return; }
+    uint64_t raw;
+    memcpy(&raw, p, 8);
+    printf("  raw bytes            %016llX\n", (unsigned long long)raw);
+
+    for (int m = 0; m < C.nslides; ++m) {
+        const struct slidemap* sm = &C.slide[m];
+        if (addr < sm->addr || addr >= sm->addr + sm->size) continue;
+        uint32_t version, page_size, page_count;
+        memcpy(&version, sm->info, 4);
+        memcpy(&page_size, sm->info + 4, 4);
+        memcpy(&page_count, sm->info + 8, 4);
+        uint64_t value_add;
+        memcpy(&value_add, sm->info + 16, 8);
+        const uint64_t page_index = (addr - sm->addr) / page_size;
+        printf("  slide mapping %d: version %u, page size %u, %u pages, "
+               "value_add %012llX\n", m, version, page_size, page_count,
+               (unsigned long long)value_add);
+        if (page_index >= page_count) { printf("  page index out of range\n"); break; }
+        uint16_t start;
+        memcpy(&start, sm->info + 24 + page_index * 2, 2);
+        if (start == 0xFFFF) {
+            printf("  page %llu: NO_REBASE -- the cache has no pointer here, so the "
+                   "bytes above are final\n", (unsigned long long)page_index);
+        } else {
+            printf("  page %llu: chain starts at +%u\n",
+                   (unsigned long long)page_index, start);
+            const uint64_t page_addr = sm->addr + page_index * page_size;
+            uint64_t a = page_addr + start;
+            int steps = 0;
+            for (; steps < 100000; ++steps) {
+                if (a == (addr & ~7ull)) {
+                    printf("  this slot IS in the chain, %d step(s) in\n", steps);
+                    break;
+                }
+                const uint8_t* q = at(a, 8);
+                if (!q) break;
+                uint64_t r;
+                memcpy(&r, q, 8);
+                const uint64_t next = version == 5 ? ((r >> 52) & 0x7FF) : ((r >> 51) & 0x7FF);
+                if (!next) { printf("  chain ends without reaching this slot\n"); break; }
+                a += next * 8;
+                if (a >= page_addr + page_size) {
+                    printf("  chain leaves the page without reaching this slot\n");
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    for (size_t i = 0; i < n_patches; ++i)
+        if (patches[i].addr == addr)
+            printf("  patch table would write %012llX here\n",
+                   (unsigned long long)patches[i].value);
+    // And which image, if any, claims it.
+    for (uint32_t k = 0; k < images_count; ++k) {
+        const uint8_t* mh = at(image_addr((int)k), sizeof(struct mach_header_64));
+        if (!mh) continue;
+        struct mach_header_64 h;
+        memcpy(&h, mh, sizeof h);
+        size_t o = sizeof h;
+        for (uint32_t i = 0; i < h.ncmds; ++i) {
+            struct load_command lc;
+            memcpy(&lc, mh + o, sizeof lc);
+            if (lc.cmd == LC_SEGMENT_64) {
+                struct segment_command_64 sc;
+                memcpy(&sc, mh + o, sizeof sc);
+                if (sc.vmsize && addr >= sc.vmaddr && addr < sc.vmaddr + sc.vmsize)
+                    printf("  inside %.16s of %s\n", sc.segname, image_path((int)k));
+            }
+            o += lc.cmdsize;
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     const char* outdir = NULL;
     int list = 0, i = 1;
+    uint64_t dump_addr = 0;
     for (; i < argc; ++i) {
         if (strcmp(argv[i], "--list") == 0) list = 1;
         else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) outdir = argv[++i];
         else if (strcmp(argv[i], "--all-deps") == 0) follow_all_kinds = 1;
         else if (strcmp(argv[i], "--patch-sym") == 0 && i + 1 < argc) patch_sym = argv[++i];
         else if (strcmp(argv[i], "--patch-cache-relative") == 0) patch_cache_relative = 1;
+        else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc)
+            dump_addr = strtoull(argv[++i], NULL, 16);
         else if (strcmp(argv[i], "--no-symbols") == 0) want_symbols = 0;
         else if (strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
             if (n_only < 8) only_prefix[n_only++] = argv[++i]; else ++i;
@@ -1386,6 +1478,19 @@ int main(int argc, char** argv) {
     for (int m = 0; m < C.nmaps; ++m)
         printf("  mapping %2d  %016llx + %10llu\n", m,
                (unsigned long long)C.map[m].addr, (unsigned long long)C.map[m].size);
+
+    if (dump_addr) {
+        // Before the closure, so it works without naming any library.
+        if (i < argc) for (; i < argc; ++i) want_add(argv[i]);
+        else want_add("/usr/lib/libSystem.B.dylib");
+        for (int k = 0; k < nwant; ++k) {
+            const int idx = find_image(want[k]);
+            if (idx >= 0) queue_deps(image_addr(idx));
+        }
+        read_patch_table();
+        dump_address(dump_addr);
+        return 0;
+    }
 
     if (list) {
         for (uint32_t k = 0; k < images_count; ++k) {

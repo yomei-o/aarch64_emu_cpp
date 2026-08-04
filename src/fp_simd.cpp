@@ -227,6 +227,71 @@ void Cpu::exec_fp_simd(uint32_t insn) {
                 case 0x0E: r = u ? (x > y ? x - y : y - x)                       // UABD / SABD
                                  : static_cast<uint64_t>(sx(x) > sx(y) ? sx(x) - sx(y)
                                                                        : sx(y) - sx(x)); break;
+                // MUL / PMUL, MLA / MLS, and SABA / UABA -- the three that read Rd's
+                // existing value as an operand rather than only writing it. `out` is a
+                // fresh register, so vreg[rd] still holds what it had.
+                case 0x13:
+                    if (!u) { r = x * y; }                                        // MUL
+                    else {                                                       // PMUL (8-bit only)
+                        if (esize != 1) { ok = false; break; }
+                        uint64_t p = 0;
+                        for (unsigned k = 0; k < 8; ++k) if ((y >> k) & 1) p ^= x << k;
+                        r = p;
+                    }
+                    break;
+                case 0x12: {                                                     // MLA / MLS
+                    const uint64_t acc = velem(vreg[rd], esize, i);
+                    r = u ? (acc - x * y) : (acc + x * y);
+                    break;
+                }
+                case 0x0F: {                                                     // SABA / UABA
+                    const uint64_t acc = velem(vreg[rd], esize, i);
+                    const uint64_t d = u ? (x > y ? x - y : y - x)
+                                         : static_cast<uint64_t>(sx(x) > sx(y) ? sx(x) - sx(y)
+                                                                               : sx(y) - sx(x));
+                    r = acc + d;
+                    break;
+                }
+                // The saturating add and subtract, which unlike everything above here do
+                // have a 64-bit element form -- so they cannot be computed one width up and
+                // clamped. At 64 bits the overflow test is the classic sign comparison; at
+                // the narrower widths clamping the wide result is simpler and equivalent.
+                case 0x01: case 0x05: {                                          // SQADD/UQADD, SQSUB/UQSUB
+                    const bool sub = (opcode == 0x05);
+                    const unsigned b = esize * 8;
+                    if (u) {
+                        if (sub) r = (y > x) ? 0 : x - y;
+                        else { const uint64_t s = x + y;
+                               r = (b == 64) ? ((s < x) ? ~0ull : s)
+                                             : ((s > emask) ? emask : s); }
+                    } else if (b == 64) {
+                        const int64_t a64 = static_cast<int64_t>(x), b64 = static_cast<int64_t>(y);
+                        const int64_t s = sub ? static_cast<int64_t>(x - y)
+                                              : static_cast<int64_t>(x + y);
+                        const bool ovf = sub ? (((a64 ^ b64) & (a64 ^ s)) < 0)
+                                             : (((~(a64 ^ b64)) & (a64 ^ s)) < 0);
+                        r = ovf ? (a64 < 0 ? static_cast<uint64_t>(INT64_MIN)
+                                           : static_cast<uint64_t>(INT64_MAX))
+                                : static_cast<uint64_t>(s);
+                    } else {
+                        const int64_t s = sub ? sx(x) - sx(y) : sx(x) + sx(y);
+                        const int64_t hi = static_cast<int64_t>((1ull << (b - 1)) - 1);
+                        const int64_t lo = -static_cast<int64_t>(1ull << (b - 1));
+                        r = static_cast<uint64_t>(s > hi ? hi : s < lo ? lo : s);
+                    }
+                    break;
+                }
+                // The halving adds and subtracts. No 64-bit form exists, so one width up is
+                // always available; SRHADD/URHADD round by adding one before halving.
+                case 0x00: case 0x02: case 0x04: {
+                    if (esize == 8) { ok = false; break; }
+                    const bool sub = (opcode == 0x04), round = (opcode == 0x02);
+                    const int64_t s = u ? static_cast<int64_t>(sub ? x - y : x + y + (round ? 1 : 0))
+                                        : (sub ? sx(x) - sx(y) : sx(x) + sx(y) + (round ? 1 : 0));
+                    r = static_cast<uint64_t>(u ? static_cast<uint64_t>(s) >> 1
+                                                : static_cast<uint64_t>(s >> 1));
+                    break;
+                }
                 default: ok = false; break;
             }
             if (ok) set_velem(out, esize, i, r);
@@ -485,19 +550,104 @@ void Cpu::exec_fp_simd(uint32_t insn) {
                 set_velem(out, esize, i, velem(vreg[rn], esize, i) << shift);
             vreg[rd] = out; return;
         }
-        if (opcode == 0x00) {                                   // SSHR / USHR
-            const unsigned shift = 2 * bits - imm;
+        // The right-shift amount, for every opcode that shifts right. `imm` counts *up*
+        // from the element size, so the shift is what is left over; a shift of `bits` is
+        // encoded and means "shift everything out", which C++ would make undefined, so the
+        // arithmetic forms clamp to bits-1 (the sign bit smeared, which is the same answer)
+        // and the logical ones are given zero directly.
+        const unsigned rshift = 2 * bits - imm;
+        const uint64_t emask = bits == 64 ? ~0ull : ((1ull << bits) - 1);
+        // One element, read as signed or unsigned according to U.
+        auto lane = [&](unsigned r, unsigned es, unsigned i) -> int64_t {
+            const uint64_t e = velem(vreg[r], es, i);
+            if (u) return static_cast<int64_t>(e);
+            const unsigned b = es * 8;
+            const uint64_t s = 1ull << (b - 1);
+            return static_cast<int64_t>((e ^ s) - s);
+        };
+        // A right shift by `sh`, optionally rounding to nearest (add half first), on a
+        // value already widened to int64_t. Rounding is *before* the shift, which is why it
+        // has to happen at the wide width: at the narrow one the addend would overflow.
+        auto shr = [&](int64_t v, unsigned sh, bool round) -> uint64_t {
+            if (round && sh > 0 && sh < 64) v += static_cast<int64_t>(1ull << (sh - 1));
+            if (sh >= 64) return u ? 0ull : static_cast<uint64_t>(v >> 63);
+            return u ? (static_cast<uint64_t>(v) >> sh) : static_cast<uint64_t>(v >> sh);
+        };
+
+        if (opcode == 0x00 || opcode == 0x02 || opcode == 0x04 || opcode == 0x06) {
+            // SSHR/USHR, SSRA/USRA (accumulate), SRSHR/URSHR (round), SRSRA/URSRA (both).
+            const bool round = (opcode & 4) != 0, acc = (opcode & 2) != 0;
             for (unsigned i = 0; i < lanes; ++i) {
-                uint64_t e = velem(vreg[rn], esize, i);
-                if (u) e >>= (shift >= bits ? bits - 1 : shift);
-                else {
-                    const uint64_t s = 1ull << (bits - 1);
-                    const int64_t se = static_cast<int64_t>((e ^ s) - s);
-                    e = static_cast<uint64_t>(se >> (shift >= bits ? bits - 1 : shift));
-                }
-                set_velem(out, esize, i, e);
+                uint64_t e = shr(lane(rn, esize, i), rshift >= bits && !round ? bits - 1 : rshift, round);
+                if (acc) e += velem(vreg[rd], esize, i);
+                set_velem(out, esize, i, e & emask);
             }
             vreg[rd] = out; return;
+        }
+        if (u && (opcode == 0x08 || opcode == 0x0A)) {
+            // SRI / SLI: shift and *insert*, so the bits the shift vacates keep whatever
+            // the destination already had. The only two opcodes here that read Rd for its
+            // value rather than to accumulate.
+            const bool left = (opcode == 0x0A);
+            const unsigned sh = left ? imm - bits : rshift;
+            for (unsigned i = 0; i < lanes; ++i) {
+                const uint64_t src = velem(vreg[rn], esize, i), dst = velem(vreg[rd], esize, i);
+                if (sh >= bits) { set_velem(out, esize, i, dst); continue; }
+                const uint64_t keep = left ? ((1ull << sh) - 1) : ~((emask >> sh)) & emask;
+                const uint64_t moved = left ? (src << sh) : (src >> sh);
+                set_velem(out, esize, i, ((dst & keep) | moved) & emask);
+            }
+            vreg[rd] = out; return;
+        }
+        if (opcode >= 0x10 && opcode <= 0x13) {
+            // The narrowing right shifts. `size` here is the *destination* element size, so
+            // the source elements are twice as wide and there are always 8/esize of them --
+            // a full 128-bit source producing a 64-bit half. Q selects which half of the
+            // destination gets it, which is what the `2` in SHRN2 means; the other half is
+            // left alone rather than zeroed.
+            //
+            //   10  SHRN / SQSHRUN      11  RSHRN / SQRSHRUN
+            //   12  SQSHRN / UQSHRN     13  SQRSHRN / UQRSHRN
+            //
+            // Saturation and signedness do not line up the way U alone suggests: 10/11 with
+            // U=1 read *signed* and saturate to *unsigned*, which is the "UN" in SQSHRUN.
+            const bool round = (opcode & 1) != 0;
+            const bool saturating = opcode >= 0x12 || u;
+            const bool src_signed = (opcode >= 0x12) ? !u : true;   // 10/11 U=1: signed in
+            const bool dst_signed = (opcode >= 0x12) && !u;
+            const unsigned sesize = esize * 2;
+            const unsigned nlanes = 8u / esize;
+            const int64_t smax = static_cast<int64_t>((1ull << (bits - 1)) - 1);
+            const int64_t smin = -static_cast<int64_t>(1ull << (bits - 1));
+            const uint64_t umax = emask;
+            V128 res = vreg[rd];                      // the untouched half survives
+            for (unsigned i = 0; i < nlanes; ++i) {
+                uint64_t raw = velem(vreg[rn], sesize, i);
+                int64_t v;
+                if (src_signed && sesize < 8) {
+                    const uint64_t s = 1ull << (sesize * 8 - 1);
+                    v = static_cast<int64_t>((raw ^ s) - s);
+                } else {
+                    v = static_cast<int64_t>(raw);
+                }
+                if (round && rshift > 0 && rshift < 64) v += static_cast<int64_t>(1ull << (rshift - 1));
+                uint64_t narrowed;
+                if (src_signed) narrowed = static_cast<uint64_t>(v >> (rshift >= 64 ? 63 : rshift));
+                else            narrowed = static_cast<uint64_t>(v) >> (rshift >= 64 ? 63 : rshift);
+                if (saturating) {
+                    if (dst_signed) {
+                        const int64_t sv = static_cast<int64_t>(narrowed);
+                        narrowed = static_cast<uint64_t>(sv > smax ? smax : sv < smin ? smin : sv);
+                    } else if (src_signed) {                       // signed in, unsigned out
+                        const int64_t sv = static_cast<int64_t>(narrowed);
+                        narrowed = sv < 0 ? 0ull : (static_cast<uint64_t>(sv) > umax ? umax : static_cast<uint64_t>(sv));
+                    } else {
+                        if (narrowed > umax) narrowed = umax;
+                    }
+                }
+                set_velem(res, esize, (q ? nlanes : 0) + i, narrowed & emask);
+            }
+            vreg[rd] = res; return;
         }
     }
 

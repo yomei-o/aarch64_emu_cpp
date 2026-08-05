@@ -241,6 +241,12 @@ int64_t Files::write(int fd, const void* src, uint64_t len) {
 int64_t Files::lseek(int fd, int64_t off, int whence) {
     auto it = open_.find(fd);
     if (it == open_.end()) return kEBADF;
+    // A pipe cannot seek, and saying so matters twice over: ESPIPE is what a
+    // guest's "is this seekable?" probe expects (CPython asks before wrapping a
+    // subprocess pipe in a file object), and fseek(nullptr) - a pipe entry has
+    // no FILE* - is instant process death under MSVC's CRT, with no message.
+    if (it->second.pipe) return -29;                   // ESPIPE
+    if (it->second.is_directory || !it->second.fp) return -29;
     if (std::fseek(it->second.fp, static_cast<long>(off),
                    whence == 1 ? SEEK_CUR : whence == 2 ? SEEK_END : SEEK_SET) != 0)
         return kEINVAL;
@@ -250,6 +256,7 @@ int64_t Files::lseek(int fd, int64_t off, int whence) {
 int64_t Files::pread(int fd, void* dst, uint64_t len, uint64_t off) {
     auto it = open_.find(fd);
     if (it == open_.end()) return kEBADF;
+    if (it->second.pipe || !it->second.fp) return -29;  // ESPIPE (see lseek)
     const long save = std::ftell(it->second.fp);
     std::fseek(it->second.fp, static_cast<long>(off), SEEK_SET);
     const size_t got = std::fread(dst, 1, len, it->second.fp);

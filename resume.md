@@ -202,6 +202,15 @@ otherwise.
 Also: MSVC 19.31 could not build the journals (`vector<map<...,unique_ptr>>`
 picks the deleted copy on growth); `journals_` is a `std::list` now.
 
+And one bug this machine exposed in the *macOS* suite (2026-08-06): `lseek`
+on a pipe descriptor called `fseek(nullptr, ...)` - a pipe entry has no
+FILE* - which MSVC's CRT answers by killing the process, silently, exit 127.
+CPython's subprocess probes its pipes with lseek before wrapping them, so
+both fork/exec tests died with no output at all; on the g++ build the same
+UB happened to return -1 and nobody noticed. lseek and pread now answer
+ESPIPE for pipes (and directories), which is also simply the right answer.
+The suite is 8/8 again.
+
 ### gcc: works, end to end (2026-08-05, fifth pass)
 
 Alpine's aarch64 packages give a real toolchain with no Mac and no cross-compiler:

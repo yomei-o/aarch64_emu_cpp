@@ -73,13 +73,30 @@ were in the way are done, and the fourth needs a Mac for ten minutes.
       aarch64emu: unmapped read at 000000000000001C (--strict)
       _xpc_pipe_check_in_once  <- _xpc_pipe_routine <- bootstrap_look_up3
 
-  a **null XPC pipe**, because `bootstrap_look_up` of
-  `com.apple.system.notification_center` has no launchd to answer it. Permissive
-  memory reads the zero and carries on, which is exactly the failure mode `--strict`
-  exists to catch. So the next job is to make the bootstrap path fail *cleanly* --
-  a stand-in bootstrap server that answers "no such service" -- rather than hand
-  libxpc a pipe that is not there. Callers degrade gracefully on a real Mac when a
-  service is missing; they do not survive a null pipe.
+  a **null XPC pipe**, reached while `bootstrap_look_up` looks for
+  `com.apple.system.notification_center`. Permissive memory reads the zero and
+  carries on, which is exactly the failure mode `--strict` exists to catch.
+
+  What is known about it, so the next attempt starts further along:
+
+  - it happens **inside libSystem's own initializer** (`[init] 1/16`), not in
+    anything CPython does. libSystem brings up libdispatch, libxpc and libnotify,
+    and the ordering inside that is the guest's, not this loader's;
+  - `_xpc_interface_routine` loads the pipe from `[domain + 0x18]` and gets 0. It
+    reached that line by testing `[global + 0x10]` against -1 and finding something
+    else, which is its "we have a bootstrap" branch. The other branch returns 141
+    without touching a pipe, and is presumably what a process with no launchd takes;
+  - `_xpc_create_bootstrap_pipe` *does* eventually store a real pipe there
+    (0x18016DB24 writes it), just **later than the three uses that read zero** --
+    watch `[domain + 0x18]` and the order is plain;
+  - making MIG `task_get_special_port(TASK_BOOTSTRAP_PORT)` answer with the null
+    port was tried and changes **nothing**: the instruction count is identical to
+    the digit, so libxpc has not asked for it by this point and gets its idea of a
+    bootstrap from somewhere else. Finding *that* is the next move.
+
+  The goal is not to make XPC work — CPython does not need it — but to have libxpc
+  take the path it has for a process with no launchd. It survives a missing service
+  on a real Mac; it does not survive a null pipe.
 
   Still unanswered on this guest, in case one of them matters more than it looks:
   sysctl `{1,14,1,pid}` (KERN_PROC_PID, a kinfo_proc), and MIG routines
@@ -124,7 +141,8 @@ The tools built for this, all of which take addresses straight out of a trace:
                              [init]/[objc]/[call]/[thr]
     --sample N               print the PC every N instructions
     --watch LO:HI            log every guest access in a range, with the PC
-    --pcwatch ADDR           at a guest function's entry, x0..x5 and any string they point at
+    --pcwatch ADDR           at a guest function's entry: x0..x5 with any strings they
+                             point at, then x19..x28 and sp on a second line
     --dyld-sections          answer dyld's section-location API (see item 1; off by default)
     --setenv NAME=VALUE      extra guest environment, repeatable (for OBJC_PRINT_*)
     --macho-info FILE [sym…] what a Mach-O contains; look symbols up in its export trie

@@ -238,11 +238,35 @@ bool Syscalls::svc(uint32_t imm) {
         }
         case 79: {                                             // newfstatat
             uint8_t st[128];
-            r = files.stat_path(guest_str(a1), st);
+            const std::string path = guest_str(a1);
+            // AT_EMPTY_PATH (0x1000) with an empty path means "stat the fd
+            // itself" - it is how glibc's fstat() is spelled on aarch64.
+            // Statting "" as a path instead answered with the sysroot root
+            // directory, whose 4096-byte st_size made ld.so reject every
+            // ld.so.cache as truncated.
+            if (path.empty() && (a3 & 0x1000))
+                r = files.fstat(static_cast<int>(a0), st);
+            else
+                r = files.stat_path(path, st);
             if (r == 0) mem_.write_bytes(a2, st, sizeof st);
+            if (trace)
+                std::fprintf(stderr, "[sys]   fstatat(%lld, \"%s\") -> %lld\n",
+                             static_cast<long long>(static_cast<int64_t>(a0)), path.c_str(),
+                             static_cast<long long>(r));
             break;
         }
-        case 48: r = files.access(guest_str(a1)); break;        // faccessat
+        case 293:                                              // rseq: refused, glibc falls back
+            r = kENOSYS;
+            break;
+        case 439:                                              // faccessat2: flags add nothing here
+        case 48: {                                             // faccessat
+            const std::string path = guest_str(a1);
+            r = files.access(path);
+            if (trace)
+                std::fprintf(stderr, "[sys]   access(\"%s\") -> %lld\n", path.c_str(),
+                             static_cast<long long>(r));
+            break;
+        }
         case 17: {                                             // getcwd
             const std::string& d = files.cwd;
             if (a1 < d.size() + 1) { r = -34; break; }         // ERANGE
@@ -316,7 +340,7 @@ bool Syscalls::svc(uint32_t imm) {
             struct { char s[6][65]; } u{};
             std::snprintf(u.s[0], 65, "Linux");
             std::snprintf(u.s[1], 65, "aarch64emu");
-            std::snprintf(u.s[2], 65, "6.1.0");
+            std::snprintf(u.s[2], 65, "6.18.33.2-microsoft-standard-WSL2");
             std::snprintf(u.s[3], 65, "#1 SMP aarch64_emu_cpp");
             std::snprintf(u.s[4], 65, "aarch64");
             std::snprintf(u.s[5], 65, "(none)");

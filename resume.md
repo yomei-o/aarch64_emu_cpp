@@ -152,6 +152,56 @@ Every one of these failed *silently*:
 - **A thread is CLONE_VM *and* CLONE_THREAD.** musl's `posix_spawn` passes
   CLONE_VM|CLONE_VFORK, which is not a thread.
 
+### glibc's gcc too: Ubuntu jammy, real ld-linux-aarch64 (2026-08-05, night)
+
+Ubuntu 22.04's arm64 gcc-11 now compiles, links and the result runs, all inside
+the emulator, through the real `ld-linux-aarch64.so.1` and glibc 2.35 — and
+`gcc -S -O2` output is byte-identical to qemu-aarch64 running the same gcc.
+The sysroot is 33 jammy/jammy-updates arm64 .debs (gcc-11, binutils, libc6(-dev),
+libgcc-11-dev, gmp/mpfr/mpc/isl, zlib/zstd + the sanitizer runtimes), `dpkg -x`'d
+in WSL, **every symlink replaced by a copy** (a WSL symlink on /mnt/c reads as
+EINVAL from Windows), plus the host's `/etc/ld.so.cache` copied in and copies of
+libc.so.6/libm.so.6 in `lib/aarch64-linux-gnu/` as well as `usr/lib/...`.
+
+Five emulator bugs stood in the way; each failed silently and each was found by
+the qemu-diff method the x86 sibling built the same night (see its
+tools/qemu-diff; here the producer is `A64EMU_TRACE_RANGE=lo:hi:bias` +
+`A64EMU_TRACE_OUT=`, tracing only ld.so's range, rebased so both runs compare
+as offsets):
+
+1. **fstatat(fd, "", AT_EMPTY_PATH) statted the sysroot root** instead of the
+   fd — and on aarch64 that IS glibc's fstat(). Every library ld.so mapped was
+   told it was 4096 bytes long: ld.so.cache "truncated", version tables
+   garbage, `libc.so.6` matching the soname of the first library loaded (so
+   cc1's deps all aliased to libisl), `__libc_single_threaded` unresolvable.
+   One wrong stat, four unrelated-looking symptoms.
+2. **The modified-immediate group executed ORR/BIC (vector, immediate) as
+   MOVI/MVNI**, replacing glibc strlen's NUL mask with a constant: every
+   strlen answered 2 short, and gcc's driver built search paths like
+   `/usr/lib/gcc/aarch64-linux-gnu/1` ("11/" minus its last two bytes) and
+   exec'd a cc1 that did not exist. MSL (shifting-ones) and the FMOV
+   immediates were also wrong-shaped; the block now follows AdvSIMDExpandImm.
+3. **ADDP (vector) was missing** — glibc's ld.so uses it in strnlen before
+   relocation. SMAXP/SMINP/UMAXP/UMINP came along.
+4. **MUL/MLA/MLS by indexed element were missing** (gcc 11 vectorises its own
+   ira pass with `mul v7.4s, v3.4s, v1.s[0]`), and **scalar SSHR** (the
+   0x5F-prefixed shift-immediate sibling) and **SHLL/SHLL2**, both from cc1's
+   -O2-compiled loops.
+5. **faccessat answered EACCES for a missing file** (ENOENT now), and
+   faccessat2 (439) and rseq (293 → ENOSYS) are answered.
+
+Alignment lessons for the diff (all in the x86 notes too, but two are new):
+the guest auxv now matches qemu's exactly — order, AT_FLAGS/AT_HWCAP2/
+AT_PLATFORM, and **AT_HWCAP=0x8fb, a Cortex-A53's** (matching
+`qemu-aarch64 -cpu cortex-a53`, the reference configuration: the default qemu
+CPU advertises SVE, which this emulator does not have) — and uname's release
+string matches the WSL host's, because glibc *parses* it digit by digit.
+`_dl_discover_osversion` and the tunables env walk both show up as divergences
+otherwise.
+
+Also: MSVC 19.31 could not build the journals (`vector<map<...,unique_ptr>>`
+picks the deleted copy on growth); `journals_` is a `std::list` now.
+
 ### gcc: works, end to end (2026-08-05, fifth pass)
 
 Alpine's aarch64 packages give a real toolchain with no Mac and no cross-compiler:

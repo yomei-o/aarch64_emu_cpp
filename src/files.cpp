@@ -355,8 +355,11 @@ int64_t Files::rename(const std::string& from, const std::string& to) {
 }
 
 int64_t Files::access(const std::string& path) {
+    // A missing file is ENOENT, not EACCES: a guest distinguishes "not there"
+    // from "forbidden" - gcc probes its search path with access() and treats
+    // the two differently.
     std::error_code ec;
-    return std::filesystem::exists(host_path(path), ec) ? 0 : kEACCES;
+    return std::filesystem::exists(host_path(path), ec) ? 0 : kENOENT;
 }
 
 }  // namespace a64

@@ -36,9 +36,10 @@ constexpr uint32_t PT_LOAD = 1, PT_INTERP = 3, PT_TLS = 7;
 
 // Auxiliary vector keys a libc startup actually reads.
 constexpr uint64_t AT_NULL = 0, AT_PHDR = 3, AT_PHENT = 4, AT_PHNUM = 5,
-                   AT_PAGESZ = 6, AT_BASE = 7, AT_ENTRY = 9, AT_UID = 11,
-                   AT_EUID = 12, AT_GID = 13, AT_EGID = 14, AT_HWCAP = 16,
-                   AT_CLKTCK = 17, AT_RANDOM = 25, AT_SECURE = 23, AT_EXECFN = 31;
+                   AT_PAGESZ = 6, AT_BASE = 7, AT_FLAGS = 8, AT_ENTRY = 9,
+                   AT_UID = 11, AT_EUID = 12, AT_GID = 13, AT_EGID = 14,
+                   AT_PLATFORM = 15, AT_HWCAP = 16, AT_CLKTCK = 17,
+                   AT_SECURE = 23, AT_RANDOM = 25, AT_HWCAP2 = 26, AT_EXECFN = 31;
 
 }  // namespace
 
@@ -119,15 +120,24 @@ uint64_t build_stack(Memory& mem, uint64_t stack_top, const LoadedImage& img,
     mem.write_bytes(p, rnd, sizeof rnd);
 
     const uint64_t execfn = argp.empty() ? 0 : argp[0];
+    const uint64_t platform = push_str("aarch64");
 
+    // The same entries a Linux kernel pushes, in qemu-aarch64's order, so a
+    // qemu run stays instruction-comparable through ld.so's auxv walk.  HWCAP
+    // is a Cortex-A53's (fp asimd evtstrm aes pmull sha1 sha2 crc32 cpuid):
+    // every feature it names is implemented - crypto.cpp for the AES/SHA
+    // group, kMIDR for the cpuid trap - and nothing newer (no LSE bit even
+    // though LSE exists here, because qemu -cpu cortex-a53, the reference,
+    // reports none).  glibc's ld.so picks its IFUNCs from this word; 0x3 made
+    // it take paths no real system takes.
     std::vector<std::pair<uint64_t, uint64_t>> aux = {
         {AT_PHDR, img.phdr_addr}, {AT_PHENT, img.phent}, {AT_PHNUM, img.phnum},
-        {AT_PAGESZ, 4096}, {AT_BASE, interp_base}, {AT_ENTRY, img.entry},
-        {AT_UID, 1000}, {AT_EUID, 1000}, {AT_GID, 1000}, {AT_EGID, 1000},
-        {AT_SECURE, 0}, {AT_CLKTCK, 100},
-        // FP and ASIMD present. A libc reads this to pick memcpy variants; claiming
-        // nothing is not safer, it just selects the byte-at-a-time paths.
-        {AT_HWCAP, 0x3}, {AT_RANDOM, random_addr}, {AT_EXECFN, execfn},
+        {AT_PAGESZ, 4096}, {AT_BASE, interp_base}, {AT_FLAGS, 0},
+        {AT_ENTRY, img.entry},
+        {AT_UID, 0}, {AT_EUID, 0}, {AT_GID, 0}, {AT_EGID, 0},
+        {AT_HWCAP, 0x8fb}, {AT_CLKTCK, 100},
+        {AT_RANDOM, random_addr}, {AT_SECURE, 0}, {AT_EXECFN, execfn},
+        {AT_HWCAP2, 0}, {AT_PLATFORM, platform},
         {AT_NULL, 0},
     };
 

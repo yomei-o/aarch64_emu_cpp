@@ -188,6 +188,35 @@ void Cpu::step() {
 
     if (pc_watch && pc == pc_watch && on_pc_watch) on_pc_watch();
 
+    // A64EMU_TRACE_RANGE=lo:hi:bias appends (pc - bias) as 8 raw bytes to
+    // A64EMU_TRACE_OUT for every instruction executed inside [lo, hi) - the
+    // producer half of a qemu-diff (see the x86 sibling's tools/qemu-diff).
+    {
+        struct RangeTrace {
+            uint64_t lo = 0, hi = 0, bias = 0;
+            std::FILE* out = nullptr;
+            RangeTrace() {
+                const char* spec = std::getenv("A64EMU_TRACE_RANGE");
+                const char* path = std::getenv("A64EMU_TRACE_OUT");
+                if (!spec || !path) return;
+                char* end = nullptr;
+                lo = std::strtoull(spec, &end, 16);
+                if (end && *end == ':') hi = std::strtoull(end + 1, &end, 16);
+                if (end && *end == ':') bias = std::strtoull(end + 1, nullptr, 16);
+                if (hi > lo) out = std::fopen(path, "wb");
+            }
+            ~RangeTrace() {
+                if (out) std::fclose(out);
+            }
+        };
+        static RangeTrace rt;
+        if (rt.out && pc >= rt.lo && pc < rt.hi) {
+            const uint64_t rebased = pc - rt.bias;
+            std::fwrite(&rebased, 8, 1, rt.out);
+            if ((insns & 0xFFFF) == 0) std::fflush(rt.out);
+        }
+    }
+
     cur_pc_ = pc;
     const uint32_t insn = mem_.read<uint32_t>(pc);
     pc += 4;

@@ -170,6 +170,42 @@ void Cpu::exec_fp_simd(uint32_t insn) {
         return;
     }
 
+    // ---- Advanced SIMD vector x indexed element: MUL / MLA / MLS ----------------
+    // One lane of Vm multiplies every lane of Vn.  gcc 11's vectoriser emits
+    // `mul v7.4s, v3.4s, v1.s[0]` inside cc1's own code (the ira pass), which
+    // is how the group earned its place; the FP and widening forms still fail
+    // loudly below.
+    if ((insn & 0x9F000400u) == 0x0F000000u) {
+        const bool q = (insn >> 30) & 1, u = (insn >> 29) & 1;
+        const unsigned size = (insn >> 22) & 3;
+        const unsigned L = (insn >> 21) & 1, M = (insn >> 20) & 1, rm4 = (insn >> 16) & 0xF;
+        const unsigned opcode = (insn >> 12) & 0xF, H = (insn >> 11) & 1;
+        const unsigned rn = (insn >> 5) & 0x1F, rd = insn & 0x1F;
+        const bool mul = (opcode == 0x8 && !u), mla = (opcode == 0x0 && u),
+                   mls = (opcode == 0x4 && u);
+        if ((mul || mla || mls) && (size == 1 || size == 2)) {
+            unsigned index, vm;
+            if (size == 1) { index = (H << 2) | (L << 1) | M; vm = rm4; }
+            else { index = (H << 1) | L; vm = (M << 4) | rm4; }
+            const unsigned esize = 1u << size;
+            const unsigned lanes = (q ? 16u : 8u) / esize;
+            const uint64_t emask = (1ull << (esize * 8)) - 1;
+            const uint64_t e = velem(vreg[vm], esize, index);
+            V128 out{};
+            for (unsigned i = 0; i < lanes; ++i) {
+                const uint64_t x = velem(vreg[rn], esize, i);
+                const uint64_t acc = velem(vreg[rd], esize, i);
+                const uint64_t r = mul ? x * e : mla ? acc + x * e : acc - x * e;
+                set_velem(out, esize, i, r & emask);
+            }
+            if (!q) out.hi = 0;
+            vreg[rd] = out;
+            return;
+        }
+        // Anything else in the group (FMLA/FMUL by element, the widening
+        // forms) falls through to the failure at the end.
+    }
+
     // ---- Advanced SIMD, three registers of the same shape ----------------------
     if ((insn & 0x9F200400u) == 0x0E200400u) {
         const bool q = (insn >> 30) & 1, u = (insn >> 29) & 1;
@@ -208,6 +244,34 @@ void Cpu::exec_fp_simd(uint32_t insn) {
             const uint64_t s = 1ull << (esize * 8 - 1);
             return static_cast<int64_t>((e ^ s) - s);
         };
+
+        // The pairwise integer ops read lanes across the *concatenation* of the
+        // two sources, so they do not fit the per-lane loop below.  ADDP is how
+        // glibc's aarch64 strlen narrows a comparison mask.
+        if (opcode == 0x17 || opcode == 0x14 || opcode == 0x15) {  // ADDP, SMAXP/UMAXP, SMINP/UMINP
+            if (opcode == 0x17 && u) fail("three-same opcode 0x17 with U set", insn);
+            V128 pout{};
+            for (unsigned i = 0; i < lanes; ++i) {
+                const bool from_b = (2 * i) >= lanes;
+                const V128& src = from_b ? b : a;
+                const unsigned base = from_b ? 2 * i - lanes : 2 * i;
+                const uint64_t x = velem(src, esize, base), y = velem(src, esize, base + 1);
+                uint64_t r;
+                if (opcode == 0x17)
+                    r = x + y;
+                else if (opcode == 0x14)
+                    r = u ? (x > y ? x : y)
+                          : static_cast<uint64_t>(sx(x) > sx(y) ? sx(x) : sx(y));
+                else
+                    r = u ? (x < y ? x : y)
+                          : static_cast<uint64_t>(sx(x) < sx(y) ? sx(x) : sx(y));
+                set_velem(pout, esize, i, r & emask);
+            }
+            if (!q) pout.hi = 0;
+            vreg[rd] = pout;
+            return;
+        }
+
         V128 out{};
         bool ok = true;
         for (unsigned i = 0; i < lanes && ok; ++i) {
@@ -453,6 +517,18 @@ void Cpu::exec_fp_simd(uint32_t insn) {
                 const uint64_t acc = (opcode == 0x06) ? velem(out, esize * 2, i) : 0;
                 set_velem(out, esize * 2, i, acc + sum);
             }
+            vreg[rd] = out; return;
+        }
+        // SHLL / SHLL2: widen the low (or, with Q, high) half and shift each
+        // element left by exactly its old width.  gcc's vectorised loops pair
+        // it with UXTL to spread 32-bit counters into 64-bit accumulators.
+        if (u && opcode == 0x13 && size != 3) {
+            const unsigned nlanes = 8u / esize;
+            const unsigned base = q ? nlanes : 0;
+            V128 out{};
+            for (unsigned i = 0; i < nlanes; ++i)
+                set_velem(out, esize * 2, i,
+                          velem(vreg[rn], esize, base + i) << (esize * 8));
             vreg[rd] = out; return;
         }
         // The compares against zero. The opcode/U table, verified against a
@@ -713,27 +789,60 @@ void Cpu::exec_fp_simd(uint32_t insn) {
         }
     }
 
-    // ---- MOVI / MVNI -----------------------------------------------------------
+    // ---- MOVI / MVNI / ORR / BIC (vector, immediate) ----------------------------
+    // One encoding group, four operations: cmode<0> with a 32- or 16-bit shifted
+    // immediate selects ORR (op=0) or BIC (op=1) *onto the existing register*,
+    // which the first version of this block executed as MOVI/MVNI - replacing
+    // glibc strlen's NUL mask with a constant, so every strlen came out short.
     if ((insn & 0x9FF80400u) == 0x0F000400u) {
         const bool q = (insn >> 30) & 1, op = (insn >> 29) & 1;
         const unsigned cmode = (insn >> 12) & 0xF, rd = insn & 0x1F;
         const uint64_t imm8 = (((insn >> 16) & 7) << 5) | ((insn >> 5) & 0x1F);
         uint64_t imm64 = 0;
-        if ((cmode & 0xE) == 0xE && op) {                       // MOVI Dd, #imm: bit per byte
-            for (int i = 0; i < 8; ++i) if ((imm8 >> i) & 1) imm64 |= 0xFFull << (i * 8);
-        } else if ((cmode & 0xE) == 0xE) {                      // 8-bit replicate
-            for (int i = 0; i < 8; ++i) imm64 |= imm8 << (i * 8);
-        } else if ((cmode & 0x8) == 0) {                        // 32-bit, shifted
-            uint64_t v32 = imm8 << (((cmode >> 1) & 3) * 8);
-            if (cmode & 1) v32 = ~v32 & 0xFFFFFFFFull;
-            v32 &= 0xFFFFFFFFull;
+        bool logical = false;  // ORR/BIC rather than MOVI/MVNI
+        bool invert = op;      // MVNI / BIC complement the expanded immediate
+        if ((cmode & 0x8) == 0) {                               // 32-bit, shifted
+            uint64_t v32 = (imm8 << (((cmode >> 1) & 3) * 8)) & 0xFFFFFFFFull;
             imm64 = v32 | (v32 << 32);
-        } else {                                                // 16-bit, shifted
+            logical = (cmode & 1) != 0;
+        } else if ((cmode & 0xC) == 0x8) {                      // 16-bit, shifted
             const uint64_t v16 = (imm8 << (((cmode >> 1) & 1) * 8)) & 0xFFFF;
             for (int i = 0; i < 4; ++i) imm64 |= v16 << (i * 16);
+            logical = (cmode & 1) != 0;
+        } else if ((cmode & 0xE) == 0xC) {                      // 32-bit, shifting ones (MSL)
+            const unsigned sh = (cmode & 1) ? 16 : 8;
+            uint64_t v32 = ((imm8 << sh) | ((1ull << sh) - 1)) & 0xFFFFFFFFull;
+            imm64 = v32 | (v32 << 32);
+        } else if (cmode == 0xE && op) {                        // MOVI Dd/2D: bit per byte
+            for (int i = 0; i < 8; ++i) if ((imm8 >> i) & 1) imm64 |= 0xFFull << (i * 8);
+            invert = false;
+        } else if (cmode == 0xE) {                              // 8-bit replicate
+            for (int i = 0; i < 8; ++i) imm64 |= imm8 << (i * 8);
+        } else {                                                // cmode 0xF: FMOV immediate
+            if (op && !q) fail("reserved modified-immediate form", insn);
+            const uint64_t s = imm8 >> 7, b6 = (imm8 >> 6) & 1;
+            if (op) {                                           // FMOV Vd.2D (VFPExpandImm 64)
+                imm64 = (s << 63) | ((b6 ^ 1) << 62) |
+                        ((b6 ? 0xFFull : 0) << 54) | ((imm8 & 0x3F) << 48);
+            } else {                                            // FMOV Vd.<T>s (VFPExpandImm 32)
+                const uint32_t v32 = static_cast<uint32_t>(
+                    (s << 31) | ((b6 ^ 1) << 30) | ((b6 ? 0x1Fu : 0) << 25) |
+                    ((imm8 & 0x3F) << 19));
+                imm64 = (static_cast<uint64_t>(v32) << 32) | v32;
+            }
+            invert = false;
         }
-        if (op && (cmode & 0xE) != 0xE) imm64 = ~imm64;         // MVNI
-        vreg[rd] = {imm64, q ? imm64 : 0};
+        if (invert && !logical) imm64 = ~imm64;                 // MVNI
+        V128 out;
+        if (logical) {
+            const V128 d = vreg[rd];
+            if (op) out = {d.lo & ~imm64, d.hi & ~imm64};       // BIC
+            else out = {d.lo | imm64, d.hi | imm64};            // ORR
+        } else {
+            out = {imm64, imm64};
+        }
+        if (!q) out.hi = 0;
+        vreg[rd] = out;
         return;
     }
 
@@ -741,7 +850,10 @@ void Cpu::exec_fp_simd(uint32_t insn) {
     // immh is doing double duty: it selects the element size *and* carries the top
     // of the shift amount. immh == 0 is the MOVI group above, which is why that has
     // to be tested first.
-    if ((insn & 0x9F800400u) == 0x0F000400u && ((insn >> 19) & 0xF) != 0) {
+    if (((insn & 0x9F800400u) == 0x0F000400u ||
+         (insn & 0xDF800400u) == 0x5F000400u) &&                // the scalar sibling (SSHR Dd, Dn, #n)
+        ((insn >> 19) & 0xF) != 0) {
+        const bool scalar = ((insn >> 28) & 1) != 0;
         const bool q = (insn >> 30) & 1, u = (insn >> 29) & 1;
         const unsigned immh = (insn >> 19) & 0xF, immb = (insn >> 16) & 7;
         const unsigned opcode = (insn >> 11) & 0x1F;
@@ -751,6 +863,10 @@ void Cpu::exec_fp_simd(uint32_t insn) {
         const unsigned esize = 1u << size;
         const unsigned bits = esize * 8;
         const unsigned imm = (immh << 3) | immb;
+        // Scalar covers only the plain shift family here; the saturating
+        // narrows and widening forms keep failing loudly until needed.
+        if (scalar && !(opcode <= 0x06 || opcode == 0x08 || opcode == 0x0A))
+            fail("unimplemented scalar shift-immediate form", insn);
 
         if (opcode == 0x14) {                                   // SSHLL / USHLL (and SXTL)
             const unsigned shift = imm - bits;
@@ -764,7 +880,7 @@ void Cpu::exec_fp_simd(uint32_t insn) {
             }
             vreg[rd] = out; return;
         }
-        const unsigned lanes = (q ? 16u : 8u) / esize;
+        const unsigned lanes = scalar ? 1u : (q ? 16u : 8u) / esize;
         V128 out{};
         if (opcode == 0x0A) {                                   // SHL
             const unsigned shift = imm - bits;

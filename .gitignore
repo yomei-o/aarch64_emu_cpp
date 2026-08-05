@@ -41,3 +41,8 @@ tests/dylib/*.actual
 tests/dylib/cerr3
 # Downloaded Alpine .apk cache for the gcc toolchain (resume.md has the list).
 .gcc/
+
+# glibc gcc sysroot (Ubuntu jammy arm64 debs, see resume.md) and qemu-diff files
+/glibcroot/
+/ours_ld.bin
+/qemu_ld_off.seq

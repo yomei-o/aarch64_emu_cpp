@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <string>
@@ -193,8 +194,10 @@ public:
 
 private:
     std::unordered_map<uint64_t, std::unique_ptr<uint8_t[]>> pages_;
-    // One undo log per open journal; see begin_journal().
-    std::vector<std::map<uint64_t, std::unique_ptr<uint8_t[]>>> journals_;
+    // One undo log per open journal; see begin_journal().  A list, not a
+    // vector: growing a vector moves the maps, and MSVC 19.31 resolves
+    // move_if_noexcept on std::map to the (deleted, unique_ptr) copy.
+    std::list<std::map<uint64_t, std::unique_ptr<uint8_t[]>>> journals_;
     uint64_t cache_vpn_ = ~0ull;
     uint8_t* cache_ = nullptr;
 };

@@ -180,5 +180,31 @@ else
     echo "skip macos files (no $F -- run: sh guests/macos/build.sh files)"
 fi
 
+# ---- the stock macOS CPython --------------------------------------------------
+#
+# Apple's own build, against Apple's own libraries, and the one macOS guest with a
+# *real* oracle: the host's Python computes the same digest from the same bytes.
+# A digest is the strongest single check there is -- every byte travels through the
+# emulated CPU, and one wrong bit anywhere in six hundred million instructions
+# changes the answer.
+#
+# `--dyld-sections` is not optional here. Without it libobjc never reads the shared
+# cache's preoptimized class tables, and libxpc fails its own type check long before
+# Python starts.
+#
+# Skipped without the guest tree: `sh prebuilt/unpack.sh python` puts it there.
+P=guests/macos_py/install/bin/python3.13
+if [ -f "$P" ] && command -v python >/dev/null 2>&1; then
+    code="import sys, platform, hashlib
+print(sys.version.split()[0], platform.machine(), sys.platform)
+print(hashlib.sha256(b'aarch64_emu_cpp').hexdigest())"
+    want="3.13.14 arm64 darwin
+$(python -c "import hashlib; print(hashlib.sha256(b'aarch64_emu_cpp').hexdigest())" | tr -d '\015')"
+    got=$($EMU --dyld-sections --root guests/macos_py "$P" -c "$code" 2>/dev/null | tr -d '\015')
+    check "macos cpython (sha256 against the host's)" "$want" "$got"
+else
+    echo "skip macos cpython (no $P -- run: sh prebuilt/unpack.sh python)"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -55,6 +55,38 @@ pointers it unpacked from the slide information, which libraries had none, what 
 declined to follow. `resume.md` records the several ways a naive extraction goes wrong
 while looking like it worked.
 
+## The Python set
+
+`macos-python-3.13.14-arm64.tar.xz.aa` and `.ab` are the second guest: Apple-built
+CPython 3.13.14 for `aarch64-apple-darwin` (from python-build-standalone, which needs
+no Mac to download) together with the 141-library closure it needs -- CoreFoundation,
+Foundation, SystemConfiguration, libncurses, libpanel, libedit, libz and everything
+under them.
+
+    sh prebuilt/unpack.sh python
+    ./aarch64emu --dyld-sections --root guests/macos_py         guests/macos_py/install/bin/python3.13 -c 'print(1+1)'
+
+Two things about the packaging are deliberate.
+
+**It is split**, because xz gets the tree to 64 MB and GitHub warns above 50 MB for a
+single file. `unpack.sh` joins the parts and checksums the *joined* archive, so a
+missing part and a corrupt part fail the same way.
+
+**The symbol tables are cleared**, by `tools/strip_syms.py`, which is 29 MB of the
+uncompressed tree. A shared cache keeps one symbol table for the whole system, so
+every extracted library carries its own copy of the names it needs. Nothing at run
+time reads them -- binding goes through the export trie -- with three exceptions the
+tool leaves alone, because the emulator looks up private symbols in them:
+libdyld (`dyld4::gAPIs`), libsystem_kernel (`bootstrap_port`) and libSystem (`_exit`).
+The check that this is inert is the one this project uses for everything: the guests
+run the same number of instructions, to the instruction, before and after.
+
+`tools/whichlib.py` and `tools/dis_macho.py` name an address by its nearest symbol, so
+a stripped tree is worse to debug in. Re-extract on a Mac when that matters.
+
+The guest tree lives under `/install` because that is the prefix
+python-build-standalone is compiled with, and CPython finds its standard library by it.
+
 ## What these files are not
 
 They are Apple's, taken from an installed copy of macOS. They are here because moving

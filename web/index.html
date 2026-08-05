@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>aarch64_emu_cpp — an ARM64 Linux binary in your browser</title>
+<title>aarch64_emu_cpp — ARM64 Linux and macOS binaries in your browser</title>
 <style>
   :root { color-scheme: light dark; --bg:#10131a; --panel:#181d28; --fg:#e6ebf5; --dim:#8b95ad;
           --acc:#63b3ed; --ok:#68d391; --line:#262d3d; }
@@ -35,11 +35,27 @@
 <body>
 <div class="wrap">
   <h1>aarch64_emu_cpp</h1>
-  <p class="sub">An AArch64 Linux executable, interpreted instruction by instruction, in this tab.
-     The emulator is C++17 compiled to WebAssembly; the guest is real ARM64 machine code.
-     Nothing is uploaded.</p>
+  <p class="sub">Real ARM64 machine code — Linux and macOS — interpreted instruction by
+     instruction in this tab. The emulator is C++17 compiled to WebAssembly. Nothing is
+     uploaded.</p>
 
   <div id="status">loading the emulator…</div>
+
+  <div class="mac">
+    <b>ARM64 Linux, three ways.</b>
+    <span style="font-size:12.5px;color:var(--dim)">A freestanding static ELF; Alpine's
+    <code>busybox</code>, a binary that has never heard of this emulator; and a stock
+    CPython 3.13.14 for <code>aarch64-unknown-linux-musl</code> that is
+    <b>dynamically linked</b> &mdash; the guest's own <code>ld.so</code> does the
+    relocation and symbol binding, so what runs is the real loader rather than a
+    reimplementation. A 22 MB fetch.</span>
+    <div class="row">
+      <button id="lxhello" class="ghost">hello.elf</button>
+      <button id="lxbusybox" class="ghost">busybox sha256sum</button>
+      <button id="lxpython">Linux CPython</button>
+      <span id="lxstatus" style="color:var(--dim);font-size:13px"></span>
+    </div>
+  </div>
 
   <div class="mac">
     <b>Or run a real macOS program.</b>
@@ -59,7 +75,7 @@
     <span style="font-size:12.5px;color:var(--dim)">The stock
     <code>aarch64-apple-darwin</code> build of Python 3.13.14, on Apple's CoreFoundation,
     Foundation and the 141 libraries under them. It prints a SHA-256 you can check against
-    your own Python. A 95 MB fetch and about ten seconds of interpreting &mdash; every byte
+    your own Python. A 93 MB fetch and about five seconds of interpreting &mdash; every byte
     of the digest travels through the emulated CPU, so one wrong bit anywhere in seventy
     million instructions changes the answer.</span>
     <div class="row">
@@ -226,58 +242,15 @@ function untar(buf) {
 }
 
 let macReady = false;
-async function fetchMacosGuest() {
-  const res = await fetch('macos-hello.tar.gz');
-  if (!res.ok) throw new Error('cannot fetch macos-hello.tar.gz (' + res.status + ')');
-  const total = Number(res.headers.get('content-length')) || 0;
-  // Read the compressed bytes ourselves rather than piping straight into the
-  // decompressor, so the download has a progress figure: 26 MB with no feedback
-  // looks like nothing is happening.
-  const chunks = [];
-  let got = 0;
-  const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value); got += value.length;
-    $('macstatus').textContent = total
-      ? `downloading ${(got / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`
-      : `downloading ${(got / 1048576).toFixed(1)} MB`;
-  }
-  $('macstatus').textContent = 'decompressing…';
-  const gz = new Blob(chunks);
-  const stream = gz.stream().pipeThrough(new DecompressionStream('gzip'));
-  const buf = new Uint8Array(await new Response(stream).arrayBuffer());
-  $('macstatus').textContent = 'unpacking…';
-  const n = untar(buf);
-  macReady = true;
-  return n;
-}
-
 $('macrun').onclick = async () => {
   $('macrun').disabled = true;
   try {
     if (!macReady) {
-      const n = await fetchMacosGuest();
+      const n = await fetchGuest(['macos-hello.tar.gz'], $('macstatus'), 26);
       $('macstatus').textContent = n + ' files in the virtual filesystem';
+      macReady = true;
     }
-    pending = '';
-    $('macstatus').textContent = 'running…';
-    await new Promise(r => setTimeout(r, 20));
-    const argz = '/hello\0\0';
-    const nb = M.lengthBytesUTF8(argz) + 1, bp = M._malloc(nb);
-    M.stringToUTF8(argz, bp, nb);
-    const pp = cstr('/hello'), rp = cstr('');
-    const t0 = performance.now();
-    const rc = M._emu_run(pp, bp, rp, 0);
-    const ms = performance.now() - t0;
-    const insns = M._emu_instructions();
-    M._free(bp); M._free(pp); M._free(rp);
-    let text = pending || '(no output)';
-    if (rc !== 0) text += '\n[exit ' + rc + '] ' + M.UTF8ToString(M._emu_error());
-    $('out').textContent = text;
-    $('macstatus').textContent =
-      `${insns.toLocaleString()} instructions of Apple's own arm64 code in ${ms.toFixed(0)} ms`;
+    await runGuest('/hello', [], $('macstatus'));
   } catch (e) {
     $('macstatus').textContent = 'failed: ' + e.message;
   }
@@ -333,31 +306,67 @@ $('pyrun').onclick = async () => {
       $('pystatus').textContent = n + ' files in the virtual filesystem';
       pyReady = true;
     }
-    pending = '';
-    $('pystatus').textContent = 'running\u2026';
-    await new Promise(r => setTimeout(r, 20));
-    // NUL-separated argv, so the code can contain spaces and quotes without a parser.
-    const prog = '/install/bin/python3.13';
-    const argz = prog + '\0-c\0' + $('pycode').value + '\0\0';
-    const nb = M.lengthBytesUTF8(argz) + 1, bp = M._malloc(nb);
-    M.stringToUTF8(argz, bp, nb);
-    const pp = cstr(prog), rp = cstr('');
-    const t0 = performance.now();
-    const rc = M._emu_run(pp, bp, rp, 0);
-    const ms = performance.now() - t0;
-    const insns = M._emu_instructions();
-    M._free(bp); M._free(pp); M._free(rp);
-    let text = pending || '(no output)';
-    if (rc !== 0) text += '\n[exit ' + rc + '] ' + M.UTF8ToString(M._emu_error());
-    $('out').textContent = text;
-    $('pystatus').textContent =
-      insns.toLocaleString() + ' instructions in ' + ms.toFixed(0) + ' ms ' +
-      '(' + (insns / ms / 1000).toFixed(1) + 'M/s)';
+    await runGuest('/install/bin/python3.13', ['-c', $('pycode').value], $('pystatus'));
   } catch (e) {
     $('pystatus').textContent = 'failed: ' + e.message;
   }
   $('pyrun').disabled = false;
 };
+
+// ---- the Linux guests ------------------------------------------------------
+//
+// One tarball for all three, because the interesting one -- CPython -- needs the
+// musl loader and the whole standard library anyway, and the other two are a
+// rounding error beside it.
+let lxReady = false;
+async function ensureLinux() {
+  if (lxReady) return;
+  const n = await fetchGuest(['linux-guests.tar.gz'], $('lxstatus'), 22);
+  $('lxstatus').textContent = n + ' files in the virtual filesystem';
+  lxReady = true;
+}
+
+// Shared by every button here and by the macOS ones: set up argv, run, and report
+// what it cost. `emu_run` is synchronous and can take seconds, so the status line is
+// painted and the call deferred a frame -- otherwise the page shows "running…" only
+// after it has finished running.
+async function runGuest(prog, args, status) {
+  pending = '';
+  status.textContent = 'running\u2026';
+  await new Promise(r => setTimeout(r, 20));
+  const argz = [prog, ...args].join('\0') + '\0\0';
+  const nb = M.lengthBytesUTF8(argz) + 1, bp = M._malloc(nb);
+  M.stringToUTF8(argz, bp, nb);
+  const pp = cstr(prog), rp = cstr('');
+  const t0 = performance.now();
+  const rc = M._emu_run(pp, bp, rp, 0);
+  const ms = performance.now() - t0;
+  const insns = M._emu_instructions();
+  M._free(bp); M._free(pp); M._free(rp);
+  let text = pending || '(no output)';
+  if (rc !== 0) text += '\n[exit ' + rc + '] ' + M.UTF8ToString(M._emu_error());
+  $('out').textContent = text;
+  status.textContent = insns.toLocaleString() + ' instructions in ' + ms.toFixed(0) +
+                       ' ms (' + (insns / ms / 1000).toFixed(1) + 'M/s)';
+}
+
+function linuxButton(id, prog, args) {
+  $(id).onclick = async () => {
+    $(id).disabled = true;
+    try {
+      await ensureLinux();
+      await runGuest(prog, args, $('lxstatus'));
+    } catch (e) {
+      $('lxstatus').textContent = 'failed: ' + e.message;
+    }
+    $(id).disabled = false;
+  };
+}
+linuxButton('lxhello', '/hello.elf', []);
+linuxButton('lxbusybox', '/busybox', ['sha256sum', '/hello.elf']);
+linuxButton('lxpython', '/opt/python/bin/python3.13',
+            ['-c', "import sys, hashlib\nprint(sys.version.split()[0], sys.platform)\n" +
+                   "print(hashlib.sha256(b'aarch64_emu_cpp').hexdigest())"]);
 
 function cstr(s) {
   const n = M.lengthBytesUTF8(s) + 1, p = M._malloc(n);

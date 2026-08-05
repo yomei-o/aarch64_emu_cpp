@@ -126,7 +126,13 @@ exactly when `imms >= immr`.)
 
 ### ▶ [Live demo](https://yomei-o.github.io/aarch64_emu_cpp/)
 
-Two buttons.
+Five guests, on one page.
+
+**ARM64 Linux** — a freestanding static ELF; Alpine's `busybox`, a binary that has
+never heard of this emulator; and a stock CPython 3.13.14 for
+`aarch64-unknown-linux-musl` that is **dynamically linked**, so the guest's own
+`ld.so` does the relocation and symbol binding and what runs is the real loader. A
+22 MB fetch.
 
 **`hello from real macOS`** — a stock arm64 Mach-O against Apple's own libSystem,
 libobjc, libxpc, libdispatch and libcorecrypto, 46 libraries out of a Mac's dyld shared

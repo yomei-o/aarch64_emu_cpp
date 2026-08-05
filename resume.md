@@ -9,7 +9,7 @@ Working notes for picking the project back up. The README says what the emulator
 
     git pull
     sh build.sh
-    sh prebuilt/unpack.sh                # 48 macOS libraries, 21 MB packed
+    sh prebuilt/unpack.sh                # both macOS guest trees, 88 MB packed
     ./aarch64emu --root guests/macos guests/macos/hello
 
 **That prints `hello from real macOS`.** 199,279 instructions of Apple's own arm64 code, from
@@ -22,111 +22,84 @@ that flushes stdio, and without which the program printed nothing at all.
 
 The macOS milestone is **met**. What is left on that side is breadth rather than a wall.
 
-**Pick up here (2026-08-05, second pass).** The goal now has a name: **run the stock
-macOS CPython, and then put it in the browser demo.** Three of the four things that
-were in the way are done, and the fourth needs a Mac for ten minutes.
+**Where this is (2026-08-05, third pass).** The goal it was aimed at is met:
 
-    ./aarch64emu --root guests/macos guests/macos/threads      # four Darwin threads
-    ./aarch64emu --dyld-sections --root guests/macos guests/macos/hello   # runs now too
-    ./aarch64emu --root guests/macpy/python/bin/python3.13 -c 'print(1)'  # blocked, see below
+    sh prebuilt/unpack.sh
+    ./aarch64emu --root guests/macos guests/macos/hello
+    hello from real macOS
 
-- **`--dyld-sections` completes.** The null function pointer at 285,669 was dyld's
-  `_dyld_objc_mark_image_mutable` **block**, which `map_images` takes as its third
-  argument and which was being passed as zero. libobjc now uses the cache's
-  preoptimized class layout for the whole registration: 666,358 instructions against
-  199,279 for the load-command fallback, same output, identical under `--strict`. It
-  is still off by default only because the fallback is the tested baseline.
-- **LC_DYLD_INFO opcodes are implemented**, which is what a stock macOS binary needs:
-  chained fixups are a Big Sur deployment target, and everything older — CPython
-  included — says the same thing as rebase/bind byte-code programs. `run_macho.sh`
-  builds the dylib test both ways now, so the two readers are held to one oracle.
-- **Threads work on Darwin.** `bsdthread_create`, `__ulock_wait`/`__ulock_wake`, and
-  the run-loop fix that made preemption exist there at all. `guests/macos/threads`
-  is the test and its answer is checkable arithmetic.
-- **The filesystem works through Apple's libc**, not just through the syscall table:
-  `getdirentries64`, `fstatfs64`, `getrlimit`. `guests/macos/files` walks a directory
-  and reads a file with opendir/readdir/fopen/fgets, and the host computes the same
-  counts and hashes from the same tree. This is the path CPython walks looking for
-  its standard library.
-- ✅ **The libraries are extracted.** 141 files, 229 MB, from a Mac's cache:
-  CoreFoundation, SystemConfiguration, Foundation, libncurses, libpanel, libedit,
-  libz and their closure. The command is below; it needs a Mac for one minute.
-- **The stock macOS CPython loads, links and runs into its own startup.** That is
-  the live frontier, and it needs `--dyld-sections`:
+    ./aarch64emu --dyld-sections --root guests/macos_py \
+        guests/macos_py/install/bin/python3.13 -c \
+        "import sys, platform, hashlib
+         print(sys.version.split()[0], platform.machine(), sys.platform)
+         print(hashlib.sha256(b'aarch64_emu_cpp').hexdigest())"
+    3.13.14 arm64 darwin
+    bffb6fd92e8571ee9842b4be91c59556fa99d85a203350610620d876755b4110
 
-      ./aarch64emu --dyld-sections --root guests/macos_py guests/macos_py/bin/python3.13 -c 'print(1)'
+Apple's own CPython, on Apple's own libraries, on an x86 host — and in a browser tab,
+at <https://yomei-o.github.io/aarch64_emu_cpp/>. The digest is the host's digest of
+the same bytes, which is what `tests/run_macos.sh` now checks.
 
-  Without the flag it stops in libxpc with "API Misuse: Messages must be
-  dictionaries" -- an XPC object failing its own type check, which is
-  `object_getClass` against a class libobjc realizes properly only when it can read
-  the cache's preoptimized tables. So the flag is no longer a curiosity: it is the
-  difference between libobjc being approximately right and right.
+`--dyld-sections` is **not optional for anything but `hello`**. Without it libobjc
+never reads the shared cache's preoptimized class tables, and libxpc fails its own
+type check ("API Misuse: Messages must be dictionaries") long before Python starts.
+It is still off by default on the command line because the load-command fallback is
+what the recorded `hello` instruction count is measured against; the wasm build turns
+it on unconditionally.
 
-  With it, the run gets past all of that and then **spins in CPython's `take_gil`**,
-  a million `__psynch_cvwait` calls deep, with `gil->locked` still holding the -1
-  its static initialiser wrote. -1 is CPython's "the GIL has not been created", so
-  `create_gil` never ran while `take_gil` did -- verified by watching the struct:
-  nothing writes to it after the initialiser, not even `pthread_cond_init`.
+**The last wall was one decoder bug, and it is the one to remember.** `STLUR`
+(ARMv8.4 store-release, unscaled offset) shares bits 29..27 with `LDR (literal)` and
+differs only in **bit 24**, which the literal case did not test. So
 
-  **`--strict` points at the likely cause four million instructions earlier:**
+    stlur wzr, [x19, #0x10]
 
-      aarch64emu: unmapped read at 000000000000001C (--strict)
-      _xpc_pipe_check_in_once  <- _xpc_pipe_routine <- bootstrap_look_up3
+decoded as a load into the zero register: an instruction that read an unrelated
+address and threw the result away, silently. CPython's `create_gil` ends with
 
-  a **null XPC pipe**, reached while `bootstrap_look_up` looks for
-  `com.apple.system.notification_center`. Permissive memory reads the zero and
-  carries on, which is exactly the failure mode `--strict` exists to catch.
+    gil->last_holder = NULL;   // str   -- happened
+    gil->locked = 0;           // stlur -- did not
 
-  **The whole chain is now known**, and it is one uninitialised global:
+and `locked` starts at -1 meaning "no GIL yet". So the GIL was created and still
+looked uncreated; `take_gil` waited for a holder that could not exist, timed out
+forever, and eventually dereferenced a null `last_holder`. **Five million
+instructions of ObjC, XPC and CoreFoundation start-up were debugged before this, all
+of them working correctly.** Everything in this file's design — refuse the unknown,
+never no-op — exists because of failures shaped like that one.
 
-      CPython startup
-        -> libsystem_info wants the user database
-        -> dispatch_once -> libnotify, registering for
-           "com.apple.system.DirectoryService.InvalidateCache"
-        -> libnotify reads the global `_bootstrap_port` (libsystem_kernel,
-           0x1EE4188AC) and gets **0**
-        -> bootstrap_look_up3(port = 0, "com.apple.system.notification_center")
-        -> _xpc_interface_routine takes its "we have a bootstrap" branch
-        -> _xpc_pipe_routine(pipe = NULL) -> read of 0x1C
+Three more from the same stretch, each found by the guest saying so:
 
-  The measurement that settles it: watch `1EE4188AC`. It is **read as 0 by
-  libnotify** and only **written later, with 0x1108, by `_libxpc_initializer
-  +1076`**. `mach_init_doit` runs (once, from `__libkernel_init +256`) and does
-  *not* set it -- it sets `mach_task_self_` and the page-size globals and nothing
-  else. So on this OS `bootstrap_port` is libxpc's initializer's to set, and
-  something reaches libnotify before it.
+- **`main` was called without its arguments.** An LC_MAIN entry point *is* `main`,
+  and dyld's start loads argc/argv/envp/apple into registers. Leaving them alone
+  worked for `hello`, which ignores them, and made CPython see no `-c`, fall through
+  to the REPL, read EOF and exit 0 having printed nothing.
+- **The bootstrap port is handed over at exec.** Measured on a Mac with a five-line
+  probe: a plain `__attribute__((constructor))` already sees `bootstrap_port = 0x807`.
+  Nothing in the guest sets it that early, so the host writes it into
+  libsystem_kernel's global before the first instruction. Leaving it zero sent
+  libnotify into libxpc's "we have a bootstrap" branch and a null pipe.
+- **`load_images` was being called far too early.** `map_images` must run
+  re-entrantly inside libobjc's registration; `+load` must not. Running it there ran
+  Foundation's `+load` on top of a libSystem initializer that was still part-way
+  through, which is how the null pipe was reached at all. dyld runs `+load` once the
+  libraries are up, and so does `run_image()` now.
 
-  Two things that were tried and did nothing, so they need not be tried again:
+What is left, in no particular order:
 
-  - answering MIG `task_get_special_port(TASK_BOOTSTRAP_PORT)` with the null port:
-    the instruction count came out identical to the digit, so libxpc has not asked
-    by then;
-  - returning `MACH_SEND_INVALID_DEST` for a send to port 0. That is now the
-    behaviour and it is right on its own terms -- the traffic really is XPC to a
-    null port -- but the crash is before any send.
-
-  **The open question is what a real Mac does here**, and it is the kind of
-  question a Mac answers in a minute and disassembly answers in an afternoon:
-
-      lldb .../python3.13 -o 'b bootstrap_look_up3' -o run -o bt -o 'p bootstrap_port'
-
-  Either `bootstrap_port` is non-zero by then (and something sets it earlier than
-  libxpc's initializer -- find what), or libnotify never gets that far because
-  something upstream succeeded that fails here.
-
-  The goal is not to make XPC work — CPython does not need it — but to have libxpc
-  take the path it has for a process with no launchd. It survives a missing service
-  on a real Mac; it does not survive a null pipe.
-
-  Still unanswered on this guest, in case one of them matters more than it looks:
-  sysctl `{1,14,1,pid}` (KERN_PROC_PID, a kinfo_proc), and MIG routines
-  1073742031 / 1073742628 sent to port 0.
+- **`os.uname()` works, `sysctl {1,14,1,pid}` (KERN_PROC_PID, a `kinfo_proc`) does
+  not.** Nothing has needed it yet.
+- **Darwin `bsdthread_create` is implemented but CPython's `threading` is untried.**
+  `guests/macos/threads` passes; a Python-level thread test is the obvious next check.
+- **Speed.** ~15M instructions/sec on the macOS guest under the interpreter, against
+  ~41M on Linux guests — the difference is the ObjC-heavy start-up, not the core. A
+  decode cache keyed on the PC is the standing idea; measure first.
+- The dyld API slots still answered with zero on the CPython guest: 1, 8, 10, 12, 13,
+  44, 49, 51, 52, 54, 59, 60, 82, 90, 97, 121. None has been shown to matter.
 
 Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agree byte for
 byte over the whole macOS run, which is the best differential oracle here for anyone
 without a cross-compiler.
 
-Run the five suites before touching anything — they should be 9 / 11 / 9 / 7 / 8, plus 8 for
+Run the five suites before touching anything — they should be 9 / 11 / 9 / 7 / 9, plus 8 for
 `node web/test_node.mjs` if emscripten is around:
 
     sh tests/run_tests.sh    sh tests/run_macho.sh
@@ -206,7 +179,8 @@ against *itself* under two memory modes, which turns out to be a sharp test (see
                                           LC_DYLD_INFO opcode programs
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
-    sh tests/run_macos.sh      8 passed   the macOS guests: hello, threads, tls, files
+    sh tests/run_macos.sh      9 passed   the macOS guests: hello, threads, tls, files,
+                                          and Apple's CPython against the host's sha256
     node web/test_node.mjs     8 passed   the same guests under WebAssembly
 
 What works:

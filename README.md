@@ -15,6 +15,9 @@ bffb6fd92e8571ee9842b4be91c59556fa99d85a203350610620d876755b4110
 
 $ ./aarch64emu --root guests/macos guests/macos/hello
 hello from real macOS
+
+$ ./aarch64emu --dyld-sections --root guests/macos_py       guests/macos_py/install/bin/python3.13       -c "import sys, platform; print(sys.version.split()[0], platform.machine(), sys.platform)"
+3.13.14 arm64 darwin
 ```
 
 That is a stock CPython built for `aarch64-unknown-linux-musl`, **dynamically
@@ -185,6 +188,9 @@ packed, out of a 4.9 GB dyld shared cache, extracted by `tools/dsc_extract.c` on
 $ sh prebuilt/unpack.sh
 $ ./aarch64emu --root guests/macos guests/macos/hello
 hello from real macOS
+
+$ ./aarch64emu --dyld-sections --root guests/macos_py       guests/macos_py/install/bin/python3.13       -c "import sys, platform; print(sys.version.split()[0], platform.machine(), sys.platform)"
+3.13.14 arm64 darwin
 ```
 
 **That works.** 199,279 instructions of Apple's own arm64 code: 48 libraries from a real

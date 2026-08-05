@@ -1078,6 +1078,10 @@ bool Syscalls::svc_darwin() {
                 return 0;
             };
             constexpr uint32_t CTL_KERN = 1, CTL_HW = 6;
+            // Where main.cpp actually put the stack, so the answer is the truth rather
+            // than a plausible constant. Declared before the first `goto sysctl_unknown`,
+            // because g++ refuses a jump across an initialization that clang lets pass.
+            constexpr uint64_t kStackTop = 0x0000'7FFF'FFFF'F000ull;
             // Some of the sysctls a libSystem startup reads are *dynamically registered*
             // nodes: they have no fixed MIB even on a real kernel, which assigns a number
             // when the node registers and hands it out through sysctlbyname(3). So this
@@ -1128,9 +1132,6 @@ bool Syscalls::svc_darwin() {
                 }
                 break;
             }
-            // Where main.cpp actually put the stack, so the answer is the truth rather
-            // than a plausible constant.
-            constexpr uint64_t kStackTop = 0x0000'7FFF'FFFF'F000ull;
             if (namelen == 2 && mib[0] == CTL_KERN) {
                 switch (mib[1]) {
                     case 2:  r = give_str("24.6.0"); break;        // KERN_OSRELEASE

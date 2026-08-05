@@ -176,7 +176,16 @@ int main(int argc, char** argv) {
                 }
                 if (n >= 2) { s[n] = 0; std::fprintf(stderr, "(\"%s\")", s); }
             }
-            std::fprintf(stderr, "\n");
+            // The callee-saved half, on a second line. An optimised library keeps the
+            // object it is working on in x19..x28 for the whole of a function, so by the
+            // time anything interesting happens the answer is usually not in x0..x5 --
+            // the XPC pipe that turned out to be null lived in x23, and no amount of
+            // looking at argument registers would have said so.
+            std::fprintf(stderr, "\n[pcwatch]  ");
+            for (unsigned r = 19; r <= 29; ++r)
+                std::fprintf(stderr, " x%u=%llX", r,
+                             static_cast<unsigned long long>(cpu.xr(r)));
+            std::fprintf(stderr, "  sp=%llX\n", static_cast<unsigned long long>(cpu.sp));
         };
     }
     // --strict: report the address and stop. A wild access is not something to hand the

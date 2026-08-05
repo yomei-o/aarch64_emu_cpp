@@ -757,6 +757,18 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
     const uint32_t reply_cap = static_cast<uint32_t>(rcv_size & 0xFFFFFFFF);
     (void)options; (void)desc_rcvname; (void)send_size;
 
+    // A send to the null port is `MACH_SEND_INVALID_DEST`, not a failed routine.
+    //
+    // This is the difference between "the service said no" and "there is nobody to
+    // ask", and libxpc treats them differently. With no launchd here, libxpc's
+    // bootstrap pipe ends up holding port 0 and sends its XPC messages there --
+    // ordinary XPC traffic, not MIG at all, which is why the routine numbers look
+    // absurd (0x4000020F). Reporting them as unimplemented MIG routines was both
+    // wrong and noisy; a real kernel answers exactly this, and a caller that gets it
+    // knows the destination is gone rather than that its request was malformed.
+    constexpr int64_t kMachSendInvalidDest = 0x1000'0003;
+    if (remote == 0) return kMachSendInvalidDest;
+
     // Every MIG reply starts the same way. `size` is the whole reply including this
     // header, which MIG checks, so it is a parameter rather than a constant.
     auto reply_header = [&](uint32_t size) {

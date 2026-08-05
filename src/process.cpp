@@ -58,9 +58,7 @@ int64_t Syscalls::sys_fork() {
     const int pid = next_pid_++;
     vfork_child_pid_ = pid;
     if (trace)
-        std::fprintf(stderr, "[proc] fork -> child pid %d (depth %d) parent pc %llX sp %llX\n",
-                     pid, vfork_depth_, static_cast<unsigned long long>(cpu_.pc),
-                     static_cast<unsigned long long>(cpu_.sp));
+        std::fprintf(stderr, "[proc] fork -> child pid %d (depth %d)\n", pid, vfork_depth_);
     return 0;                                   // the child's view
 }
 
@@ -120,6 +118,12 @@ void Syscalls::vfork_resume() {
     vfork_files_.pop_back();
     child_status_[vfork_child_pid_] = vfork_child_status_;
     cpu_.setx(0, static_cast<uint64_t>(vfork_child_pid_));
+    // Darwin's `fork` returns the pid in x0 *and* a flag in x1 -- 1 in the child, 0 in
+    // the parent -- because with a pid of 0 the two are otherwise indistinguishable.
+    // The child's return set x1 to 1; leaving it there made the resumed *parent* look
+    // like a child to libsyscall's wrapper, which took the child's branch in a process
+    // whose stack said otherwise. Harmless on the Linux side, where x1 is scratch.
+    cpu_.setx(1, 0);
     if (trace)
         std::fprintf(stderr, "[proc] child %d exited %d; parent resumes at pc %llX sp %llX\n",
                      vfork_child_pid_, vfork_child_status_ >> 8,

@@ -1126,6 +1126,14 @@ bool Syscalls::svc_darwin() {
 
     switch (nr) {
         case 1:                                            // exit
+            // A vfork child exiting before it execs -- the `_exit(127)` after a failed
+            // exec. The parent has to come back rather than the whole run ending.
+            if (in_vfork_child()) {
+                vfork_child_status_ = static_cast<int>(a0 & 0xFF) << 8;
+                vfork_returning_ = true;
+                cpu_.stop_requested = true;
+                return true;
+            }
             cpu_.exit_code = static_cast<int>(a0 & 0xFF);
             cpu_.halted = true;
             return true;
@@ -1141,6 +1149,62 @@ bool Syscalls::svc_darwin() {
         case 199: r = files.lseek(static_cast<int>(a0), static_cast<int64_t>(a1),
                                   static_cast<int>(a2)); break;
         case 33: r = files.access(guest_str(a0)); break;
+        // ---- child processes. The numbers are read out of libsystem_kernel, one
+        // `movz x16, #N` per stub, for the same reason the psynch ones are: a wrong
+        // number is a syscall that quietly fails.
+        //
+        //   2  fork      41 dup       42 pipe      90 dup2
+        //   7  wait4    147 execve   230 poll
+        //
+        // `fork` is the odd one: Darwin returns the pid in x0 *and* a flag in x1 --
+        // 1 in the child, 0 in the parent -- because the child and parent otherwise
+        // cannot be told apart when the pid is 0. libsyscall's wrapper reads x1.
+        // fork is **refused on Darwin**, and that is a finding rather than a gap.
+        //
+        // The vfork model in process.cpp works on Linux because musl's `fork()` is a
+        // bare `clone` and the child touches nothing but descriptors before it execs.
+        // Darwin's wrapper is not bare: it runs `_libSystem_atfork_child()`, which
+        // reinitialises malloc's zones, libdispatch's queues and libnotify's state --
+        // and with a shared address space it does that *in the parent's heap*. The
+        // parent then limps on and dies half a billion instructions later, nowhere
+        // near the cause.
+        //
+        // ENOSYS is what CPython needs to hear: `subprocess` falls back from
+        // `fork_exec` to `posix_spawn`, which on Darwin is one syscall that does the
+        // whole job in the kernel and never runs guest code in the parent's memory.
+        // That is the next piece of work, and it is the right one.
+        case 2:
+            std::fprintf(stderr,
+                         "[proc] fork() refused on Darwin: the child would run "
+                         "_libSystem_atfork_child() in the parent's memory. "
+                         "posix_spawn is the path (see process.cpp).\n");
+            err = kBsdENOSYS;
+            break;
+        case 42: {                                         // pipe: fds come back in
+            int fds[2];                                    // x0 and x1, not a buffer
+            const int64_t rc = files.pipe2(fds);
+            if (rc < 0) { err = bsd_errno(rc); r = 0; break; }
+            cpu_.setx(1, static_cast<uint64_t>(fds[1]));
+            r = fds[0];
+            break;
+        }
+        case 41: r = files.dup(static_cast<int>(a0), -1); break;
+        case 90: r = files.dup(static_cast<int>(a0), static_cast<int>(a1)); break;
+        case 147: r = sys_execve(a0, a1, a2); return true;  // execve
+        case 7: r = sys_wait4(static_cast<int64_t>(a0), a1); break;
+        // poll(fds, n, timeout). Same answer as the Linux ppoll and for the same
+        // reason: nothing here runs two processes at once, so by the time a parent
+        // polls, the child has finished and everything it wrote is in the buffer.
+        case 230: {
+            int64_t ready = 0;
+            for (uint64_t i = 0; i < a1 && i < 64; ++i) {
+                const uint64_t e = a0 + i * 8;
+                mem_.write<uint16_t>(e + 6, mem_.read<uint16_t>(e + 4));
+                ++ready;
+            }
+            r = ready;
+            break;
+        }
         // readlink(path, buf, size). Nothing in this filesystem is a symbolic link --
         // the guest trees are extracted, not mounted -- so EINVAL ("not a link") is
         // the truthful answer for a path that exists, and ENOENT for one that does

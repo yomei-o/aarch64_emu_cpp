@@ -21,6 +21,14 @@ extern void* fopen(const char*, const char*);
 extern char* fgets(char*, int, void*);
 extern int fclose(void*);
 extern int access(const char*, int);
+// strcmp and strncmp are *stub-and-resolver* exports: libsystem_c re-exports them
+// from libsystem_platform under the name `__platform_strcmp`, and the export trie
+// entry carries a stub address and a resolver address rather than one address. The
+// loader binds the stub. Calling them here is what says the stub actually works --
+// binding to a plausible wrong address would give a comparison that is merely
+// *usually* right, which is the worst kind of wrong.
+extern int strcmp(const char*, const char*);
+extern int strncmp(const char*, const char*, unsigned long);
 
 // struct dirent on Darwin (64-bit inode form): ino:8, seekoff:8, reclen:2,
 // namlen:2, type:1, name[1024]. The name therefore starts at offset 21, which is
@@ -62,6 +70,12 @@ int main(void) {
     printf("access libsystem_c %d\n", access("/usr/lib/system/libsystem_c.dylib", 0));
     printf("access nonesuch %d\n", access("/usr/lib/system/nonesuch.dylib", 0));
     printf("access hello %d\n", access("/hello.txt", 0));
+
+    // Signs only: the magnitude of a strcmp result is not specified.
+    printf("strcmp %d %d %d\n", strcmp("abc", "abc"),
+           strcmp("abc", "abd") < 0, strcmp("b", "a") > 0);
+    printf("strncmp %d %d\n", strncmp("abcXX", "abcYY", 3),
+           strncmp("abcXX", "abcYY", 4) < 0);
 
     // fopen/fgets: stdio's read path, which is a different set of syscalls from
     // open/read -- it stats the file to size its buffer.

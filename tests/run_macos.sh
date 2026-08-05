@@ -100,6 +100,25 @@ else
     echo "skip macos threads (no $T -- run: sh guests/macos/build.sh threads)"
 fi
 
+# ---- thread-local storage, which on Darwin is a loader feature ----------------
+#
+# A `_Thread_local` reference compiles to a *call* through a descriptor the loader
+# fills in, so TLS here is dyld's job rather than the compiler's. Two properties,
+# and they fail differently: the declared initial value has to arrive (a thunk that
+# hands back a fresh zeroed block passes a write-then-read test but not this), and
+# each thread has to get its own (a thunk that hands back one shared block passes
+# both of those and is wrong in the way that matters).
+L=guests/macos/tls
+if [ -f "$L" ]; then
+    want='main counter 100 scratch 0
+workers 1230 (expected 1230)
+main after 107 (expected 107)'
+    got=$($EMU --root guests/macos "$L" 2>/dev/null | tr -d '\015')
+    check "macos thread-local storage" "$want" "$got"
+else
+    echo "skip macos tls (no $L -- run: sh guests/macos/build.sh tls)"
+fi
+
 # ---- the filesystem, through Apple's own libc ---------------------------------
 #
 # `tests/file.c` covers open/read/write, but freestanding: it makes the syscalls
@@ -137,6 +156,10 @@ print('names %x' % names)
 print('access libsystem_c 0')
 print('access nonesuch -1')
 print('access hello 0')
+# strcmp and strncmp are stub-and-resolver exports; these lines are what says the
+# loader bound the stub to something that really compares.
+print('strcmp 0 1 1')
+print('strncmp 0 1')
 print('line %x' % line)
 PY
 )

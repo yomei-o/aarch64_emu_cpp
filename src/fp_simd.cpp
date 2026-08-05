@@ -475,6 +475,49 @@ void Cpu::exec_fp_simd(uint32_t insn) {
         }
     }
 
+    // ---- Advanced SIMD scalar pairwise: ADDP Dd, Vn.2D and the FP reductions ---
+    //
+    // The last step of a vectorised reduction: the loop leaves a partial sum in each
+    // lane and this folds the two halves together. clang emits it for something as
+    // ordinary as `for (i) total += a[i]` over longs, which is how it turned up --
+    // in a four-line test program, not in anything exotic.
+    if ((insn & 0xDF3E0C00u) == 0x5E300800u) {
+        const bool u = (insn >> 29) & 1;
+        const unsigned size = (insn >> 22) & 3, opcode = (insn >> 12) & 0x1F;
+        const unsigned rn = (insn >> 5) & 0x1F, rd = insn & 0x1F;
+        const V128 n = vreg[rn];
+        if (!u && opcode == 0x1B && size == 3) {                // ADDP Dd, Vn.2D
+            vreg[rd] = {n.lo + n.hi, 0};
+            return;
+        }
+        if (u) {
+            // The FP forms. `size` bit 0 picks single or double; bit 1 selects the
+            // MIN group, which is why FMAXP and FMINP share an opcode.
+            const bool dbl = (size & 1) != 0;
+            const bool is_min = (size & 2) != 0;
+            auto f = [&](uint64_t bits) -> double {
+                if (dbl) { double d; std::memcpy(&d, &bits, 8); return d; }
+                float g; const uint32_t b = static_cast<uint32_t>(bits);
+                std::memcpy(&g, &b, 4);
+                return g;
+            };
+            const uint64_t a = dbl ? n.lo : (n.lo & 0xFFFFFFFFull);
+            const uint64_t b = dbl ? n.hi : ((n.lo >> 32) & 0xFFFFFFFFull);
+            double r0;
+            if (opcode == 0x0D) r0 = f(a) + f(b);                       // FADDP
+            else if (opcode == 0x0C) r0 = is_min ? (f(a) < f(b) ? f(a) : f(b))
+                                                 : (f(a) > f(b) ? f(a) : f(b));  // FMAXNMP/FMINNMP
+            else if (opcode == 0x0F) r0 = is_min ? (f(a) < f(b) ? f(a) : f(b))
+                                                 : (f(a) > f(b) ? f(a) : f(b));  // FMAXP/FMINP
+            else fail("unimplemented scalar pairwise", insn);
+            if (dbl) { uint64_t b; std::memcpy(&b, &r0, 8); vreg[rd] = {b, 0}; }
+            else { const float g = static_cast<float>(r0); uint32_t b;
+                   std::memcpy(&b, &g, 4); vreg[rd] = {b, 0}; }
+            return;
+        }
+        fail("unimplemented scalar pairwise", insn);
+    }
+
     // ---- Advanced SIMD, across lanes ------------------------------------------
     if ((insn & 0x9F3E0C00u) == 0x0E300800u) {
         const bool q = (insn >> 30) & 1, u = (insn >> 29) & 1;

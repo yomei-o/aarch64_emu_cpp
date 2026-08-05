@@ -126,6 +126,11 @@ bool macho_parse(const std::vector<uint8_t>& f, MachoImage* out, std::string* er
                         std::memcpy(&reserved1, f.data() + so + 68, 4);
                         out->got_secs.push_back({addr, size, reserved1});
                     }
+                    // Thread-local storage, by type again rather than by the
+                    // conventional names __thread_vars / __thread_data / __thread_bss.
+                    else if (type == 0x13) { out->tlv_vars = addr; out->tlv_vars_size = size; }
+                    else if (type == 0x11) { out->tlv_data = addr; out->tlv_data_size = size; }
+                    else if (type == 0x12) { out->tlv_bss = addr; out->tlv_bss_size = size; }
                 }
                 // __TEXT starts at the mach_header, so its vmaddr is the image base.
                 if (name == "__TEXT") out->text_vmaddr = sc.vmaddr;

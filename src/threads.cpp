@@ -218,6 +218,55 @@ int64_t Syscalls::sys_ulock_wake(uint32_t operation, uint64_t addr) {
     return 0;
 }
 
+// `__psynch_cvwait` and friends: the older half of Darwin's synchronisation, which
+// pthread condition variables still use even where mutexes have moved to ulock.
+//
+//     __psynch_cvwait(cv, cvlsgen, cvugen, mutex, mugen, flags, sec, nsec)
+//     __psynch_cvsignal(cv, cvlsgen, cvugen, mutex, mugen, thread, flags)
+//     __psynch_cvbroad(cv, cvlsgen, cvugen, mutex, mugen, thread, flags)
+//
+// The generation counters are how the real kernel decides which waiters a signal
+// applies to; here there is one CPU and a switch happens only where this code says
+// so, so "who is waiting on this address" is the whole of the state and the counters
+// are not consulted. What does have to be right is the *mutex*: the kernel drops it
+// on the way into the wait and the caller expects to hold it again on the way out.
+// Anyone blocked on it is therefore woken here.
+int64_t Syscalls::sys_psynch_cvwait(uint64_t cv, uint64_t mutex, bool timed) {
+    ensure_main_thread();
+    for (Thread& t : threads_)
+        if (t.waiting && t.wait_addr == mutex) t.waiting = false;
+    cpu_.setx(0, 0);
+    cpu_.c = false;
+    threads_[cur_thread_].waiting = true;
+    threads_[cur_thread_].wait_addr = cv;
+    if (!schedule(true)) {
+        threads_[cur_thread_].waiting = false;
+        // A timed wait that nobody can satisfy is a *timeout*, which the caller is
+        // written to handle -- CPython's `take_gil` retries. An untimed one is a
+        // deadlock, and saying so beats spinning in something that looks like work.
+        if (timed) {
+            cpu_.setx(0, 60);                                // ETIMEDOUT
+            cpu_.c = true;
+            return 0;
+        }
+        throw CpuError{"all threads are blocked in psynch_cvwait: deadlock", cpu_.pc, 0};
+    }
+    return 0;
+}
+
+int64_t Syscalls::sys_psynch_cvsignal(uint64_t cv, bool broadcast) {
+    unsigned woken = 0;
+    for (Thread& t : threads_) {
+        if (!t.waiting || t.wait_addr != cv) continue;
+        t.waiting = false;
+        ++woken;
+        if (!broadcast) break;
+    }
+    cpu_.setx(0, woken);
+    cpu_.c = false;
+    return 0;
+}
+
 // Darwin creates a thread through `bsdthread_create`, not `clone`, and the shape of
 // the call is different enough to be worth spelling out rather than translating.
 //

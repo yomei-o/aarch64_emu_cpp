@@ -45,6 +45,14 @@ struct LoadedImage {
     // highest segment swallows half the address space and every other library in it.
     struct ImageSeg { uint64_t lo = 0, hi = 0, header = 0; };
     std::vector<ImageSeg> image_segs;
+    // Mach-O only: every image that has thread-local variables, with its descriptor
+    // array and the template a new thread's copy is made from. All slid.
+    struct TlvImage {
+        uint64_t vars = 0, vars_size = 0;      // the tlv_descriptor array
+        uint64_t tmpl = 0, tmpl_init = 0;      // the template, and how much of it is
+        uint64_t tmpl_size = 0;                // initialised rather than zero
+    };
+    std::vector<TlvImage> tlv_images;
     // Where libdyld keeps the crt globals -- `NXArgc`, `NXArgv`, `environ`, `__progname`.
     // Zero when no libdyld is loaded, in which case there is nothing to fill in.
     struct ProgVars { uint64_t argc = 0, argv = 0, env = 0, progname = 0; };
@@ -136,6 +144,17 @@ struct MachoImage {
     // says which symbol each null slot wants. `reserved1` on the section is the index
     // where that section's run of indirect symbols begins.
     uint32_t indirect_off = 0, indirect_count = 0;
+    // Thread-local storage, Darwin's way. `__thread_vars` is an array of
+    // `struct tlv_descriptor { void* (*thunk)(tlv_descriptor*); ulong key, offset; }`
+    // and a reference to a `_Thread_local` compiles to "load the thunk, call it" --
+    // so an image with these needs someone to fill the thunk in before it runs. On a
+    // Mac that someone is dyld. `__thread_data` holds the initial values and
+    // `__thread_bss` the zero-initialised tail; together they are the template each
+    // thread gets its own copy of, and a descriptor's `offset` is measured from the
+    // start of that pair.
+    uint64_t tlv_vars = 0, tlv_vars_size = 0;
+    uint64_t tlv_data = 0, tlv_data_size = 0;
+    uint64_t tlv_bss = 0, tlv_bss_size = 0;
     struct GotSec { uint64_t addr = 0, size = 0; uint32_t first_indirect = 0; };
     std::vector<GotSec> got_secs;
     // Every __objc_imageinfo section. A cache dylib's has OPTIMIZED_BY_DYLD set, which
@@ -177,9 +196,11 @@ uint64_t macho_lookup_symtab(const MachoImage& img, const std::string& sym);
 // walks LC_DYLD_CHAINED_FIXUPS and writes the rebased and bound pointers. Apple's
 // dyld cannot be shipped, so this stands in for it -- unlike the Linux side, where
 // the guest's own ld.so runs.
+// `list_unresolved` prints every unresolved symbol rather than the first forty.
+// The short form is for reading; the long one is for feeding to a script.
 bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_path, Memory& mem,
                 uint64_t dylib_base,
                 const std::function<std::vector<uint8_t>(const std::string&)>& read_file,
-                LoadedImage* out, std::string* err);
+                LoadedImage* out, std::string* err, bool list_unresolved = false);
 
 }  // namespace a64

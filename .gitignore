@@ -20,6 +20,8 @@ guests/macos/*
 !guests/macos/build.sh
 !guests/macos/threads.c
 !guests/macos/files.c
+!guests/macos/tls.c
+!guests/macos/stub_libs.sh
 !guests/macos/hello.txt
 tests/*.macho
 tests/*.cerr

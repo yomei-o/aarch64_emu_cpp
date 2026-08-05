@@ -65,6 +65,11 @@ public:
     // address" API. A flat list scanned linearly: there are a few hundred of them and it is
     // asked a handful of times.
     void set_image_segs(std::vector<LoadedImage::ImageSeg> segs) { image_segs_ = std::move(segs); }
+    // Darwin thread-local storage. Fills in every `tlv_descriptor`'s thunk, which is
+    // dyld's job and without which the first reference to a `_Thread_local` calls
+    // through a null pointer -- or, in libsystem_c's case, aborts with "thread locals
+    // not initialized" before the guest has printed anything.
+    void setup_tlv(const std::vector<LoadedImage::TlvImage>& images);
     // The address a handler returns to when the guest supplied no restorer.
     static constexpr uint64_t kSigreturnMagic = 0x0000'0000'DEAD'0000ull;
 
@@ -119,6 +124,8 @@ private:
     // every switching syscall here follows.
     int64_t sys_ulock_wait(uint32_t operation, uint64_t addr, uint64_t value);
     int64_t sys_ulock_wake(uint32_t operation, uint64_t addr);
+    int64_t sys_psynch_cvwait(uint64_t cv, uint64_t mutex, bool timed);
+    int64_t sys_psynch_cvsignal(uint64_t cv, bool broadcast);
     // Where `bsdthread_register` said new threads begin: libpthread's `_thread_start`,
     // not the start routine the guest passed to `pthread_create`.
     uint64_t bsdthread_entry_ = 0;
@@ -188,6 +195,17 @@ private:
     // 0x3'0000'0000 dyld stubs, 0x3'0100'0000 objc infos, 0x3'0200'0000 opt_rw,
     // 0x3'0300'0000 paths, 0x3'0400'0000 TSD.
     static constexpr uint64_t kObjcBlock = 0x0000'0003'0500'0000ull;
+    // Thread-local storage. `tlv_thunk_` is two instructions the descriptors point at;
+    // `tlv_blocks_` is one guest allocation per (thread, image), made on first use and
+    // seeded from that image's template.
+    static constexpr uint64_t kTlvBase = 0x0000'0003'0600'0000ull;
+    static constexpr uint64_t kTlvSize = 8u << 20;
+    uint64_t tlv_thunk_ = 0, tlv_next_ = 0;
+    std::vector<LoadedImage::TlvImage> tlv_images_;
+    // Keyed on (image index, thread index): the same variable in two threads is two
+    // allocations, which is the entire point of the mechanism.
+    std::map<std::pair<uint32_t, size_t>, uint64_t> tlv_blocks_;
+    uint64_t tlv_addr(uint64_t descriptor);
     static constexpr uint64_t kObjcBlockSize = 1u << 12;
 };
 

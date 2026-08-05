@@ -43,6 +43,12 @@ bool Syscalls::svc(uint32_t imm) {
         cpu_.setx(0, static_cast<uint64_t>(dyld_api_stub(static_cast<uint32_t>(cpu_.wr(16)))));
         return true;
     }
+    // And a fourth: the thunk every `tlv_descriptor` points at. x0 arrives holding
+    // the descriptor and leaves holding this thread's copy of the variable.
+    if (imm == 0x82) {
+        cpu_.setx(0, tlv_addr(cpu_.xr(0)));
+        return true;
+    }
     if (imm != 0) {
         cpu_.setx(0, static_cast<uint64_t>(kENOSYS));
         return true;

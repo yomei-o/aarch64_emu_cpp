@@ -276,6 +276,81 @@ void Syscalls::call_guest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, ui
     cpu_.halted = died;
 }
 
+// Darwin thread-local storage.
+//
+// A reference to a `_Thread_local` variable does not compile to an address. It
+// compiles to a *call*:
+//
+//     adrp x0, descriptor@page ; add x0, x0, descriptor@pageoff
+//     ldr  x1, [x0]            ; the descriptor's first word: a function pointer
+//     blr  x1                  ; -> the address of this thread's copy
+//
+// where the descriptor is `{ thunk, key, offset }` in `__DATA,__thread_vars`. The
+// static linker leaves `thunk` for the loader to fill in, and on a Mac dyld fills it
+// with its own `tlv_get_addr`. Nobody filled it here, which is why the stock macOS
+// CPython aborted 203,172 instructions in, before printing anything, with a message
+// from libsystem_c that named the problem exactly:
+//
+//     thread locals not initialized
+//
+// The thunk points at two host instructions instead, and the work happens on this
+// side: one allocation per (image, thread), made on first use and seeded from the
+// image's `__thread_data`/`__thread_bss` template. That is simpler than emulating
+// dyld's version, which does the same thing through a pthread key.
+void Syscalls::setup_tlv(const std::vector<LoadedImage::TlvImage>& images) {
+    if (images.empty()) return;
+    tlv_images_ = images;
+    mem_.map(kTlvBase, kTlvSize);
+    // svc #0x82 / ret. x0 arrives holding the descriptor and leaves holding the
+    // address, which is the whole ABI: everything else is caller-saved.
+    tlv_thunk_ = kTlvBase;
+    mem_.write<uint32_t>(tlv_thunk_ + 0, 0xD4001041u);        // svc #0x82
+    mem_.write<uint32_t>(tlv_thunk_ + 4, 0xD65F03C0u);        // ret
+    tlv_next_ = kTlvBase + 0x1000;
+
+    for (uint32_t i = 0; i < tlv_images_.size(); ++i) {
+        const LoadedImage::TlvImage& t = tlv_images_[i];
+        // Each descriptor is three words. `offset` is already right -- the linker
+        // wrote it -- so only the thunk and the key are the loader's business, and
+        // the key here is just "which image", because that is all it has to select.
+        for (uint64_t o = 0; o + 24 <= t.vars_size; o += 24) {
+            mem_.write<uint64_t>(t.vars + o + 0, tlv_thunk_);
+            mem_.write<uint64_t>(t.vars + o + 8, i);
+        }
+        if (trace)
+            std::fprintf(stderr, "[tlv] image %u: %llu descriptor(s), template %llu "
+                                 "bytes (%llu initialised)\n",
+                         i, static_cast<unsigned long long>(t.vars_size / 24),
+                         static_cast<unsigned long long>(t.tmpl_size),
+                         static_cast<unsigned long long>(t.tmpl_init));
+    }
+}
+
+uint64_t Syscalls::tlv_addr(uint64_t descriptor) {
+    const uint32_t key = static_cast<uint32_t>(mem_.read<uint64_t>(descriptor + 8));
+    const uint64_t offset = mem_.read<uint64_t>(descriptor + 16);
+    if (key >= tlv_images_.size()) return 0;
+    const LoadedImage::TlvImage& t = tlv_images_[key];
+    const auto id = std::make_pair(key, cur_thread_);
+    auto it = tlv_blocks_.find(id);
+    if (it == tlv_blocks_.end()) {
+        const uint64_t size = (t.tmpl_size + 15) & ~15ull;
+        const uint64_t block = tlv_next_;
+        tlv_next_ += size ? size : 16;
+        // The initialised half is copied and the rest zeroed, which is what makes a
+        // second thread's copy start from the declared initial values rather than
+        // from whatever the first thread left behind.
+        mem_.set(block, 0, t.tmpl_size);
+        for (uint64_t k = 0; k < t.tmpl_init; ++k)
+            mem_.write<uint8_t>(block + k, mem_.read<uint8_t>(t.tmpl + k));
+        it = tlv_blocks_.emplace(id, block).first;
+        if (trace)
+            std::fprintf(stderr, "[tlv] image %u, thread %zu -> %012llX\n", key,
+                         cur_thread_, static_cast<unsigned long long>(block));
+    }
+    return it->second + offset;
+}
+
 // The handler for those stubs. `w16` holds the vtable slot index.
 int64_t Syscalls::dyld_api_stub(uint32_t slot) {
     switch (slot) {
@@ -1151,6 +1226,24 @@ bool Syscalls::svc_darwin() {
         case 516:
             sys_ulock_wake(static_cast<uint32_t>(a0), a1);
             return true;
+        // The psynch family: condition variables. Same rule as ulock -- these write
+        // x0 and the carry flag themselves and do not fall into the shared tail,
+        // because a wait switches threads.
+        //
+        //   305 __psynch_cvwait(cv, cvlsgen, cvugen, mutex, mugen, flags, sec, nsec)
+        //   303 __psynch_cvsignal, 302 __psynch_cvbroad -- same first arguments
+        //
+        // "Timed" is decided by the seconds/nanoseconds pair, not by a flag: a zero
+        // deadline is an untimed wait. The difference matters at the end of the run,
+        // where a timed wait nobody can satisfy is a timeout the caller retries and an
+        // untimed one is a deadlock worth reporting.
+        case 305: {
+            const bool timed = cpu_.xr(6) || cpu_.xr(7);
+            sys_psynch_cvwait(a0, a3, timed);
+            return true;
+        }
+        case 303: sys_psynch_cvsignal(a0, false); return true;
+        case 302: sys_psynch_cvsignal(a0, true); return true;
         case 116: {                                        // gettimeofday
             const uint64_t ns = host_nanos();
             mem_.write<uint64_t>(a0, ns / 1000000000ull);

@@ -41,6 +41,7 @@ int main(int argc, char** argv) {
     // reasoning about them from outside. (It parses those through libobjc-env.dylib,
     // which is not in the current extraction -- so today this is set-up, not a tool.)
     std::vector<std::string> extra_env;
+    bool list_unresolved = false;
     // The guest sees this directory as "/". Defaulting to the host cwd means a
     // relative path from the guest lands where a user would expect it to.
     std::string root = ".";
@@ -79,6 +80,10 @@ int main(int argc, char** argv) {
         else if (a == "--sample" && i + 1 < argc) sample = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--root" && i + 1 < argc) root = argv[++i];
         else if (a == "--setenv" && i + 1 < argc) extra_env.push_back(argv[++i]);
+        // --list-unresolved — print every unresolved symbol instead of the first
+        // forty. Forty says which library is missing; all of them is what
+        // guests/macos/stub_libs.sh needs to generate a stand-in for each one.
+        else if (a == "--list-unresolved") list_unresolved = true;
         else break;
     }
     if (i >= argc) {
@@ -246,7 +251,8 @@ int main(int argc, char** argv) {
             return read_file(hp.c_str());
         };
         const bool ok = probe.needs_dyld
-            ? macho_link(file, guest_exe, mem, kDylibBase, read_guest, &img, &err)
+            ? macho_link(file, guest_exe, mem, kDylibBase, read_guest, &img, &err,
+                         list_unresolved)
             : load_macho(file, mem, 0, &img, &err);
         if (!ok) { std::fprintf(stderr, "aarch64emu: %s\n", err.c_str()); return 1; }
     } else if (!load_elf(file, mem, kPieBase, &img, &err)) {
@@ -329,6 +335,7 @@ int main(int argc, char** argv) {
         sys.set_objc_opt_ro(img.objc_opt_ro);
         sys.set_prog_header(img.phdr_addr);
         sys.set_cache_range(img.cache_lo, img.cache_hi);
+        sys.setup_tlv(img.tlv_images);
     }
 
     int rc = 0;

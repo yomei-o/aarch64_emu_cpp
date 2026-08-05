@@ -52,7 +52,7 @@ constexpr uint16_t kPtr64 = 2, kPtr64Offset = 6;
 constexpr uint16_t kStartNone = 0xFFFF;
 
 // Export flags that mean the address is not a plain address.
-constexpr uint64_t kExportReexport = 0x08, kExportStubResolver = 0x10;
+constexpr uint64_t kExportReexport = 0x08;
 
 std::string dirname_of(const std::string& p) {
     const size_t s = p.find_last_of('/');
@@ -90,12 +90,27 @@ MachoExport macho_lookup_export(const MachoImage& img, const std::string& sym) {
                     r.import_name.assign(nm, len);
                     return r;
                 }
-                // A stub-and-resolver export needs guest code run to produce the
-                // address, which the loader cannot do. Report absence rather than the
-                // stub's address, which would be a plausible wrong answer.
-                if (flags & kExportStubResolver) return r;
+                // A stub-and-resolver export carries two offsets: a **stub** that is a
+                // real callable function, and a resolver that returns the address of
+                // whichever CPU-specific variant this machine should use. dyld runs the
+                // resolver; a loader that cannot run guest code binds the stub, which is
+                // what the stub is for.
+                //
+                // This used to report absence instead, on the reasoning that the stub
+                // was a plausible wrong answer. It is not: `_strcmp` and `_strncmp` are
+                // exports of exactly this kind (libsystem_c re-exports them from
+                // libsystem_platform as `__platform_strcmp`), so refusing them makes a
+                // stock macOS binary fail to link against the C library over two of the
+                // most ordinary functions there are. The stub is
+                //
+                //     adrp x16, …; ldr x16, [x16, #…]; braaz x16
+                //
+                // — an indirect jump through a data slot the shared cache has already
+                // filled in, which is why every cache library's own calls to strcmp
+                // have worked all along.
+                const uint64_t first = read_uleb(p, size, &off);
                 r.found = true;
-                r.offset = read_uleb(p, size, &off);
+                r.offset = first;
                 return r;
             }
             const size_t children = off + term;
@@ -503,7 +518,7 @@ std::vector<std::string> expand_path(const std::string& name, const std::string&
 bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_path, Memory& mem,
                 uint64_t dylib_base,
                 const std::function<std::vector<uint8_t>(const std::string&)>& read_file,
-                LoadedImage* out, std::string* err) {
+                LoadedImage* out, std::string* err, bool list_unresolved) {
     std::vector<MachoImage> images;
     std::vector<std::string> missing_libs, unresolved;
     images.reserve(16);
@@ -789,10 +804,16 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
                              unresolved.end());
             msg += "  " + std::to_string(unresolved.size()) +
                    " unresolved non-weak symbol(s):\n";
-            for (size_t k = 0; k < unresolved.size() && k < 40; ++k)
+            // Forty is enough to see *which library* is missing, which is what the
+            // list is usually read for. It is not enough to act on the whole of it,
+            // and guests/macos/stub_libs.sh generates a stand-in for every name here
+            // -- so --list-unresolved prints all of them.
+            const size_t cap = list_unresolved ? unresolved.size() : 40;
+            for (size_t k = 0; k < unresolved.size() && k < cap; ++k)
                 msg += "    " + unresolved[k] + "\n";
-            if (unresolved.size() > 40)
-                msg += "    ... and " + std::to_string(unresolved.size() - 40) + " more\n";
+            if (unresolved.size() > cap)
+                msg += "    ... and " + std::to_string(unresolved.size() - cap) +
+                       " more (--list-unresolved for all of them)\n";
         }
         *err = msg;
         return false;
@@ -822,6 +843,23 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
                     out->image_segs.push_back({im.slide + sg.vmaddr,
                                                im.slide + sg.vmaddr + sg.vmsize,
                                                im.load_addr()});
+            // Thread-local storage, if the image has any. The template is
+            // `__thread_data` followed by `__thread_bss`, contiguous by construction:
+            // the linker places the zero-initialised half immediately after the
+            // initialised one, and a descriptor's offset counts from the start of the
+            // pair. Either half may be absent.
+            if (im.tlv_vars) {
+                LoadedImage::TlvImage t;
+                t.vars = im.slide + im.tlv_vars;
+                t.vars_size = im.tlv_vars_size;
+                const uint64_t lo = im.tlv_data ? im.tlv_data : im.tlv_bss;
+                const uint64_t hi = im.tlv_bss ? im.tlv_bss + im.tlv_bss_size
+                                               : im.tlv_data + im.tlv_data_size;
+                t.tmpl = im.slide + lo;
+                t.tmpl_init = im.tlv_data_size;
+                t.tmpl_size = hi - lo;
+                out->tlv_images.push_back(t);
+            }
             // ...and the span they cover, which is what `_dyld_get_shared_cache_range`
             // reports. Only the *libraries* that kept the cache's own addresses count.
             // images[0] is the main executable, which is not in any cache and sits at

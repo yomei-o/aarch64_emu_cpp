@@ -181,7 +181,7 @@ function untar(buf) {
     off += 512;
     if (type === '5') {
       mkdirpAbs(full);
-    } else if (type === '0' || type === ' ' || buf[off - 512 + 156] === 0) {
+    } else if (type === '0' || type === '\0' || buf[off - 512 + 156] === 0) {
       const slash = full.lastIndexOf('/');
       if (slash > 0) mkdirpAbs(full.slice(0, slash));
       M.FS.writeFile('/' + full, buf.subarray(off, off + size));
@@ -231,7 +231,7 @@ $('macrun').onclick = async () => {
     pending = '';
     $('macstatus').textContent = 'running…';
     await new Promise(r => setTimeout(r, 20));
-    const argz = '/hello  ';
+    const argz = '/hello\0\0';
     const nb = M.lengthBytesUTF8(argz) + 1, bp = M._malloc(nb);
     M.stringToUTF8(argz, bp, nb);
     const pp = cstr('/hello'), rp = cstr('');
@@ -241,8 +241,7 @@ $('macrun').onclick = async () => {
     const insns = M._emu_instructions();
     M._free(bp); M._free(pp); M._free(rp);
     let text = pending || '(no output)';
-    if (rc !== 0) text += '
-[exit ' + rc + '] ' + M.UTF8ToString(M._emu_error());
+    if (rc !== 0) text += '\n[exit ' + rc + '] ' + M.UTF8ToString(M._emu_error());
     $('out').textContent = text;
     $('macstatus').textContent =
       `${insns.toLocaleString()} instructions of Apple's own arm64 code in ${ms.toFixed(0)} ms`;

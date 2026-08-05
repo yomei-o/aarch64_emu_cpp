@@ -138,7 +138,7 @@ initializers in dyld's order, and the `exit` that flushes stdio. A 26 MB fetch.
 CoreFoundation, Foundation and the 141 libraries under them. Type any expression; the
 default prints a SHA-256 you can check against your own Python. Seventy-odd million
 instructions, about five seconds, and every byte of that digest travels through the
-emulated CPU. A 93 MB fetch, from a GitHub release rather than the repository.
+emulated CPU. A 93 MB fetch, in three pieces, from the same site.
 
 Both are decompressed by the browser's own `DecompressionStream` and unpacked into an
 in-memory filesystem; nothing is uploaded, and the page is static files. You can also

@@ -286,27 +286,37 @@ $('macrun').onclick = async () => {
 
 // ---- Apple's CPython -------------------------------------------------------
 //
-// Released rather than committed: 95 MB, and a git history keeps everything
-// forever. The same tree is in the repository as xz for command-line use, where
-// xz's better ratio is worth having and the browser cannot decompress it.
-const PY_URL = 'https://github.com/yomei-o/aarch64_emu_cpp/releases/download/' +
-               'web-guests-v1/macos-python-3.13.14-arm64.tar.gz';
+// Served from beside this page, in three parts.
+//
+// A GitHub *release* was the obvious place for 93 MB and it does not work: release
+// assets carry no `Access-Control-Allow-Origin`, so a fetch from the Pages origin is
+// blocked before a byte arrives. (`raw.githubusercontent.com` does send it, but that
+// only serves files that are in the repository -- at which point Pages serves them
+// from this origin anyway, and there is no cross-origin request to allow.)
+//
+// Split at 32 MB because git warns above 50 MB per file, not because anything here
+// needs it: the parts are concatenated before they are decompressed.
+const PY_PARTS = ['macos-python.tar.gz.00', 'macos-python.tar.gz.01',
+                  'macos-python.tar.gz.02'];
 
 let pyReady = false;
-async function fetchGuest(url, status) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('cannot fetch (' + res.status + ')');
-  const total = Number(res.headers.get('content-length')) || 0;
+// `urls` are the pieces of one gzip stream, in order. They are downloaded one after
+// another rather than in parallel: the progress figure is the point, and 93 MB with no
+// feedback looks like nothing is happening.
+async function fetchGuest(urls, status, expectMB) {
   const chunks = [];
   let got = 0;
-  const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value); got += value.length;
-    status.textContent = total
-      ? 'downloading ' + (got / 1048576).toFixed(0) + ' / ' + (total / 1048576).toFixed(0) + ' MB'
-      : 'downloading ' + (got / 1048576).toFixed(0) + ' MB';
+  for (const url of urls) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('cannot fetch ' + url + ' (' + res.status + ')');
+    const reader = res.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); got += value.length;
+      status.textContent = 'downloading ' + (got / 1048576).toFixed(0) +
+                           (expectMB ? ' / ' + expectMB : '') + ' MB';
+    }
   }
   status.textContent = 'decompressing\u2026';
   const stream = new Blob(chunks).stream().pipeThrough(new DecompressionStream('gzip'));
@@ -319,7 +329,7 @@ $('pyrun').onclick = async () => {
   $('pyrun').disabled = true;
   try {
     if (!pyReady) {
-      const n = await fetchGuest(PY_URL, $('pystatus'));
+      const n = await fetchGuest(PY_PARTS, $('pystatus'), 93);
       $('pystatus').textContent = n + ' files in the virtual filesystem';
       pyReady = true;
     }

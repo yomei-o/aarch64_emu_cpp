@@ -155,6 +155,161 @@ int64_t Syscalls::sys_futex(uint64_t addr, int op, uint32_t val) {
     return 0;
 }
 
+// Darwin's futex: `__ulock_wait` and `__ulock_wake`.
+//
+//     __ulock_wait(operation, addr, value, timeout_us)
+//     __ulock_wake(operation, addr, wake_value)
+//
+// The same contract as FUTEX_WAIT/WAKE with three differences that matter here:
+//
+//  - the low byte of `operation` picks the comparison *width* -- the UL_*64 forms
+//    compare eight bytes, the rest four. Comparing the wrong width against a lock
+//    word whose upper half holds an owner is how a wait returns instantly, forever;
+//  - `ULF_NO_ERRNO` asks for the error as a negative return value instead of through
+//    the carry flag, and libpthread sets it. Answering the wrong way makes a
+//    "nobody was waiting" into a valid small positive result;
+//  - waking nobody is `-ENOENT`, not success. A caller that is told it woke someone
+//    waits for an acknowledgement that never comes.
+int64_t Syscalls::sys_ulock_wait(uint32_t operation, uint64_t addr, uint64_t value) {
+    const unsigned op = operation & 0xFF;
+    const bool wide = op == 4 || op == 5 || op == 6;   // the UL_*64 operations
+    const bool no_errno = (operation & 0x0100'0000u) != 0;
+    // Read and compare with nothing else running, which is what makes this atomic
+    // from the guest's point of view: the value may have changed between the guest's
+    // own load and this call, and that is the whole reason the kernel re-checks.
+    const uint64_t now = wide ? mem_.read<uint64_t>(addr)
+                              : static_cast<uint64_t>(mem_.read<uint32_t>(addr));
+    const uint64_t want = wide ? value : (value & 0xFFFF'FFFFull);
+    if (now != want) {
+        // EAGAIN: the caller's reason for sleeping is already gone.
+        cpu_.setx(0, static_cast<uint64_t>(no_errno ? -35 : 35));
+        cpu_.c = !no_errno;
+        return 0;
+    }
+    ensure_main_thread();
+    cpu_.setx(0, 0);
+    cpu_.c = false;
+    threads_[cur_thread_].waiting = true;
+    threads_[cur_thread_].wait_addr = addr;
+    if (!schedule(true)) {
+        threads_[cur_thread_].waiting = false;
+        throw CpuError{"all threads are blocked in ulock_wait: deadlock", cpu_.pc, 0};
+    }
+    return 0;
+}
+
+int64_t Syscalls::sys_ulock_wake(uint32_t operation, uint64_t addr) {
+    const bool all = (operation & 0x0000'0100u) != 0;   // ULF_WAKE_ALL
+    const bool no_errno = (operation & 0x0100'0000u) != 0;
+    unsigned woken = 0;
+    for (Thread& t : threads_) {
+        if (!t.waiting || t.wait_addr != addr) continue;
+        t.waiting = false;
+        ++woken;
+        if (!all) break;
+    }
+    if (!woken) {
+        cpu_.setx(0, static_cast<uint64_t>(no_errno ? -2 : 2));   // ENOENT
+        cpu_.c = !no_errno;
+        return 0;
+    }
+    cpu_.setx(0, 0);
+    cpu_.c = false;
+    return 0;
+}
+
+// Darwin creates a thread through `bsdthread_create`, not `clone`, and the shape of
+// the call is different enough to be worth spelling out rather than translating.
+//
+//     bsdthread_create(fn, arg, stack, self, flags)
+//
+// The kernel does *not* start the thread at `fn`. It starts it at the entry point
+// libpthread registered with `bsdthread_register` -- `_thread_start`, which falls
+// straight into `_pthread_start` -- and passes `fn` and `arg` along as arguments:
+//
+//     thread_start(self, kport, fun, arg, stacksize, flags)
+//
+// So the emulator plays the same trick: a new Thread whose PC is the registered
+// entry and whose registers carry the four values the trampoline expects. Nothing
+// else about the thread has to be invented, because with PTHREAD_START_CUSTOM --
+// which is what a `pthread_create` with a normal attribute sets -- libpthread has
+// already allocated the stack *and* filled in the `struct _pthread` before the call.
+//
+// The thread pointer is the part the kernel really does own: Darwin's TPIDRRO_EL0
+// points at the TSD array *inside* the pthread structure, 0xE0 bytes past its base,
+// with the header fields at negative offsets. Getting that wrong is not a crash, it
+// is `errno` landing on top of something else.
+int64_t Syscalls::sys_bsdthread_create(uint64_t fn, uint64_t arg, uint64_t stack,
+                                       uint64_t self, uint64_t flags) {
+    if (!bsdthread_entry_) {
+        std::fprintf(stderr, "[mac] bsdthread_create before bsdthread_register\n");
+        return -1;
+    }
+    ensure_main_thread();
+
+    Thread child;
+    child.tid = next_tid_++;
+    child.ctx = cpu_.save_context();
+    child.ctx.pc = bsdthread_entry_;
+    child.ctx.sp = stack;
+    // 0xE0: the offset from `struct _pthread` to its TSD array. main.cpp places the
+    // main thread's the same way, and for the same reason.
+    child.ctx.tpidr_el0 = self + 0xE0;
+    // The port goes in x1 *and* into the thread's own TSD, because libpthread reads it
+    // back from there rather than from the argument:
+    //
+    //     ldr w8, [x19, #0xf8]      ; self->tsd[3], _PTHREAD_TSD_SLOT_MACH_THREAD_SELF
+    //     add w9, w8, #1            ; and it must be neither 0 nor -1
+    //     cmp w9, #1
+    //     b.ls  <BUG IN CLIENT OF LIBPTHREAD: Unable to allocate thread port>
+    //
+    // 0xf8 is 0xe0 + 3*8: the TSD array, slot three. Setting up that array is the
+    // kernel's job on a real machine, which is why libpthread treats an empty slot as
+    // a bug in whoever created the thread rather than in itself.
+    const uint64_t port = next_port_++;
+    child.ctx.x[0] = self;
+    child.ctx.x[1] = port;
+    mem_.write<uint64_t>(self + 0xE0, self);       // tsd[0]: pthread_self
+    mem_.write<uint64_t>(self + 0xF8, port);       // tsd[3]: the mach port
+    child.ctx.x[2] = fn;
+    child.ctx.x[3] = arg;
+    child.ctx.x[4] = stack;
+    // PTHREAD_START_TSD_BASE_SET. The kernel does not merely set the thread pointer,
+    // it *says* it did, by adding this bit to the flags it passes on -- and libpthread
+    // checks, then stops the process itself when the bit is missing:
+    //
+    //     BUG IN LIBPTHREAD: thread_set_tsd_base() wasn't called by the kernel
+    //
+    // Which is the whole argument for reading the guest's strings: the thread pointer
+    // was already right, and nothing about a missing status bit would have been
+    // guessable from the crash address.
+    child.ctx.x[5] = flags | 0x1000'0000ull;
+    // x30 is whatever the creating thread had. A thread that returns from its start
+    // routine goes through libpthread's own exit path, so this is never used -- but
+    // a plausible address would hide the case where it is, and zero does not.
+    child.ctx.x[30] = 0;
+    threads_.push_back(child);
+    if (trace)
+        std::fprintf(stderr, "[thr] bsdthread_create -> tid %llu, entry %012llX, "
+                             "fn %012llX, sp %012llX  (%zu threads)\n",
+                     static_cast<unsigned long long>(child.tid),
+                     static_cast<unsigned long long>(bsdthread_entry_),
+                     static_cast<unsigned long long>(fn),
+                     static_cast<unsigned long long>(stack), threads_.size());
+
+    cpu_.preempt_every = kPreemptEvery;
+    cpu_.preempt_left = kPreemptEvery;
+    cpu_.on_preempt = [this] {
+        const size_t was = cur_thread_;
+        const bool moved = schedule(true);
+        if (trace)
+            std::fprintf(stderr, "[thr] preempt %zu -> %zu (%s)\n", was, cur_thread_,
+                         moved ? "switched" : "stayed");
+    };
+    // The return value is the new thread's `self`, which is what libpthread stores.
+    return static_cast<int64_t>(self);
+}
+
 // exit(2) ends one thread; exit_group(2) ends the process. Before threads existed
 // the two were the same call, and treating exit as exit_group here would kill the
 // program the first time any worker finished.

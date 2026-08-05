@@ -112,6 +112,16 @@ private:
     bool schedule(bool must_move);
     uint64_t current_tid() const;
     int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t ptid, uint64_t tls, uint64_t ctid);
+    int64_t sys_bsdthread_create(uint64_t fn, uint64_t arg, uint64_t stack,
+                                 uint64_t self, uint64_t flags);
+    // Darwin's futex. Both write x0 *and* the carry flag themselves, because the
+    // thread that made the call may not be the one running on return -- the same rule
+    // every switching syscall here follows.
+    int64_t sys_ulock_wait(uint32_t operation, uint64_t addr, uint64_t value);
+    int64_t sys_ulock_wake(uint32_t operation, uint64_t addr);
+    // Where `bsdthread_register` said new threads begin: libpthread's `_thread_start`,
+    // not the start routine the guest passed to `pthread_create`.
+    uint64_t bsdthread_entry_ = 0;
     int64_t sys_futex(uint64_t addr, int op, uint32_t val);
     int64_t sys_sched_yield();
     void thread_exit(int status);
@@ -173,7 +183,11 @@ private:
     // The `mark image mutable` block map_images takes as its third argument. A block is
     // {isa, flags, reserved, invoke, descriptor} and libobjc calls `invoke(block, index)`,
     // so this needs a real function to point at -- see the note at `case 107`.
-    static constexpr uint64_t kObjcBlock = 0x0000'0003'0400'0000ull;
+    // 0x3'0400'0000 is the main thread's TSD region, in main.cpp -- this arena has to
+    // be somewhere else, and "somewhere else" is a list worth keeping in one place:
+    // 0x3'0000'0000 dyld stubs, 0x3'0100'0000 objc infos, 0x3'0200'0000 opt_rw,
+    // 0x3'0300'0000 paths, 0x3'0400'0000 TSD.
+    static constexpr uint64_t kObjcBlock = 0x0000'0003'0500'0000ull;
     static constexpr uint64_t kObjcBlockSize = 1u << 12;
 };
 

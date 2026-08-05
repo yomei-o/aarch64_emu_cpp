@@ -21,7 +21,8 @@
 #   * The **compile** half needs a clang with the AArch64 target built in. The
 #     emscripten clang this project is otherwise built with has only wasm and
 #     x86, so on such a host this script stops and says so rather than
-#     producing something that looks like a guest.
+#     producing something that looks like a guest. An ordinary LLVM release has
+#     the target; `guests/macos/threads` was built this way, with no Mac.
 #
 # CC and LD are overridable, which is the whole point on a host where the usable
 # clang is not the first one on PATH.
@@ -50,8 +51,26 @@ fi
 # macho_dyld.cpp refuses (loudly, on purpose). The committed `hello` is arm64 for
 # the same reason.
 "$CC" --target=arm64-apple-macos15 -O2 -c "$name.c" -o "$name.o"
-"$LD" -flavor darwin -arch arm64 -platform_version macos 15.0 15.0 \
-      -syslibroot . -o "$name" "$name.o" /usr/lib/libSystem.B.dylib
+
+# Every libsystem_* by name, not just libSystem.
+#
+# libSystem contains almost no code: it exports the C library by *re-exporting*
+# seventeen libraries under usr/lib/system. The emulator's own loader follows
+# those edges (that is why `lookup_in` in macho_dyld.cpp recurses), and lld does
+# not follow them out of an extracted tree -- `printf` links, because it happens
+# to be in libsystem_c, and `pthread_mutex_lock` does not. Naming them all is
+# both shorter than diagnosing that per symbol and closer to what is true: they
+# are the libc.
+#
+# MSYS2_ARG_CONV_EXCL because MSYS rewrites an argument beginning with `/` into a
+# Windows path before lld sees it, and every one of these begins with `/`.
+libs="/usr/lib/libSystem.B.dylib"
+for l in usr/lib/system/*.dylib; do libs="$libs /${l}"; done
+
+MSYS2_ARG_CONV_EXCL='*' "$LD" -flavor darwin -arch arm64 \
+      -platform_version macos 15.0 15.0 \
+      -syslibroot . -o "$name" "$name.o" $libs 2>&1 | grep -v 'which is newer than' || true
+[ -f "$name" ] || { echo "build.sh: link produced nothing" >&2; exit 4; }
 rm -f "$name.o"
 echo "built guests/macos/$name"
 echo "  run it with: ./aarch64emu --root guests/macos guests/macos/$name"

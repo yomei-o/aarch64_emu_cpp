@@ -1045,7 +1045,38 @@ bool Syscalls::svc_darwin() {
         // sends libpthread down legacy paths that Apple no longer exercises, which is a
         // worse place to be than on the modern path missing a syscall -- and the missing
         // syscall announces itself, where a legacy path just behaves oddly.
-        case 366: r = 0x4000001F; break;                   // bsdthread_register
+        // x0 is `threadstart`, the address a new thread begins at. Remembering it is
+        // what makes bsdthread_create possible at all: the start routine the guest
+        // passed to pthread_create is an *argument* to that trampoline, not the entry.
+        case 366:
+            bsdthread_entry_ = a0;
+            r = 0x4000001F;
+            break;                                         // bsdthread_register
+        case 360:                                          // bsdthread_create
+            r = sys_bsdthread_create(a0, a1, a2, a3, cpu_.xr(4));
+            if (r < 0) { err = kBsdEINVAL; r = 0; }
+            break;
+        // bsdthread_terminate(stackaddr, size, port, sem). Darwin's thread exit: the
+        // stack is handed back to the kernel to free, which is why it is not freed by
+        // the thread itself. Nothing here unmaps, so only the exit matters.
+        case 361:
+            thread_exit(0);
+            return true;
+        // __disable_threadsignal(0). A thread on its way out tells the kernel to stop
+        // delivering signals to it. Nothing here delivers a signal to a specific
+        // thread, so agreeing costs nothing -- and refusing does not: libpthread calls
+        // it on every exit, so an error is three lines of noise per thread.
+        case 331: r = 0; break;
+        // __ulock_wait / __ulock_wake: Darwin's futex. Both write x0 and the carry
+        // flag themselves and return here without falling into the shared tail,
+        // because a wait switches threads and the tail would land in whichever
+        // thread happens to be running afterwards.
+        case 515:
+            sys_ulock_wait(static_cast<uint32_t>(a0), a1, a2);
+            return true;
+        case 516:
+            sys_ulock_wake(static_cast<uint32_t>(a0), a1);
+            return true;
         case 116: {                                        // gettimeofday
             const uint64_t ns = host_nanos();
             mem_.write<uint64_t>(a0, ns / 1000000000ull);

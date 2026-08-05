@@ -78,5 +78,27 @@ else
     fi
 fi
 
+# ---- four Darwin threads, a mutex, and an answer the host can check -----------
+#
+# The one macOS guest that does have an oracle, and it needs no Mac and no
+# emulator to compute: the workers sum 1..1000, 1..2000, 1..3000 and 1..4000, so
+# the total is fixed arithmetic and the guest prints what it expected alongside
+# what it got. A thread that never ran contributes zero and says so -- which is
+# exactly how the missing preemption in the Darwin run loop was found.
+#
+# `--strict` runs it too, because thread creation is where the host invents the
+# most memory on the guest's behalf: the TSD array, the mach port in tsd[3], and
+# a stack the guest allocated but the kernel is supposed to know about.
+T=guests/macos/threads
+if [ -f "$T" ]; then
+    want="total 15005000 (expected 15005000)"
+    got=$($EMU --root guests/macos "$T" 2>/dev/null | tr -d '\015' | tail -1)
+    check "macos threads (bsdthread_create + ulock)" "$want" "$got"
+    got=$($EMU --strict --root guests/macos "$T" 2>/dev/null | tr -d '\015' | tail -1)
+    check "macos threads --strict" "$want" "$got"
+else
+    echo "skip macos threads (no $T -- run: sh guests/macos/build.sh threads)"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

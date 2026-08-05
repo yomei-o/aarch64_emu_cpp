@@ -150,8 +150,19 @@ public:
     uint64_t preempt_every = 0, preempt_left = 0;
     std::function<void()> on_preempt;
 
-    void run() {
-        while (!halted) {
+    void run() { run_until(0, false); }
+
+    // Step until `halted`, or -- when `bounded` -- until the PC reaches `stop_pc`.
+    //
+    // The bounded form is how the Darwin path runs an initializer and `main`, both of
+    // which return to a sentinel address rather than exiting. It exists as a method
+    // rather than a loop at each call site because the preemption check has to be in
+    // *every* run loop: the Darwin loops were written as bare `while (…) step();` and
+    // so never preempted, which meant `bsdthread_create` could put four threads on the
+    // list and none of them would ever be given the CPU. The guest reported that as a
+    // sum of zero, which is exactly what a thread that never ran contributes.
+    void run_until(uint64_t stop_pc, bool bounded = true) {
+        while (!halted && !(bounded && pc == stop_pc)) {
             step();
             if (preempt_left && --preempt_left == 0) {
                 preempt_left = preempt_every;

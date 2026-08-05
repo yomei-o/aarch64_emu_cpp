@@ -413,7 +413,7 @@ int main(int argc, char** argv) {
                 cpu.setx(3, apple_g);
                 cpu.setx(4, vars_g);
                 cpu.setx(30, kInitReturn);
-                while (!cpu.halted && cpu.pc != kInitReturn) cpu.step();
+                cpu.run_until(kInitReturn);
                 if (cpu.halted) break;
 
             }
@@ -432,7 +432,7 @@ int main(int argc, char** argv) {
         // the host and was really "main returned and nobody was there to catch it".
         constexpr uint64_t kMainReturn = 0x0000'0000'DEAD'3000ull;
         if (darwin) cpu.setx(30, kMainReturn);
-        while (!cpu.halted && cpu.pc != kMainReturn) cpu.step();
+        cpu.run_until(kMainReturn);
         if (!cpu.halted && cpu.pc == kMainReturn && img.exit_fn) {
             if (trace_sys)
                 std::fprintf(stderr, "[main] returned %d; calling exit at %012llX\n",
@@ -440,7 +440,7 @@ int main(int argc, char** argv) {
                              static_cast<unsigned long long>(img.exit_fn));
             cpu.pc = img.exit_fn;
             cpu.setx(30, kMainReturn);          // exit does not return; if it does, stop
-            while (!cpu.halted && cpu.pc != kMainReturn) cpu.step();
+            cpu.run_until(kMainReturn);
         }
         rc = cpu.exit_code;
     } catch (const CpuError& e) {

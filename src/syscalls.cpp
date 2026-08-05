@@ -33,6 +33,8 @@ Syscalls::Syscalls(Cpu& cpu, Memory& mem) : cpu_(cpu), mem_(mem) {
     cpu_.on_svc = [this](uint32_t imm) { return svc(imm); };
 }
 
+// Every syscall returns through here, and a vfork child that has just execed or
+// exited asks the run loop to stop so the parent can be restored.
 bool Syscalls::svc(uint32_t imm) {
     // Linux traps with `svc #0`, Darwin with `svc #0x80`. The immediate is the
     // personality selector, so a Mach-O guest and an ELF guest need no mode flag.
@@ -71,8 +73,17 @@ bool Syscalls::svc(uint32_t imm) {
         case 65: r = sys_readv(static_cast<int>(a0), a1, a2); break;
         // exit ends *this thread*; exit_group ends the process. They are the same
         // thing right up until a second thread exists, and then they are not.
-        case 93: thread_exit(static_cast<int>(a0 & 0xFF)); return true;
-        case 94:
+        case 93: case 94:
+            // A vfork child that exits before it execs -- the `_exit(127)` after a
+            // failed exec, and what `posix_spawn` does when it cannot find the
+            // program. The parent has to come back rather than the whole run ending.
+            if (in_vfork_child()) {
+                vfork_child_status_ = static_cast<int>(a0 & 0xFF) << 8;
+                vfork_returning_ = true;
+                cpu_.stop_requested = true;
+                return true;
+            }
+            if (nr == 93) { thread_exit(static_cast<int>(a0 & 0xFF)); return true; }
             cpu_.exit_code = static_cast<int>(a0 & 0xFF);
             cpu_.halted = true;
             return true;
@@ -100,6 +111,15 @@ bool Syscalls::svc(uint32_t imm) {
         // a context switch the shared tail below would write it into the wrong
         // thread.
         case 220:
+            // A thread is CLONE_VM *and* CLONE_THREAD. Everything else that comes
+            // through here is a new process: musl's `fork()` passes SIGCHLD alone, and
+            // its `posix_spawn()` passes CLONE_VM|CLONE_VFORK -- which shares the
+            // address space but is emphatically not a thread, and taking the thread
+            // path for it would leave two schedulable contexts in one program.
+            if (!((a0 & 0x00000100) && (a0 & 0x00010000))) {
+                cpu_.setx(0, static_cast<uint64_t>(sys_fork()));
+                return true;
+            }
             cpu_.setx(0, static_cast<uint64_t>(sys_clone(a0, a1, a2, a3, a4)));
             return true;
         case 98: sys_futex(a0, static_cast<int>(a1), static_cast<uint32_t>(a2)); return true;
@@ -115,7 +135,62 @@ bool Syscalls::svc(uint32_t imm) {
         // rather than a stub. CMD_QUERY (cmd 0) reads the same 0 as "no expedited
         // commands available", which is also true, and CPython falls back cleanly.
         case 283: r = 0; break;
-        case 261: r = kEINVAL; break;                          // prlimit64
+        // prlimit64(pid, resource, new, old). Answering EINVAL was survivable until
+        // something asked how many descriptors it might have: CPython's
+        // `_posixsubprocess` closes every fd from 3 to the limit before it execs, and
+        // with no answer it falls back to a limit of about twenty million and spends
+        // the run calling close(2) on descriptors that were never open.
+        case 261: {
+            constexpr uint64_t kInfinity = ~0ull;
+            uint64_t cur = kInfinity, max = kInfinity;
+            switch (a1) {
+                case 3: cur = 8u << 20; max = 64u << 20; break;    // RLIMIT_STACK
+                case 7: cur = 256; max = 4096; break;              // RLIMIT_NOFILE
+                default: break;
+            }
+            if (a3) {                                              // the `old` buffer
+                mem_.write<uint64_t>(a3, cur);
+                mem_.write<uint64_t>(a3 + 8, max);
+            }
+            r = 0;
+            break;
+        }
+        // close_range(first, last, flags). One call instead of a loop, and CPython uses
+        // it when it is there -- which is the difference between a child that execs
+        // immediately and one that makes a quarter of a million syscalls first.
+        // epoll_create1 (20) and ppoll (73). CPython's `subprocess` waits on the
+        // child's pipes with one or the other, and refusing both leaves it with no way
+        // to find out that there is data.
+        //
+        // Nothing here runs two processes at once, so by the time the parent polls, the
+        // child has finished and everything it wrote is already in the buffer. "Every
+        // descriptor asked about is ready" is therefore the truthful answer rather than
+        // a convenient one -- a pipe with a dead writer is ready to report end of file
+        // even when it is empty.
+        // epoll_create1: refused on purpose. Python's selectors module tries epoll
+        // first and falls back to poll when it is absent, and poll is the one that can
+        // be answered honestly here -- an epoll set would have to remember
+        // registrations and report edges, which is a lot of machinery for a design
+        // where the child has always already finished.
+        case 20: r = kENOSYS; break;
+        case 73: {                                             // ppoll(fds, n, ...)
+            const uint64_t n = a1;
+            int64_t ready = 0;
+            for (uint64_t i = 0; i < n && i < 64; ++i) {
+                const uint64_t e = a0 + i * 8;                 // struct pollfd
+                const int16_t events = static_cast<int16_t>(mem_.read<uint16_t>(e + 4));
+                mem_.write<uint16_t>(e + 6, static_cast<uint16_t>(events));
+                ++ready;
+            }
+            r = ready;
+            break;
+        }
+        case 436: {
+            const uint64_t last = a1 > 4096 ? 4096 : a1;
+            for (uint64_t fd = a0; fd <= last; ++fd) files.close(static_cast<int>(fd));
+            r = 0;
+            break;
+        }
         case 278: {                                            // getrandom
             for (uint64_t i = 0; i < a1; ++i)
                 mem_.write<uint8_t>(a0 + i, static_cast<uint8_t>(0x9E * (i + 1) + 0x37));
@@ -188,7 +263,23 @@ bool Syscalls::svc(uint32_t imm) {
         case 179: r = 0; break;                                // sysinfo: zeroed is fine
         case 233: r = 0; break;                                // madvise
         case 29: r = -25; break;                               // ioctl: ENOTTY, we are not a tty
-        case 23: case 24: r = static_cast<int64_t>(a0); break;  // dup / dup3: same fd back
+        // dup / dup3. These used to hand the same descriptor back, which is right
+        // only while nothing can have two: a child redirecting its own stdout with
+        // `dup2(pipe_w, 1)` needs fd 1 to *become* the pipe, and getting fd 1 back
+        // unchanged sends its output to the terminal instead of to its parent.
+        case 23: r = files.dup(static_cast<int>(a0), -1); break;
+        case 24: r = files.dup(static_cast<int>(a0), static_cast<int>(a1)); break;
+        case 59: {                                             // pipe2
+            int fds[2];
+            r = files.pipe2(fds);
+            if (r == 0) {
+                mem_.write<uint32_t>(a0, static_cast<uint32_t>(fds[0]));
+                mem_.write<uint32_t>(a0 + 4, static_cast<uint32_t>(fds[1]));
+            }
+            break;
+        }
+        case 221: r = sys_execve(a0, a1, a2); return true;      // execve
+        case 260: r = sys_wait4(static_cast<int64_t>(a0), a1); break;   // wait4
         case 25: r = (a1 == 1 /*F_GETFD*/ || a1 == 3 /*F_GETFL*/) ? 0 : 0; break;   // fcntl
         case 101: r = 0; break;                                // nanosleep: return immediately
         case 169: {                                            // gettimeofday
@@ -221,6 +312,10 @@ bool Syscalls::svc(uint32_t imm) {
             break;
     }
     cpu_.setx(0, static_cast<uint64_t>(r));
+    // A vfork child that has just execed or exited: ask the run loop to stop so the
+    // host can put the parent back. Set after x0, because the value written here
+    // belongs to the child and is about to be discarded with it.
+    if (vfork_pending()) cpu_.stop_requested = true;
     return true;
 }
 
@@ -228,6 +323,11 @@ int64_t Syscalls::sys_write(int fd, uint64_t buf, uint64_t len) {
     if (len == 0) return 0;
     std::vector<uint8_t> tmp(len);
     mem_.read_bytes(buf, tmp.data(), len);
+    // Descriptors 0..2 are the console *unless* something redirected them. A child
+    // about to exec does exactly that -- `dup2(pipe_w, 1)` -- and sending fd 1 to the
+    // terminal regardless made the child's output appear on the screen while its
+    // parent read an empty pipe and reported failure.
+    if (fd >= 0 && fd <= 2 && files.is_open(fd)) return files.write(fd, tmp.data(), len);
     if (fd > 2) return files.write(fd, tmp.data(), len);
     if (output) { output(fd, reinterpret_cast<const char*>(tmp.data()), len); return static_cast<int64_t>(len); }
     if (fd == 1 || fd == 2) {
@@ -240,6 +340,13 @@ int64_t Syscalls::sys_write(int fd, uint64_t buf, uint64_t len) {
 }
 
 int64_t Syscalls::sys_read(int fd, uint64_t buf, uint64_t len) {
+    // The same rule as sys_write: fd 0 is the console until something redirects it.
+    if (fd == 0 && files.is_open(0)) {
+        std::vector<uint8_t> tmp(len);
+        const int64_t n = files.read(0, tmp.data(), len);
+        if (n > 0) mem_.write_bytes(buf, tmp.data(), static_cast<size_t>(n));
+        return n;
+    }
     if (fd > 2) {
         std::vector<uint8_t> tmp(len);
         const int64_t got = files.read(fd, tmp.data(), len);

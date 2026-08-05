@@ -1614,6 +1614,7 @@ bool Syscalls::svc_darwin() {
     if (!err && r < 0) { err = bsd_errno(r); r = 0; }
     if (err) { cpu_.setx(0, static_cast<uint64_t>(err)); cpu_.c = true; }
     else     { cpu_.setx(0, static_cast<uint64_t>(r));   cpu_.c = false; }
+    if (vfork_pending()) cpu_.stop_requested = true;
     return true;
 }
 

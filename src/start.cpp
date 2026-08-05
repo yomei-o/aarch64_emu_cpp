@@ -69,6 +69,9 @@ void darwin_prepare(Cpu& cpu, Memory& mem, Syscalls& sys, const LoadedImage& img
 // code. `trace` only controls the running commentary.
 int run_image(Cpu& cpu, Memory& mem, Syscalls& sys, const LoadedImage& img,
               bool darwin, uint64_t start_pc, bool trace) {
+    // A vfork child that execs or exits asks the run loop to stop; this is what puts
+    // the parent back so the same loop can carry on with it.
+    cpu.on_stop_requested = [&sys] { sys.vfork_resume(); };
     if (!img.initializers.empty()) {
         constexpr uint64_t kInitReturn = 0x0000'0000'DEAD'1000ull;
         const uint64_t sp0 = cpu.sp;

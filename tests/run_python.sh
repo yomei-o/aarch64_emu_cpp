@@ -80,5 +80,27 @@ with ThreadPoolExecutor(max_workers=4) as ex:
     r=list(ex.map(work, range(20)))
 print(len(r), r[0], r[-1])' 2>/dev/null | norm)"
 
+# ---- a child process, which is fork + execve + a pipe + wait4 -----------------
+#
+# `subprocess` is the shape gcc and make need: fork, redirect the child's stdout onto
+# a pipe, exec, and wait. The oracle is the host's own sha256 of the same file, and
+# it goes through a *second* guest -- busybox -- so a pass says the parent's pipe, the
+# child's redirect and the exec all lined up.
+#
+# The child runs to completion before the parent resumes (see src/process.cpp), which
+# is why the pipe buffer is unbounded and why this is `capture_output` rather than a
+# streaming read.
+if [ -f guests/busybox ]; then
+    cp guests/busybox guests/sysroot/busybox 2>/dev/null || true
+    want="$(sha256sum guests/busybox | cut -d' ' -f1)"
+    got=$($EMU $PY -c '
+import subprocess
+r = subprocess.run(["/busybox","sha256sum","/busybox"], capture_output=True)
+print(r.returncode, r.stdout.split()[0].decode())' 2>/dev/null | norm)
+    check "python subprocess (fork/exec/pipe/wait)" "0 $want" "$got"
+else
+    echo "skip python subprocess (no guests/busybox)"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

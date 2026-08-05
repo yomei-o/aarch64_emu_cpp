@@ -33,6 +33,16 @@ public:
     std::function<int64_t(char* dst, uint64_t len)> input;
     std::function<int64_t(int fd, void* dst, uint64_t len, uint64_t off)> file_read;
     std::function<void(uint64_t nr)> unknown;
+    // Run another program to completion and return its exit status, sharing this
+    // process's descriptors. The host supplies it because loading a program means
+    // reading files and choosing an address-space layout, which is the front end's
+    // job -- `main.cpp` and `web/wasm_api.cpp` each have their own.
+    //
+    // Returning -1 means "could not start it", which `execve` reports as ENOENT.
+    std::function<int(const std::string& path,
+                      const std::vector<std::string>& argv,
+                      const std::vector<std::string>& envp,
+                      Files& files)> spawn;
 
     // Signal delivery, in signals.cpp. Returns false when nothing is installed --
     // then the caller reports the fault, which is the default action anyway.
@@ -128,6 +138,41 @@ private:
     bool schedule(bool must_move);
     uint64_t current_tid() const;
     int64_t sys_clone(uint64_t flags, uint64_t stack, uint64_t ptid, uint64_t tls, uint64_t ctid);
+    // fork/execve/wait4, in process.cpp. See the note there: the child is a *vfork*
+    // child -- the parent is suspended and the two never run at the same time.
+    int64_t sys_fork();
+    int64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp);
+    int64_t sys_wait4(int64_t pid, uint64_t status_addr);
+    bool in_vfork_child() const { return vfork_depth_ > 0; }
+public:
+    // True when a vfork child has just finished and the parent is waiting to be put
+    // back. The run loop checks it; `vfork_resume()` does the putting back.
+    bool vfork_pending() const { return vfork_returning_; }
+    void vfork_resume();
+private:
+    // The parent's registers, saved across a vfork child. A vector because a child
+    // may fork again -- `make` does, and `gcc` does under it.
+    std::vector<Cpu::Context> vfork_saved_;
+    // The parent's descriptor table, saved across a vfork child.
+    //
+    // Real vfork *shares* the table, and POSIX therefore forbids a child from touching
+    // it -- but every real fork+exec does touch it, because redirecting the child's
+    // standard streams is the entire point. CPython's `_posixsubprocess` dup2s the pipe
+    // onto fd 1 and closes the rest, relying on fork having given it a copy.
+    //
+    // Sharing it left the *parent* with fd 1 pointing at the pipe after the child was
+    // gone, so the parent's own `print` went into a buffer nobody read and the run
+    // ended silently with status 1. The pipes themselves are shared_ptr, so what the
+    // child wrote survives the copy -- which is the half that does have to be shared.
+    std::vector<Files> vfork_files_;
+    int vfork_depth_ = 0;
+    // What the last child exited with, by pid, for wait4 to report.
+    std::map<int, int> child_status_;
+    int next_pid_ = 2000;
+    // Set when a vfork child reaches execve or _exit: the run loop stops stepping and
+    // `sys_fork` resumes the parent.
+    bool vfork_returning_ = false;
+    int vfork_child_pid_ = 0, vfork_child_status_ = 0;
     int64_t sys_bsdthread_create(uint64_t fn, uint64_t arg, uint64_t stack,
                                  uint64_t self, uint64_t flags);
     // Darwin's futex. Both write x0 *and* the carry flag themselves, because the

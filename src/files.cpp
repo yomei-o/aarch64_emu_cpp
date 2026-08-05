@@ -62,7 +62,11 @@ int64_t Files::open(const std::string& path, int flags, int mode) {
     if (!fp && (flags & kO_CREAT)) fp = std::fopen(hp.c_str(), "w+b");
     if (!fp) return kENOENT;
     const int fd = next_fd_++;
-    open_[fd] = {fp, hp, true};
+    Entry e;
+    e.fp = fp;
+    e.path = hp;
+    e.used = true;
+    open_[fd] = std::move(e);
     return fd;
 }
 
@@ -70,8 +74,48 @@ int64_t Files::close(int fd) {
     auto it = open_.find(fd);
     if (it == open_.end()) return kEBADF;
     if (it->second.fp) std::fclose(it->second.fp);
+    if (it->second.pipe) {
+        // Which end is closing matters: a reader that sees no writers left is at end
+        // of file, and a reader that sees one is merely waiting. Getting this wrong
+        // makes `cat` in a pipeline either stop early or never stop at all.
+        if (it->second.writable) --it->second.pipe->writers;
+        else --it->second.pipe->readers;
+    }
     open_.erase(it);
     return 0;
+}
+
+int64_t Files::pipe2(int fds[2]) {
+    auto p = std::make_shared<Pipe>();
+    p->readers = 1;
+    p->writers = 1;
+    const int r = next_fd_++, w = next_fd_++;
+    Entry re; re.used = true; re.pipe = p; re.writable = false;
+    Entry we; we.used = true; we.pipe = p; we.writable = true;
+    open_[r] = std::move(re);
+    open_[w] = std::move(we);
+    fds[0] = r;
+    fds[1] = w;
+    return 0;
+}
+
+int64_t Files::dup(int oldfd, int newfd) {
+    auto it = open_.find(oldfd);
+    if (it == open_.end()) return kEBADF;
+    if (newfd < 0) newfd = next_fd_++;
+    else if (newfd != oldfd) close(newfd);          // dup2 silently replaces
+    else return newfd;                              // dup2(fd, fd) is a no-op
+    Entry e = it->second;
+    // A duplicated descriptor is another *reference*, so the end counts go up. The
+    // std::FILE* is shared rather than reopened, which means closing either one closes
+    // the file -- wrong in general, right for the only thing that duplicates a file
+    // descriptor here, which is a child redirecting its own standard streams.
+    if (e.pipe) { if (e.writable) ++e.pipe->writers; else ++e.pipe->readers; }
+    e.fp = nullptr;                                 // only the original owns it
+    e.path = it->second.path;
+    open_[newfd] = std::move(e);
+    if (newfd >= next_fd_) next_fd_ = newfd + 1;
+    return newfd;
 }
 
 // getdents64: pack linux_dirent64 records until the buffer is full.
@@ -143,12 +187,35 @@ int64_t Files::getdirentries64(int fd, void* buf, uint64_t len) {
 int64_t Files::read(int fd, void* dst, uint64_t len) {
     auto it = open_.find(fd);
     if (it == open_.end()) return kEBADF;
+    if (it->second.pipe) {
+        Pipe& p = *it->second.pipe;
+        const size_t have = p.buf.size() - p.pos;
+        if (!have) {
+            // No data. With writers still open a real kernel would block; nothing here
+            // can run the writer while this call is in progress, so returning 0 -- end
+            // of file -- is the honest answer for this design and the caller stops
+            // rather than spinning. See the note on Pipe.
+            return 0;
+        }
+        const size_t n = have < len ? have : static_cast<size_t>(len);
+        std::memcpy(dst, p.buf.data() + p.pos, n);
+        p.pos += n;
+        return static_cast<int64_t>(n);
+    }
+    if (!it->second.fp) return kEBADF;
     return static_cast<int64_t>(std::fread(dst, 1, len, it->second.fp));
 }
 
 int64_t Files::write(int fd, const void* src, uint64_t len) {
     auto it = open_.find(fd);
     if (it == open_.end()) return kEBADF;
+    if (it->second.pipe) {
+        Pipe& p = *it->second.pipe;
+        const auto* b = static_cast<const uint8_t*>(src);
+        p.buf.insert(p.buf.end(), b, b + len);
+        return static_cast<int64_t>(len);
+    }
+    if (!it->second.fp) return kEBADF;
     return static_cast<int64_t>(std::fwrite(src, 1, len, it->second.fp));
 }
 

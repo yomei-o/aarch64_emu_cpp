@@ -14,6 +14,7 @@
 #include <map>
 #include <string>
 #include <utility>
+#include <memory>
 #include <vector>
 
 namespace a64 {
@@ -28,6 +29,16 @@ public:
     int64_t read(int fd, void* dst, uint64_t len);
     int64_t write(int fd, const void* src, uint64_t len);
     int64_t lseek(int fd, int64_t off, int whence);
+    // Has this descriptor been opened or redirected here? Descriptors 0..2 are the
+    // console by default and are not in the table; a `dup2` onto one puts it there.
+    bool is_open(int fd) const { return open_.count(fd) != 0; }
+    // A pipe. Writes the two descriptors into `fds` and returns 0.
+    int64_t pipe2(int fds[2]);
+    // dup/dup2. `newfd` of -1 means "the lowest free one", which is dup(2).
+    int64_t dup(int oldfd, int newfd);
+    // Everything an `execve` should keep. Descriptors survive it -- that is how a
+    // shell redirects -- so this is what a spawned child inherits.
+    Files clone_for_exec() const { return *this; }
     int64_t pread(int fd, void* dst, uint64_t len, uint64_t off);
     // Fills a Linux AArch64 `struct stat` (128 bytes). Returns 0 or -errno.
     int64_t fstat(int fd, void* statbuf);
@@ -47,8 +58,27 @@ public:
     std::string cwd = "/";
 
 private:
+    // A pipe: one buffer, two descriptors. Shared between the two ends and, because
+    // descriptors survive `execve`, between a parent and the child it spawned -- which
+    // is the whole point of having one.
+    //
+    // The buffer grows without limit, and that is a decision rather than an oversight.
+    // A real pipe blocks the writer at 64 KiB and expects the reader to be running
+    // concurrently; nothing here runs two processes at once (see `sys_fork`), so a
+    // bounded buffer would be a deadlock rather than back-pressure. The cost is memory
+    // for output nobody has read yet.
+    struct Pipe {
+        std::vector<uint8_t> buf;
+        size_t pos = 0;              // how much the reader has taken
+        int readers = 0, writers = 0;
+        bool empty() const { return pos >= buf.size(); }
+    };
+
     struct Entry {
         std::FILE* fp = nullptr;
+        // Non-null for a pipe end; `writable` says which end this descriptor is.
+        std::shared_ptr<Pipe> pipe;
+        bool writable = false;
         std::string path;
         bool used = false;
         // A directory descriptor holds its listing instead of a file handle. Python's

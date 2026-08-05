@@ -330,6 +330,95 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // Running a child program. `execve` in a vfork child calls this, and what it does
+    // is the whole of the compromise described in process.cpp: the child runs here, to
+    // completion, in its own Memory and Cpu, and only then does the parent resume.
+    //
+    // The descriptors are *shared*, not copied, which is what makes a pipe between the
+    // two work at all -- the child writes into a buffer the parent still holds.
+    //
+    // Recursion is expected: gcc's driver execs cc1, and cc1 could exec something else.
+    // The depth is capped because a guest that execs itself would otherwise recurse
+    // until the host's stack ran out, and a stack overflow says nothing about why.
+    static int spawn_depth = 0;
+    sys.spawn = [&](const std::string& prog, const std::vector<std::string>& sargv,
+                    const std::vector<std::string>& senvp, Files& parent_files) -> int {
+        if (spawn_depth >= 8) {
+            std::fprintf(stderr, "aarch64emu: refusing to nest more than 8 processes\n");
+            return -1;
+        }
+        std::string host = prog;
+        if (!root.empty() && root != "." && !host.empty() && host[0] == '/') host = root + host;
+        const std::vector<uint8_t> cfile = read_file(host.c_str());
+        if (cfile.empty()) return -1;
+
+        Memory cmem;
+        Cpu ccpu(cmem);
+        Syscalls csys(ccpu, cmem);
+        csys.trace = trace_sys;
+        csys.dyld_section_info = dyld_sections;
+        csys.files = parent_files;            // descriptors survive exec; that is the point
+        csys.files.set_root(root);
+        csys.spawn = sys.spawn;               // a child may spawn in turn
+        ccpu.on_undefined = [&csys](uint32_t, uint64_t at) { return csys.deliver_signal(4, at); };
+
+        LoadedImage cimg;
+        std::string cerr_s;
+        const bool cdarwin = is_macho(cfile);
+        auto cread = [&](const std::string& gp) {
+            std::string hp = gp;
+            if (!root.empty() && root != "." && !hp.empty() && hp[0] == '/') hp = root + hp;
+            return read_file(hp.c_str());
+        };
+        bool ok;
+        if (cdarwin) {
+            MachoImage probe;
+            if (!macho_parse(cfile, &probe, &cerr_s)) return -1;
+            ok = probe.needs_dyld
+                ? macho_link(cfile, prog, cmem, 0x0000'0002'0000'0000ull, cread, &cimg, &cerr_s)
+                : load_macho(cfile, cmem, 0, &cimg, &cerr_s);
+        } else {
+            ok = load_elf(cfile, cmem, kPieBase, &cimg, &cerr_s);
+        }
+        if (!ok) {
+            std::fprintf(stderr, "aarch64emu: cannot run %s: %s\n", prog.c_str(), cerr_s.c_str());
+            return -1;
+        }
+        uint64_t cstart = 0, cinterp = 0;
+        if (!cdarwin && !cimg.interp.empty()) {
+            const std::vector<uint8_t> ifile = cread(cimg.interp);
+            if (ifile.empty()) return -1;
+            LoadedImage interp2;
+            if (!load_elf(ifile, cmem, kInterpBase, &interp2, &cerr_s)) return -1;
+            cinterp = interp2.base;
+            cstart = interp2.entry;
+        }
+        cmem.set(kStackTop - (1u << 20), 0, 1u << 20);
+        cmem.map(kStackTop - (1u << 20), 1u << 20);
+        ccpu.sp = cdarwin ? build_stack_darwin(cmem, kStackTop, prog, sargv, senvp)
+                          : build_stack(cmem, kStackTop, cimg, cinterp, sargv, senvp);
+        ccpu.pc = cstart ? cstart : cimg.entry;
+        csys.set_brk(cimg.brk);
+        csys.set_mmap_base(kMmapBase);
+        csys.exe_path = prog;
+        if (cdarwin) darwin_prepare(ccpu, cmem, csys, cimg);
+
+        ++spawn_depth;
+        int cstatus;
+        try {
+            cstatus = run_image(ccpu, cmem, csys, cimg, cdarwin, cstart, trace_sys);
+        } catch (const CpuError& e) {
+            std::fflush(stdout);
+            std::fprintf(stderr, "\naarch64emu: in child %s: %s\n", prog.c_str(), e.what.c_str());
+            cstatus = 127;
+        }
+        --spawn_depth;
+        // The parent's descriptor table gets the child's back: the child may have
+        // written into a pipe, and the buffer lives in the entry.
+        parent_files = csys.files;
+        return cstatus;
+    };
+
     int rc = 0;
     try {
         rc = run_image(cpu, mem, sys, img, darwin, start_pc, trace_sys);

@@ -161,15 +161,33 @@ public:
     // so never preempted, which meant `bsdthread_create` could put four threads on the
     // list and none of them would ever be given the CPU. The guest reported that as a
     // sum of zero, which is exactly what a thread that never ran contributes.
+    // Set by a vfork child reaching execve or _exit: the run loop stops so the host
+    // can restore the parent. A flag rather than an exception because the parent
+    // resumes in the same loop, one instruction later.
+    bool stop_requested = false;
+
     void run_until(uint64_t stop_pc, bool bounded = true) {
-        while (!halted && !(bounded && pc == stop_pc)) {
-            step();
-            if (preempt_left && --preempt_left == 0) {
-                preempt_left = preempt_every;
-                if (on_preempt) on_preempt();
+        for (;;) {
+            while (!halted && !stop_requested && !(bounded && pc == stop_pc)) {
+                step();
+                if (preempt_left && --preempt_left == 0) {
+                    preempt_left = preempt_every;
+                    if (on_preempt) on_preempt();
+                }
             }
+            // A vfork child finished: the host puts the parent back and the loop
+            // carries on with it. Handled here rather than at the call sites because
+            // there are four of them and a missed one is a run that ends when a
+            // *child* exits.
+            if (stop_requested && on_stop_requested) {
+                stop_requested = false;
+                on_stop_requested();
+                continue;
+            }
+            return;
         }
     }
+    std::function<void()> on_stop_requested;
     void step();
 
     Memory& mem() { return mem_; }

@@ -48,35 +48,48 @@ were in the way are done, and the fourth needs a Mac for ten minutes.
   and reads a file with opendir/readdir/fopen/fgets, and the host computes the same
   counts and hashes from the same tree. This is the path CPython walks looking for
   its standard library.
-- **What is left is the libraries.** The stock CPython for macOS
-  (`aarch64-apple-darwin` from python-build-standalone, no Mac needed to download)
-  loads far enough to name exactly what it wants and nothing more:
+- ✅ **The libraries are extracted.** 141 files, 229 MB, from a Mac's cache:
+  CoreFoundation, SystemConfiguration, Foundation, libncurses, libpanel, libedit,
+  libz and their closure. The command is below; it needs a Mac for one minute.
+- **The stock macOS CPython loads, links and runs into its own startup.** That is
+  the live frontier, and it needs `--dyld-sections`:
 
-      CoreFoundation, SystemConfiguration, libncurses.5.4, libpanel.5.4,
-      libedit.3, libz.1
+      ./aarch64emu --dyld-sections --root guests/macos_py guests/macos_py/bin/python3.13 -c 'print(1)'
 
-  None are in the 48-library extraction. They exist only inside a Mac's dyld shared
-  cache, so getting them is `tools/dsc_extract.c` on a Mac, once. The whole of it:
+  Without the flag it stops in libxpc with "API Misuse: Messages must be
+  dictionaries" -- an XPC object failing its own type check, which is
+  `object_getClass` against a class libobjc realizes properly only when it can read
+  the cache's preoptimized tables. So the flag is no longer a curiosity: it is the
+  difference between libobjc being approximately right and right.
 
-      cc -O2 -o dsc_extract tools/dsc_extract.c
-      ./dsc_extract -o out --only /usr/lib/           --only /System/Library/Frameworks/ --only /System/Library/PrivateFrameworks/           /System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e           /usr/lib/libSystem.B.dylib /usr/lib/libobjc.A.dylib /usr/lib/libobjc-env.dylib           /usr/lib/libz.1.dylib /usr/lib/libedit.3.dylib           /usr/lib/libncurses.5.4.dylib /usr/lib/libpanel.5.4.dylib           /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation           /System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration
+  With it, the run gets past all of that and then **spins in CPython's `take_gil`**,
+  a million `__psynch_cvwait` calls deep, with `gil->locked` still holding the -1
+  its static initialiser wrote. -1 is CPython's "the GIL has not been created", so
+  `create_gil` never ran while `take_gil` did -- verified by watching the struct:
+  nothing writes to it after the initialiser, not even `pthread_cond_init`.
 
-  The `--only` prefixes are not decoration: CoreFoundation's dependency closure reaches
-  most of the system without them. `/usr/lib/libobjc-env.dylib` is in the list for a
-  different reason — Sequoia's libobjc parses the whole `OBJC_PRINT_*` diagnostic
-  vocabulary through it, so without it `--setenv OBJC_HELP=YES` prints nothing, and the
-  runtime's own account of what it is doing is unavailable.
+  **`--strict` points at the likely cause four million instructions earlier:**
 
-  Then `python-build-standalone`'s macOS build, which needs no Mac to fetch:
+      aarch64emu: unmapped read at 000000000000001C (--strict)
+      _xpc_pipe_check_in_once  <- _xpc_pipe_routine <- bootstrap_look_up3
 
-      cd guests && curl -Lo mac-py.tgz         'https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-aarch64-apple-darwin-install_only_stripped.tar.gz'
-      mkdir -p macpy && tar xzf mac-py.tgz -C macpy    # the symlinks fail on Windows; harmless
+  a **null XPC pipe**, because `bootstrap_look_up` of
+  `com.apple.system.notification_center` has no launchd to answer it. Permissive
+  memory reads the zero and carries on, which is exactly the failure mode `--strict`
+  exists to catch. So the next job is to make the bootstrap path fail *cleanly* --
+  a stand-in bootstrap server that answers "no such service" -- rather than hand
+  libxpc a pipe that is not there. Callers degrade gracefully on a real Mac when a
+  service is missing; they do not survive a null pipe.
+
+  Still unanswered on this guest, in case one of them matters more than it looks:
+  sysctl `{1,14,1,pid}` (KERN_PROC_PID, a kinfo_proc), and MIG routines
+  1073742031 / 1073742628 sent to port 0.
 
 Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agree byte for
 byte over the whole macOS run, which is the best differential oracle here for anyone
 without a cross-compiler.
 
-Run the five suites before touching anything — they should be 9 / 11 / 9 / 7 / 7, plus 8 for
+Run the five suites before touching anything — they should be 9 / 11 / 9 / 7 / 8, plus 8 for
 `node web/test_node.mjs` if emscripten is around:
 
     sh tests/run_tests.sh    sh tests/run_macho.sh
@@ -119,7 +132,10 @@ The tools built for this, all of which take addresses straight out of a trace:
     tools/dis_macho.py       disassemble at a virtual address in a cache-extracted library
     tools/dyld_slots.py      names 98 of dyld's API vtable slots
     tools/profile_pcs.py     a --sample trace -> a per-function profile
+    --list-unresolved        every unresolved symbol, not the first forty
     tools/dsc_extract.c      re-extract from a Mac's shared cache (only if the OS changes)
+    guests/macos/build.sh    build a new macOS guest with clang+lld, no Mac and no SDK
+    guests/macos/stub_libs.sh  stand-in dylibs for libraries not yet extracted
 
 Two habits this project runs on, both earned the hard way and both worth keeping:
 
@@ -152,7 +168,7 @@ against *itself* under two memory modes, which turns out to be a sharp test (see
                                           LC_DYLD_INFO opcode programs
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
-    sh tests/run_macos.sh      7 passed   the macOS guests: hello, threads, files
+    sh tests/run_macos.sh      8 passed   the macOS guests: hello, threads, tls, files
     node web/test_node.mjs     8 passed   the same guests under WebAssembly
 
 What works:

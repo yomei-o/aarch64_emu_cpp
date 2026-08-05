@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -41,6 +42,54 @@ public:
         cache_vpn_ = vpn; cache_ = it->second.get();
         return cache_;
     }
+
+    // The page a *write* is about to land on. Identical to `page()` except that it
+    // records the page's previous contents in every open journal, which is what makes
+    // `fork` honest -- see begin_journal().
+    uint8_t* page_for_write(uint64_t addr) {
+        if (!journals_.empty()) {
+            const uint64_t vpn = addr >> kPageBits;
+            const bool existed = pages_.find(vpn) != pages_.end();
+            for (auto& j : journals_) {
+                if (j.count(vpn)) continue;          // already saved under this journal
+                if (!existed) {
+                    j.emplace(vpn, nullptr);         // null = "did not exist; erase it"
+                } else {
+                    auto copy = std::make_unique<uint8_t[]>(kPageSize);
+                    std::memcpy(copy.get(), pages_[vpn].get(), kPageSize);
+                    j.emplace(vpn, std::move(copy));
+                }
+            }
+        }
+        return page(addr);
+    }
+
+    // Undo logs, for `fork`.
+    //
+    // A forked child has to be unable to affect its parent's memory, and copying the
+    // whole address space to guarantee that costs hundreds of megabytes for a guest
+    // like CPython. What the parent actually needs is only the pages the child *wrote*,
+    // which is a handful: between fork and exec a child sets up descriptors, and even
+    // Darwin's `_libSystem_atfork_child()` only touches malloc's and libdispatch's
+    // globals. So this records the previous contents of each page on its first write
+    // and puts them back afterwards.
+    //
+    // Nested, because a child may fork again -- `make` runs `gcc` runs `cc1`. A page is
+    // saved into *every* open journal rather than only the innermost, so an inner
+    // rollback and an inner discard are both correct without the outer one knowing
+    // which happened.
+    void begin_journal() { journals_.emplace_back(); }
+    void rollback_journal() {
+        if (journals_.empty()) return;
+        for (auto& kv : journals_.back()) {
+            if (kv.second) std::memcpy(page(kv.first << kPageBits), kv.second.get(), kPageSize);
+            else pages_.erase(kv.first);
+        }
+        journals_.pop_back();
+        cache_ = nullptr;                            // the one-entry lookup cache may
+        cache_vpn_ = ~0ull;                          // point at a page just erased
+    }
+    void discard_journal() { if (!journals_.empty()) journals_.pop_back(); }
 
     // `--strict`: a guest access to a page nothing ever mapped is a fault, not a zero.
     //
@@ -98,7 +147,7 @@ public:
             on_watch(a, sizeof(T), as_u64, true);
         }
         if (((a & kPageMask) + sizeof(T)) <= kPageSize) {
-            std::memcpy(page(a) + (a & kPageMask), &v, sizeof(T)); return;
+            std::memcpy(page_for_write(a) + (a & kPageMask), &v, sizeof(T)); return;
         }
         write_bytes(a, &v, sizeof(T));
     }
@@ -117,7 +166,7 @@ public:
         while (n) {
             const uint64_t off = a & kPageMask;
             const uint64_t k = std::min(n, kPageSize - off);
-            std::memcpy(page(a) + off, s, k);
+            std::memcpy(page_for_write(a) + off, s, k);
             a += k; s += k; n -= k;
         }
     }
@@ -125,7 +174,7 @@ public:
         while (n) {
             const uint64_t off = a & kPageMask;
             const uint64_t k = std::min(n, kPageSize - off);
-            std::memset(page(a) + off, byte, k);
+            std::memset(page_for_write(a) + off, byte, k);
             a += k; n -= k;
         }
     }
@@ -144,6 +193,8 @@ public:
 
 private:
     std::unordered_map<uint64_t, std::unique_ptr<uint8_t[]>> pages_;
+    // One undo log per open journal; see begin_journal().
+    std::vector<std::map<uint64_t, std::unique_ptr<uint8_t[]>>> journals_;
     uint64_t cache_vpn_ = ~0ull;
     uint8_t* cache_ = nullptr;
 };

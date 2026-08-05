@@ -54,6 +54,11 @@ std::vector<std::string> read_strv(Memory& mem, uint64_t addr, size_t cap = 4096
 int64_t Syscalls::sys_fork() {
     vfork_saved_.push_back(cpu_.save_context());
     vfork_files_.push_back(files);
+    // From here every page the child writes is recorded, and put back when the child
+    // is done. That is what makes this a *fork* rather than a vfork: the parent's
+    // memory is genuinely unaffected, without copying an address space that is
+    // hundreds of megabytes for a guest like CPython.
+    mem_.begin_journal();
     ++vfork_depth_;
     const int pid = next_pid_++;
     vfork_child_pid_ = pid;
@@ -116,6 +121,7 @@ void Syscalls::vfork_resume() {
     vfork_saved_.pop_back();
     files = vfork_files_.back();
     vfork_files_.pop_back();
+    mem_.rollback_journal();
     child_status_[vfork_child_pid_] = vfork_child_status_;
     cpu_.setx(0, static_cast<uint64_t>(vfork_child_pid_));
     // Darwin's `fork` returns the pid in x0 *and* a flag in x1 -- 1 in the child, 0 in
@@ -124,6 +130,11 @@ void Syscalls::vfork_resume() {
     // like a child to libsyscall's wrapper, which took the child's branch in a process
     // whose stack said otherwise. Harmless on the Linux side, where x1 is scratch.
     cpu_.setx(1, 0);
+    // And the carry flag, which is how Darwin reports failure. The parent's saved
+    // context was taken *inside* the fork syscall, before the shared tail cleared it,
+    // so a carry left set by whatever the child did last made libsyscall read the
+    // child's pid as an errno: "OSError: [Errno 2000] Unknown error: 2000".
+    cpu_.c = false;
     if (trace)
         std::fprintf(stderr, "[proc] child %d exited %d; parent resumes at pc %llX sp %llX\n",
                      vfork_child_pid_, vfork_child_status_ >> 8,

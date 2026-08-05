@@ -1154,31 +1154,25 @@ bool Syscalls::svc_darwin() {
         // number is a syscall that quietly fails.
         //
         //   2  fork      41 dup       42 pipe      90 dup2
-        //   7  wait4    147 execve   230 poll
+        //   7  wait4     59 execve   230 poll
         //
         // `fork` is the odd one: Darwin returns the pid in x0 *and* a flag in x1 --
         // 1 in the child, 0 in the parent -- because the child and parent otherwise
         // cannot be told apart when the pid is 0. libsyscall's wrapper reads x1.
-        // fork is **refused on Darwin**, and that is a finding rather than a gap.
+        // fork. Darwin returns the pid in x0 *and* a flag in x1 -- 1 in the child,
+        // 0 in the parent -- because with a pid of 0 the two are otherwise
+        // indistinguishable, and libsyscall's wrapper reads x1.
         //
-        // The vfork model in process.cpp works on Linux because musl's `fork()` is a
-        // bare `clone` and the child touches nothing but descriptors before it execs.
-        // Darwin's wrapper is not bare: it runs `_libSystem_atfork_child()`, which
-        // reinitialises malloc's zones, libdispatch's queues and libnotify's state --
-        // and with a shared address space it does that *in the parent's heap*. The
-        // parent then limps on and dies half a billion instructions later, nowhere
-        // near the cause.
-        //
-        // ENOSYS is what CPython needs to hear: `subprocess` falls back from
-        // `fork_exec` to `posix_spawn`, which on Darwin is one syscall that does the
-        // whole job in the kernel and never runs guest code in the parent's memory.
-        // That is the next piece of work, and it is the right one.
+        // This was refused for a while, and what made it possible is the memory
+        // journal in Memory::begin_journal(). Darwin's `fork()` wrapper is not the
+        // bare `clone` musl's is: it runs `_libSystem_atfork_child()`, which
+        // reinitialises malloc's zones, libdispatch's queues and libnotify's state.
+        // With the parent's address space merely *shared*, that reinitialised the
+        // parent's heap and the parent limped on to die half a billion instructions
+        // later. With every page the child writes recorded and put back, it does not.
         case 2:
-            std::fprintf(stderr,
-                         "[proc] fork() refused on Darwin: the child would run "
-                         "_libSystem_atfork_child() in the parent's memory. "
-                         "posix_spawn is the path (see process.cpp).\n");
-            err = kBsdENOSYS;
+            r = sys_fork();
+            cpu_.setx(1, 1);                 // this return is the child's
             break;
         case 42: {                                         // pipe: fds come back in
             int fds[2];                                    // x0 and x1, not a buffer
@@ -1190,7 +1184,13 @@ bool Syscalls::svc_darwin() {
         }
         case 41: r = files.dup(static_cast<int>(a0), -1); break;
         case 90: r = files.dup(static_cast<int>(a0), static_cast<int>(a1)); break;
-        case 147: r = sys_execve(a0, a1, a2); return true;  // execve
+        // execve is **59**, the classic BSD number. 147 is `setsid`, and the scan
+        // that produced 147 for execve had over-run into the next stub: `_execve`
+        // begins with a branch through an interposable slot rather than with
+        // `movz x16`. What the guest actually issues is the number to trust.
+        case 59: r = sys_execve(a0, a1, a2); return true;
+        case 147: r = 1000; break;                         // setsid: one session here
+        case 362: r = 0; break;                            // kqueue: no events, ever
         case 7: r = sys_wait4(static_cast<int64_t>(a0), a1); break;
         // poll(fds, n, timeout). Same answer as the Linux ppoll and for the same
         // reason: nothing here runs two processes at once, so by the time a parent

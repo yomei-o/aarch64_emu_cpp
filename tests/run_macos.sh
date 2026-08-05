@@ -209,30 +209,6 @@ fi
 # ---- CPython's own threads, on Darwin -----------------------------------------
 #
 # `guests/macos/threads` proves bsdthread_create works; this proves it works for a
-# guest that did not have its pthread calls written by hand. The arithmetic is the
-# same on purpose -- four workers summing 1..1000 through 1..4000 -- so a failure
-# here and a failure there are directly comparable.
-#
-# It found a real bug the day it was written: __psynch_cvsignal is syscall 304 and
-# was answered at 303, so a waiter was never woken and `Thread.join()` hung with no
-# diagnostic. The numbers are in libsystem_kernel, one `movz x16, #N` per stub.
-if [ -f "$P" ]; then
-    code="import threading
-t=[]; total=[0]; lock=threading.Lock()
-def w(n):
-    s=sum(range(1,n+1))
-    with lock: total[0]+=s
-for n in (1000,2000,3000,4000):
-    x=threading.Thread(target=w,args=(n,)); x.start(); t.append(x)
-for x in t: x.join()
-print('threads', total[0])"
-    got=$($EMU --dyld-sections --root guests/macos_py "$P" -c "$code" 2>/dev/null | tr -d '')
-    check "macos cpython threading" "threads 15005000" "$got"
-fi
-
-# ---- CPython's own threads, on Darwin -----------------------------------------
-#
-# `guests/macos/threads` proves bsdthread_create works; this proves it works for a
 # guest whose pthread calls nobody here wrote. The arithmetic is deliberately the
 # same -- four workers summing 1..1000 through 1..4000 -- so a failure here and a
 # failure there are directly comparable.
@@ -253,6 +229,28 @@ for x in t: x.join()
 print('threads', total[0])"
     got=$($EMU --dyld-sections --root guests/macos_py "$P" -c "$code" 2>/dev/null | tr -d '\015')
     check "macos cpython threading" "threads 15005000" "$got"
+fi
+
+# ---- a child process on Darwin ------------------------------------------------
+#
+# The macOS CPython spawning the macOS CPython: fork, redirect onto a pipe, exec,
+# wait. Two things make this a sharper test than the Linux one.
+#
+# Darwin's `fork()` wrapper is not a bare `clone`. It runs
+# `_libSystem_atfork_child()`, which reinitialises malloc's zones, libdispatch's
+# queues and libnotify's state -- so without the memory journal in
+# Memory::begin_journal() the child does that to the *parent's* heap, and the
+# parent limps on to die half a billion instructions later. This passing is what
+# says the journal works.
+#
+# And the child is a whole second macOS start-up inside the first: 141 libraries,
+# dyld's job done twice, nested.
+if [ -f "$P" ]; then
+    code="import subprocess
+r = subprocess.run(['/install/bin/python3.13','-c','print(6*7)'], capture_output=True)
+print(r.returncode, r.stdout.decode().strip())"
+    got=$($EMU --dyld-sections --root guests/macos_py "$P" -c "$code" 2>/dev/null | tr -d '')
+    check "macos cpython subprocess (fork/exec/pipe/wait)" "0 42" "$got"
 fi
 
 echo "$pass passed, $fail failed"

@@ -84,56 +84,104 @@ Three more from the same stretch, each found by the guest saying so:
   libraries are up, and so does `run_image()` now.
 
 **Threads and child processes (2026-08-05, fourth pass).** Both were asked for as the
-step before running gcc, and they are in different places.
+step before running gcc, and both work on both personalities now.
 
-**Threads work on both, for real guests.** `threading.Thread` + `join()` returns the
-same 15005000 under the Linux CPython and the macOS one, and `guests/macos/threads`
-does it with hand-written pthread calls. The Darwin bug worth remembering: the psynch
-syscall numbers are
+    # four threads and a mutex, in Apple's CPython
+    ./aarch64emu --dyld-sections --root guests/macos_py \
+        guests/macos_py/install/bin/python3.13 -c \
+        "import threading; ..."          # -> 15005000
 
-    301 __psynch_mutexwait      303 __psynch_cvbroad
-    302 __psynch_mutexdrop      304 __psynch_cvsignal
-    305 __psynch_cvwait
+    # Apple's CPython spawning Apple's CPython
+    ./aarch64emu --dyld-sections --root guests/macos_py \
+        guests/macos_py/install/bin/python3.13 -c \
+        "import subprocess
+         print(subprocess.run(['/install/bin/python3.13','-c','print(6*7)'],
+                              capture_output=True).stdout)"   # -> b'42\n'
 
-and cvsignal was answered at 303, so a signal woke nobody and `join()` hung with no
-diagnostic. Every stub in libsystem_kernel begins `movz x16, #N`; read it.
+Both are in `tests/run_macos.sh` (12 cases) and the Linux equivalents are in
+`tests/run_python.sh` (8).
 
-**Child processes work on Linux.** `subprocess.run(..., capture_output=True)` returns
-the child's output and its status, and `run_python.sh` checks the digest against the
-host's. The model is in `src/process.cpp` and it is **vfork**: the parent suspends at
-the fork, the child runs in the parent's address space until `execve`, and `execve`
-runs the new program to completion in a fresh one before the parent resumes. That is
-the shape gcc's driver, make and `subprocess` all use.
+### fork, and why it needs no host fork and no copied address space
 
-Four things failed silently on the way, all now fixed and all worth knowing:
-the descriptor table has to be *copied* at fork though the pipes must be shared;
-fd 0..2 are the console only until something redirects them; `dup2` has to actually
-duplicate; and `prlimit64` answering EINVAL made `_posixsubprocess` close twenty
-million descriptors before each exec.
+This was asked directly and the answer is worth keeping. `fork` is entirely internal:
+nothing here calls the host's. What a parent requires is only that the child cannot
+affect its memory -- and the pages a child touches between fork and exec are a
+handful. So `Memory::begin_journal()` records each page's previous contents on its
+first write and `rollback_journal()` puts them back. The cost is the pages written,
+not the hundreds of megabytes a CPython address space occupies.
 
-**Child processes do not work on Darwin, and `fork` refuses rather than pretending.**
-Darwin's `fork()` wrapper runs `_libSystem_atfork_child()`, which reinitialises
-malloc, libdispatch and libnotify -- in the parent's heap, given a shared address
-space. The parent limped on and died half a billion instructions later. `ENOSYS` sends
-CPython to a plain OSError instead.
+`src/process.cpp` has the model in full. The shape:
 
-The next piece is **`posix_spawn` (Darwin syscall 244)**: one syscall that does the
-whole job in the kernel and never runs guest code in the parent's memory. It needs the
-`posix_spawn_file_actions_t` and `posix_spawnattr_t` structures decoded, which is
-fiddly but contained. After that, or instead of it, **real fork with a copied address
-space** is what CPython's own `os.fork()` needs -- it corrupts the parent under vfork
-for the same reason Darwin's wrapper does.
+    fork      save the registers, the descriptor table (copied) and open a journal;
+              the child continues in place seeing 0 in x0
+    execve    load and run the new program to completion in a *fresh* Memory, then
+              stop the run loop
+    resume    restore the registers, the descriptor table and the journal; the
+              parent's fork() returns the child's pid
+    wait4     the status is already on hand
 
-Toward gcc, what is known to be missing: `posix_spawn` on Darwin, and on both sides a
-guest that runs two processes at once (a pipeline where the writer must be scheduled
-while the reader blocks). The pipe buffer is unbounded so the common shape works.
+**What is still not supported**, and is reported rather than faked: a child that runs
+*concurrently* with its parent. A pipeline where the writer must be scheduled while
+the reader blocks cannot work. The pipe buffer is unbounded so the common shape --
+child writes, exits, parent reads -- does, and `Files::Pipe` says why. Making the two
+concurrent means a process table and a scheduler over it, which is the next real
+piece of work if something needs it.
 
-Also still open:
+### Bugs from this stretch worth not rediscovering
+
+Every one of these failed *silently*:
+
+- **The psynch syscall numbers.** 301 mutexwait, 302 mutexdrop, 303 cvbroad,
+  **304 cvsignal**, 305 cvwait. cvsignal was answered at 303, so a signal woke nobody
+  and `Thread.join()` hung with no diagnostic.
+- **execve is Darwin syscall 59**, not 147 (that is `setsid`). A scan of `_execve`
+  returned 147 because the stub begins with a branch through an interposable slot
+  rather than `movz x16`, so the scan over-ran into the next symbol. **The number the
+  guest issues is the one to trust** -- `--trace-sys` prints it.
+- **Darwin's `fork` returns a flag in x1** as well as the pid in x0, and the **carry
+  flag** is how Darwin reports failure. The parent's context is saved inside the fork
+  syscall, before the tail clears the carry, so a carry left set by the child made
+  libsyscall read the child's pid as an errno: "[Errno 2000] Unknown error: 2000".
+- **The descriptor table is copied at fork; the pipes are shared.** Sharing the table
+  left the *parent* with fd 1 pointing at a pipe after the child was gone.
+- **fd 0..2 are the console only until something redirects them.** `sys_write` sent
+  fd 1 to the terminal regardless, so a child's output appeared on screen while its
+  parent read an empty pipe.
+- **`prlimit64` answering EINVAL** made `_posixsubprocess` close every descriptor from
+  3 to twenty million before each exec. `close_range` is implemented too.
+- **A thread is CLONE_VM *and* CLONE_THREAD.** musl's `posix_spawn` passes
+  CLONE_VM|CLONE_VFORK, which is not a thread.
+
+### gcc: where it actually stands
+
+Alpine's aarch64 packages give a real toolchain with no Mac and no cross-compiler:
+
+    for p in binutils-2.42-r1 gcc-13.2.1_git20240309-r1 musl-dev-1.2.5-r3 musl-1.2.5-r3; do
+      curl -sLO "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/$p.apk"
+      tar xzf "$p.apk" -C guests/gccroot
+    done
+    ./aarch64emu --root guests/gccroot guests/gccroot/usr/bin/gcc --version
+    gcc (Alpine 13.2.1_git20240309) 13.2.1 20240309
+
+**`gcc --version` runs, and `gcc -c` gets as far as spawning `cc1`** -- the errors it
+prints are `cc1`'s own `ld.so` reporting libraries the extraction lacks:
+
+    Error loading shared library libisl.so.23 ... (needed by .../cc1)
+    Error loading shared library libmpc.so.3, libmpfr.so.6, libgmp.so.10, libz.so.1
+
+which is a *packaging* gap, not an emulator one -- the fork and the exec both worked.
+Fetch `isl`, `mpc`, `mpfr`, `gmp` and `zlib` from the same place and it should get to
+the compiler proper. That is the next thing to try, and it was deliberately stopped
+here rather than half-done.
+
+### Also still open
 
 - **`sysctl {1,14,1,pid}`** (KERN_PROC_PID, a `kinfo_proc`). Nothing has needed it.
-- **Speed.** ~15M instructions/sec on the macOS guest against ~41M on Linux ones --
-  the difference is the ObjC-heavy start-up, not the core. A decode cache keyed on the
-  PC is the standing idea; measure first.
+- **`posix_spawn`** on Darwin (syscall 244) is unimplemented. It is no longer *needed*
+  now that fork works, but it is the path a guest that avoids fork would take.
+- **Speed.** ~15M instructions/sec on the macOS guest against ~41M on Linux ones; the
+  difference is the ObjC-heavy start-up, not the core. A decode cache keyed on the PC
+  is the standing idea -- measure first.
 - The dyld API slots still answered with zero on the CPython guest: 1, 8, 10, 12, 13,
   44, 49, 51, 52, 54, 59, 60, 82, 90, 97, 121. None has been shown to matter.
 
@@ -141,7 +189,7 @@ Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agr
 byte over the whole macOS run, which is the best differential oracle here for anyone
 without a cross-compiler.
 
-Run the five suites before touching anything — they should be 9 / 11 / 9 / 8 / 11, plus 8 for
+Run the five suites before touching anything — they should be 9 / 11 / 9 / 8 / 12, plus 8 for
 `node web/test_node.mjs` if emscripten is around:
 
     sh tests/run_tests.sh    sh tests/run_macho.sh
@@ -186,6 +234,7 @@ The tools built for this, all of which take addresses straight out of a trace:
     tools/dyld_slots.py      names 98 of dyld's API vtable slots
     tools/profile_pcs.py     a --sample trace -> a per-function profile
     --list-unresolved        every unresolved symbol, not the first forty
+    --list-images            every image the loader actually mapped, and stop
     tools/dsc_extract.c      re-extract from a Mac's shared cache (only if the OS changes)
     guests/macos/build.sh    build a new macOS guest with clang+lld, no Mac and no SDK
     guests/macos/stub_libs.sh  stand-in dylibs for libraries not yet extracted
@@ -222,9 +271,9 @@ against *itself* under two memory modes, which turns out to be a sharp test (see
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     8 passed   CPython 3.13, dynamically linked, and a
                                           child process through fork/exec/pipe/wait
-    sh tests/run_macos.sh     11 passed   the macOS guests: hello, threads, tls, files,
+    sh tests/run_macos.sh     12 passed   the macOS guests: hello, threads, tls, files,
                                           and Apple's CPython -- its digest against the
-                                          host's, and its threads
+                                          host's, its threads, and a child process
     node web/test_node.mjs     8 passed   the same guests under WebAssembly
 
 What works:
@@ -259,7 +308,13 @@ What works:
   real exclusive monitor. CPython's `threading`, `queue`, `Event` and
   `ThreadPoolExecutor` all work — including inside WebAssembly, on one wasm
   instance, with no `SharedArrayBuffer` and no COOP/COEP.
-- **WebAssembly** (`web/`), running all of the above.
+- **Threads and child processes on both personalities.** `bsdthread_create`,
+  `__ulock_wait`/`wake` and the psynch condition variables on Darwin; `clone`, `futex`
+  and a real exclusive monitor on Linux. `fork`/`execve`/`wait4` and pipes on both,
+  with the parent's memory protected by an undo journal rather than a copy -- see
+  `src/process.cpp`.
+- **WebAssembly** (`web/`), running all of the above, and a browser demo with five
+  guests at <https://yomei-o.github.io/aarch64_emu_cpp/>.
 
 ## ⏭ Next, in order
 

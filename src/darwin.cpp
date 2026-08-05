@@ -1000,6 +1000,80 @@ bool Syscalls::svc_darwin() {
             if (r == 0) { linux_stat_to_darwin(lin, dar); mem_.write_bytes(a1, dar, sizeof dar); }
             break;
         }
+        // getdirentries64(fd, buf, bufsize, &position). Darwin's readdir. The fourth
+        // argument is an in/out file position the caller keeps across calls; the
+        // directory's own cursor lives in `Files`, so it only has to be written back
+        // -- but it does have to be, because libc compares it to detect a rewind.
+        case 344: {
+            std::vector<uint8_t> tmp(a2 > (1u << 20) ? (1u << 20) : a2);
+            r = files.getdirentries64(static_cast<int>(a0), tmp.data(), tmp.size());
+            if (r < 0) { err = bsd_errno(r); r = 0; break; }
+            if (r > 0) mem_.write_bytes(a1, tmp.data(), static_cast<size_t>(r));
+            if (a3) mem_.write<uint64_t>(a3, mem_.read<uint64_t>(a3) + static_cast<uint64_t>(r));
+            break;
+        }
+        // getrlimit(resource, &rlp). Only the descriptor and stack limits are ever
+        // read by the guests here, and both answers are the host's own arrangement
+        // rather than a constant: the stack is where main.cpp put it.
+        case 194: {
+            constexpr uint64_t kInfinity = ~0ull;
+            uint64_t cur = kInfinity, max = kInfinity;
+            // Darwin ORs `_RLIMIT_POSIX_FLAG` (0x1000) into the resource number to ask
+            // for the per-process limit rather than the per-user one. Matching on the
+            // raw value therefore never matches: the guest asks for 0x1008, falls to
+            // the default, and gets RLIM_INFINITY for RLIMIT_NOFILE -- whereupon
+            // sysconf(_SC_OPEN_MAX) has no number, `__sfp` decides every FILE slot is
+            // taken, and **fopen returns NULL without ever calling open**. Which is
+            // why the trace showed no failing syscall at all.
+            switch (a0 & 0xFFF) {
+                case 3: cur = 8u << 20; max = 64u << 20; break;      // RLIMIT_STACK
+                case 8: cur = 256; max = 4096; break;                // RLIMIT_NOFILE
+                default: break;                                      // the rest: no limit
+            }
+            mem_.write<uint64_t>(a1, cur);
+            mem_.write<uint64_t>(a1 + 8, max);
+            r = 0;
+            break;
+        }
+        // statfs64 / fstatfs64. `opendir` calls fstatfs before it reads anything, to
+        // learn the filesystem's block size and whether it is one of the types it has
+        // to work around -- so failing this is not a missing feature, it is `opendir`
+        // returning null and a guest that cannot list a directory at all.
+        //
+        // struct statfs (the 64-bit-inode form) is 2168 bytes and mostly names. The
+        // fields a caller branches on are the block size, the type name, and the two
+        // paths; the free-space numbers only have to be self-consistent, because
+        // nothing here can run out of space in a way the guest could observe.
+        case 345: case 346: {                              // statfs64, fstatfs64
+            const uint64_t out = (nr == 345) ? a1 : a1;
+            // The path argument only has to exist -- an fd or a name that does not
+            // resolve should still fail, so both are checked the ordinary way first.
+            if (nr == 345) {
+                uint8_t lin[128];
+                r = files.stat_path(guest_str(a0), lin);
+            } else {
+                uint8_t lin[128];
+                r = files.fstat(static_cast<int>(a0), lin);
+            }
+            if (r != 0) { err = bsd_errno(r); r = 0; break; }
+            std::vector<uint8_t> sfs(2168, 0);
+            auto put32 = [&](size_t o, uint32_t v) { std::memcpy(sfs.data() + o, &v, 4); };
+            auto put64 = [&](size_t o, uint64_t v) { std::memcpy(sfs.data() + o, &v, 8); };
+            put32(0, 4096);                                // f_bsize
+            put32(4, 1 << 20);                             // f_iosize
+            put64(8, 1ull << 26);                          // f_blocks: 256 GiB of 4 KiB
+            put64(16, 1ull << 25);                         // f_bfree
+            put64(24, 1ull << 25);                         // f_bavail
+            put64(32, 1ull << 20);                         // f_files
+            put64(40, 1ull << 19);                         // f_ffree
+            put32(60, 26);                                 // f_type: APFS
+            std::memcpy(sfs.data() + 72, "apfs", 5);       // f_fstypename
+            std::memcpy(sfs.data() + 88, "/", 2);          // f_mntonname
+            std::memcpy(sfs.data() + 1112, "/dev/disk1s1", 13);   // f_mntfromname
+            mem_.write_bytes(out, sfs.data(), sfs.size());
+            r = 0;
+            break;
+        }
         // Darwin's mmap has the same argument order as Linux's, but MAP_ANON is
         // 0x1000 rather than 0x20, so the flag is translated before it is used.
         case 197: {

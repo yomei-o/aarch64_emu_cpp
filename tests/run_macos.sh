@@ -100,5 +100,55 @@ else
     echo "skip macos threads (no $T -- run: sh guests/macos/build.sh threads)"
 fi
 
+# ---- the filesystem, through Apple's own libc ---------------------------------
+#
+# `tests/file.c` covers open/read/write, but freestanding: it makes the syscalls
+# itself, so it tests the syscall table and nothing above it. This guest goes
+# through libsystem_c -- getcwd, opendir/readdir, access, fopen/fgets -- which is
+# what CPython does when it hunts for its standard library, and which reaches
+# fstatfs, getdirentries64 and getrlimit that the freestanding path never touches.
+#
+# And it has a real oracle: the host computes the same directory count, the same
+# FNV hash of the same names, and the same hash of the same line, from the same
+# tree. A wrong `struct dirent` offset changes the hash rather than the count,
+# which is the failure worth catching -- Darwin's name field starts at 21, not 24.
+F=guests/macos/files
+if [ -f "$F" ] && command -v python >/dev/null 2>&1; then
+    want=$(python - <<'PY'
+import os
+h0 = 1469598103934665603
+def fnv(b):
+    h = h0
+    for c in b:
+        h ^= c
+        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h
+names, n = 0, 0
+for e in sorted(os.listdir('guests/macos/usr/lib/system')):
+    if e.startswith('.'):
+        continue
+    names ^= fnv(e.encode())
+    n += 1
+with open('guests/macos/hello.txt', 'rb') as f:
+    line = fnv(f.readline())
+print('cwd ok: 1')
+print('entries %d' % n)
+print('names %x' % names)
+print('access libsystem_c 0')
+print('access nonesuch -1')
+print('access hello 0')
+print('line %x' % line)
+PY
+)
+    # Windows python prints CRLF, so the oracle needs the same stripping the guest
+    # output gets. Comparing one against the other without it fails on every line
+    # while printing two blocks that look identical, which wastes a good minute.
+    want=$(printf '%s\n' "$want" | tr -d '\015')
+    got=$($EMU --root guests/macos "$F" 2>/dev/null | tr -d '\015')
+    check "macos files (libc: opendir, stat, stdio)" "$want" "$got"
+else
+    echo "skip macos files (no $F -- run: sh guests/macos/build.sh files)"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

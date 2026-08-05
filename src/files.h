@@ -34,6 +34,11 @@ public:
     // Emits linux_dirent64 records into a host buffer; returns bytes written, 0 at
     // end of directory, or -errno.
     int64_t getdents64(int fd, void* buf, uint64_t len);
+    // The same walk, in Darwin's record layout. Kept as a second function rather than
+    // a flag because the two structures share no field offsets and the name does not
+    // start 8-aligned in Darwin's -- a shared body with an `if` would be a worse lie
+    // than two short ones.
+    int64_t getdirentries64(int fd, void* buf, uint64_t len);
     int64_t stat_path(const std::string& path, void* statbuf);
     int64_t access(const std::string& path);
     bool is_dir(const std::string& path) const;

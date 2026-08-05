@@ -19,6 +19,8 @@ guests/*
 guests/macos/*
 !guests/macos/build.sh
 !guests/macos/threads.c
+!guests/macos/files.c
+!guests/macos/hello.txt
 tests/*.macho
 tests/*.cerr
 tests/dylib/*.dylib

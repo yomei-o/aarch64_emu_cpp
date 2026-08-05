@@ -105,6 +105,41 @@ int64_t Files::getdents64(int fd, void* buf, uint64_t len) {
     return static_cast<int64_t>(used);
 }
 
+// getdirentries64: the same walk, packing Darwin's `struct dirent`.
+//
+//   ino:8  seekoff:8  reclen:2  namlen:2  type:1  name[]
+//
+// The name therefore begins at offset **21**, which is not 8-aligned. Rounding that
+// up to 24 -- which is what the Linux layout trains the fingers to do -- shifts every
+// name three bytes and reads as a corrupted filesystem rather than a struct mistake.
+// The record as a whole is padded to 8.
+int64_t Files::getdirentries64(int fd, void* buf, uint64_t len) {
+    auto it = open_.find(fd);
+    if (it == open_.end()) return kEBADF;
+    Entry& e = it->second;
+    if (!e.is_directory) return -20;                       // ENOTDIR
+    auto* out = static_cast<uint8_t*>(buf);
+    uint64_t used = 0;
+    while (e.pos < e.entries.size()) {
+        const std::string& name = e.entries[e.pos].first;
+        const uint64_t reclen = (21 + name.size() + 1 + 7) & ~7ull;
+        if (used + reclen > len) break;
+        std::memset(out + used, 0, reclen);
+        const uint64_t ino = e.pos + 1, seekoff = e.pos + 1;
+        const uint16_t rl = static_cast<uint16_t>(reclen);
+        const uint16_t nl = static_cast<uint16_t>(name.size());
+        std::memcpy(out + used + 0, &ino, 8);
+        std::memcpy(out + used + 8, &seekoff, 8);
+        std::memcpy(out + used + 16, &rl, 2);
+        std::memcpy(out + used + 18, &nl, 2);
+        out[used + 20] = e.entries[e.pos].second ? 4 : 8;  // DT_DIR : DT_REG
+        std::memcpy(out + used + 21, name.c_str(), name.size() + 1);
+        used += reclen;
+        ++e.pos;
+    }
+    return static_cast<int64_t>(used);
+}
+
 int64_t Files::read(int fd, void* dst, uint64_t len) {
     auto it = open_.find(fd);
     if (it == open_.end()) return kEBADF;

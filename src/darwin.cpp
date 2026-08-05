@@ -255,7 +255,7 @@ void Syscalls::setup_dyld_apis(uint64_t gapis_addr) {
 // afterwards as if nothing happened -- the PC has already advanced past the SVC by the
 // time a handler runs, and restoring it puts that back. The guest's own stack is used,
 // which is right: the frame the call lands on top of is the one dyld would have used.
-void Syscalls::call_guest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2) {
+void Syscalls::call_guest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
     constexpr uint64_t kReturnMagic = 0x0000'0000'DEAD'2000ull;
     const uint64_t insns0 = cpu_.insns;
     const Cpu::Context saved = cpu_.save_context();
@@ -263,6 +263,7 @@ void Syscalls::call_guest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2) {
     cpu_.setx(0, a0);
     cpu_.setx(1, a1);
     cpu_.setx(2, a2);
+    cpu_.setx(3, a3);
     cpu_.setx(30, kReturnMagic);
     while (!cpu_.halted && cpu_.pc != kReturnMagic) cpu_.step();
     const bool died = cpu_.halted;
@@ -591,10 +592,34 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
                 mem_.write<uint64_t>(infos + j * kInfoSize + 24, 0);
                 strp += s.size() + 1;
             }
+            // The third argument is a **block**, and leaving it zero is fatal further in.
+            //
+            // dyld hands libobjc a `_dyld_objc_mark_image_mutable` block so libobjc can
+            // say "I am about to write to image N's read-only data, make it writable".
+            // libobjc calls it the way every block is called -- `invoke(block, index)`,
+            // through the pointer at offset 0x10, signed with address diversity:
+            //
+            //     ldur x0, [x29, #-0xd0]     ; the block, straight from x3
+            //     ldr  x8, [x0, #0x10]       ; -> invoke
+            //     add  x1, w9, w10           ; -> the image index
+            //     blraa x8, x9               ; x9 = &block->invoke, the modifier
+            //
+            // With x3 zero that reads a function pointer from address 0x10 and branches
+            // to it. Nothing here enforces page permissions, so the block only has to
+            // *return* -- but it has to exist, and its `invoke` has to point at a real
+            // instruction. This one is a bare `ret` in the stub arena.
+            const uint64_t block = kObjcBlock, invoke = kObjcBlock + 0x40;
+            mem_.map(kObjcBlock, kObjcBlockSize);
+            mem_.write<uint64_t>(block + 0, 0);            // isa: never read here
+            mem_.write<uint32_t>(block + 8, 1u << 28);     // flags: BLOCK_IS_GLOBAL
+            mem_.write<uint32_t>(block + 12, 0);           // reserved
+            mem_.write<uint64_t>(block + 16, invoke);
+            mem_.write<uint64_t>(block + 24, 0);           // descriptor: never read here
+            mem_.write<uint32_t>(invoke, 0xD65F03C0u);     // ret
             if (trace)
                 std::fprintf(stderr, "[objc] map_images(%zu) at %012llX\n", n,
                              static_cast<unsigned long long>(map_images));
-            call_guest(map_images, n, infos, 0);
+            call_guest(map_images, n, infos, block);
 
             // Then the `init` callback, once per image, which is the rest of what dyld
             // does at registration: it runs each image's `+load` methods and finishes

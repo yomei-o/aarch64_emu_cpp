@@ -77,7 +77,7 @@ private:
     // Mach IPC, in darwin.cpp: enough of mach_msg2_trap and MIG to answer the kernel
     // RPCs a libSystem startup makes.
     int64_t dyld_api_stub(uint32_t slot);
-    void call_guest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2);
+    void call_guest(uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3 = 0);
     int64_t mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
                       uint64_t remote_local, uint64_t voucher_id,
                       uint64_t desc_rcvname, uint64_t rcv_size);
@@ -170,6 +170,11 @@ private:
     uint64_t path_next_ = 0;
     // Where map_images's two arrays and their path strings go.
     static constexpr uint64_t kObjcArena = 0x0000'0003'0100'0000ull;
+    // The `mark image mutable` block map_images takes as its third argument. A block is
+    // {isa, flags, reserved, invoke, descriptor} and libobjc calls `invoke(block, index)`,
+    // so this needs a real function to point at -- see the note at `case 107`.
+    static constexpr uint64_t kObjcBlock = 0x0000'0003'0400'0000ull;
+    static constexpr uint64_t kObjcBlockSize = 1u << 12;
 };
 
 }  // namespace a64

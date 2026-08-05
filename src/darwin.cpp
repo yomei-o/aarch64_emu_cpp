@@ -1141,6 +1141,18 @@ bool Syscalls::svc_darwin() {
         case 199: r = files.lseek(static_cast<int>(a0), static_cast<int64_t>(a1),
                                   static_cast<int>(a2)); break;
         case 33: r = files.access(guest_str(a0)); break;
+        // readlink(path, buf, size). Nothing in this filesystem is a symbolic link --
+        // the guest trees are extracted, not mounted -- so EINVAL ("not a link") is
+        // the truthful answer for a path that exists, and ENOENT for one that does
+        // not. Returning ENOSYS instead made CPython's `os.path.realpath` give up on
+        // resolving its own executable.
+        case 58: {
+            uint8_t lin[128];
+            r = files.stat_path(guest_str(a0), lin);
+            err = (r == 0) ? kBsdEINVAL : kBsdENOENT;
+            r = 0;
+            break;
+        }
         case 339: case 189: {                              // fstat64, fstat
             uint8_t lin[128], dar[144];
             r = files.fstat(static_cast<int>(a0), lin);
@@ -1320,7 +1332,13 @@ bool Syscalls::svc_darwin() {
         // because a wait switches threads.
         //
         //   305 __psynch_cvwait(cv, cvlsgen, cvugen, mutex, mugen, flags, sec, nsec)
-        //   303 __psynch_cvsignal, 302 __psynch_cvbroad -- same first arguments
+        //   304 __psynch_cvsignal, 303 __psynch_cvbroad -- same first arguments
+        //   301 __psynch_mutexwait, 302 __psynch_mutexdrop
+        //
+        // The numbers are read out of libsystem_kernel rather than recalled: each stub
+        // begins `movz x16, #N`, and getting one wrong is a syscall that silently
+        // fails and a thread that is never woken. 304 was 303 here for a while, and
+        // the symptom was `threading.Thread.join()` hanging with no diagnostic at all.
         //
         // "Timed" is decided by the seconds/nanoseconds pair, not by a flag: a zero
         // deadline is an untimed wait. The difference matters at the end of the run,
@@ -1331,7 +1349,12 @@ bool Syscalls::svc_darwin() {
             sys_psynch_cvwait(a0, a3, timed);
             return true;
         }
-        case 303: sys_psynch_cvsignal(a0, false); return true;
+        case 304: sys_psynch_cvsignal(a0, false); return true;
+        case 303: sys_psynch_cvsignal(a0, true); return true;
+        // __psynch_mutexwait(mutex, mgen, ugen, tid, flags) and __psynch_mutexdrop.
+        // The same wait machinery as the condition variables: one CPU, one thread at a
+        // time, so "who is waiting on this address" is the whole of the state.
+        case 301: sys_psynch_cvwait(a0, 0, false); return true;
         case 302: sys_psynch_cvsignal(a0, true); return true;
         case 116: {                                        // gettimeofday
             const uint64_t ns = host_nanos();

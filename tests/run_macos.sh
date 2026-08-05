@@ -206,5 +206,54 @@ else
     echo "skip macos cpython (no $P -- run: sh prebuilt/unpack.sh python)"
 fi
 
+# ---- CPython's own threads, on Darwin -----------------------------------------
+#
+# `guests/macos/threads` proves bsdthread_create works; this proves it works for a
+# guest that did not have its pthread calls written by hand. The arithmetic is the
+# same on purpose -- four workers summing 1..1000 through 1..4000 -- so a failure
+# here and a failure there are directly comparable.
+#
+# It found a real bug the day it was written: __psynch_cvsignal is syscall 304 and
+# was answered at 303, so a waiter was never woken and `Thread.join()` hung with no
+# diagnostic. The numbers are in libsystem_kernel, one `movz x16, #N` per stub.
+if [ -f "$P" ]; then
+    code="import threading
+t=[]; total=[0]; lock=threading.Lock()
+def w(n):
+    s=sum(range(1,n+1))
+    with lock: total[0]+=s
+for n in (1000,2000,3000,4000):
+    x=threading.Thread(target=w,args=(n,)); x.start(); t.append(x)
+for x in t: x.join()
+print('threads', total[0])"
+    got=$($EMU --dyld-sections --root guests/macos_py "$P" -c "$code" 2>/dev/null | tr -d '')
+    check "macos cpython threading" "threads 15005000" "$got"
+fi
+
+# ---- CPython's own threads, on Darwin -----------------------------------------
+#
+# `guests/macos/threads` proves bsdthread_create works; this proves it works for a
+# guest whose pthread calls nobody here wrote. The arithmetic is deliberately the
+# same -- four workers summing 1..1000 through 1..4000 -- so a failure here and a
+# failure there are directly comparable.
+#
+# It found a real bug the day it was written. `__psynch_cvsignal` is syscall 304 and
+# was being answered at 303, so a waiter was never woken and `Thread.join()` hung
+# with no diagnostic at all. The numbers are in libsystem_kernel, one `movz x16, #N`
+# per stub, and reading them beats recalling them.
+if [ -f "$P" ]; then
+    code="import threading
+t=[]; total=[0]; lock=threading.Lock()
+def w(n):
+    s=sum(range(1,n+1))
+    with lock: total[0]+=s
+for n in (1000,2000,3000,4000):
+    x=threading.Thread(target=w,args=(n,)); x.start(); t.append(x)
+for x in t: x.join()
+print('threads', total[0])"
+    got=$($EMU --dyld-sections --root guests/macos_py "$P" -c "$code" 2>/dev/null | tr -d '\015')
+    check "macos cpython threading" "threads 15005000" "$got"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

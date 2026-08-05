@@ -83,15 +83,57 @@ Three more from the same stretch, each found by the guest saying so:
   through, which is how the null pipe was reached at all. dyld runs `+load` once the
   libraries are up, and so does `run_image()` now.
 
-What is left, in no particular order:
+**Threads and child processes (2026-08-05, fourth pass).** Both were asked for as the
+step before running gcc, and they are in different places.
 
-- **`os.uname()` works, `sysctl {1,14,1,pid}` (KERN_PROC_PID, a `kinfo_proc`) does
-  not.** Nothing has needed it yet.
-- **Darwin `bsdthread_create` is implemented but CPython's `threading` is untried.**
-  `guests/macos/threads` passes; a Python-level thread test is the obvious next check.
-- **Speed.** ~15M instructions/sec on the macOS guest under the interpreter, against
-  ~41M on Linux guests — the difference is the ObjC-heavy start-up, not the core. A
-  decode cache keyed on the PC is the standing idea; measure first.
+**Threads work on both, for real guests.** `threading.Thread` + `join()` returns the
+same 15005000 under the Linux CPython and the macOS one, and `guests/macos/threads`
+does it with hand-written pthread calls. The Darwin bug worth remembering: the psynch
+syscall numbers are
+
+    301 __psynch_mutexwait      303 __psynch_cvbroad
+    302 __psynch_mutexdrop      304 __psynch_cvsignal
+    305 __psynch_cvwait
+
+and cvsignal was answered at 303, so a signal woke nobody and `join()` hung with no
+diagnostic. Every stub in libsystem_kernel begins `movz x16, #N`; read it.
+
+**Child processes work on Linux.** `subprocess.run(..., capture_output=True)` returns
+the child's output and its status, and `run_python.sh` checks the digest against the
+host's. The model is in `src/process.cpp` and it is **vfork**: the parent suspends at
+the fork, the child runs in the parent's address space until `execve`, and `execve`
+runs the new program to completion in a fresh one before the parent resumes. That is
+the shape gcc's driver, make and `subprocess` all use.
+
+Four things failed silently on the way, all now fixed and all worth knowing:
+the descriptor table has to be *copied* at fork though the pipes must be shared;
+fd 0..2 are the console only until something redirects them; `dup2` has to actually
+duplicate; and `prlimit64` answering EINVAL made `_posixsubprocess` close twenty
+million descriptors before each exec.
+
+**Child processes do not work on Darwin, and `fork` refuses rather than pretending.**
+Darwin's `fork()` wrapper runs `_libSystem_atfork_child()`, which reinitialises
+malloc, libdispatch and libnotify -- in the parent's heap, given a shared address
+space. The parent limped on and died half a billion instructions later. `ENOSYS` sends
+CPython to a plain OSError instead.
+
+The next piece is **`posix_spawn` (Darwin syscall 244)**: one syscall that does the
+whole job in the kernel and never runs guest code in the parent's memory. It needs the
+`posix_spawn_file_actions_t` and `posix_spawnattr_t` structures decoded, which is
+fiddly but contained. After that, or instead of it, **real fork with a copied address
+space** is what CPython's own `os.fork()` needs -- it corrupts the parent under vfork
+for the same reason Darwin's wrapper does.
+
+Toward gcc, what is known to be missing: `posix_spawn` on Darwin, and on both sides a
+guest that runs two processes at once (a pipeline where the writer must be scheduled
+while the reader blocks). The pipe buffer is unbounded so the common shape works.
+
+Also still open:
+
+- **`sysctl {1,14,1,pid}`** (KERN_PROC_PID, a `kinfo_proc`). Nothing has needed it.
+- **Speed.** ~15M instructions/sec on the macOS guest against ~41M on Linux ones --
+  the difference is the ObjC-heavy start-up, not the core. A decode cache keyed on the
+  PC is the standing idea; measure first.
 - The dyld API slots still answered with zero on the CPython guest: 1, 8, 10, 12, 13,
   44, 49, 51, 52, 54, 59, 60, 82, 90, 97, 121. None has been shown to matter.
 
@@ -99,7 +141,7 @@ Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agr
 byte over the whole macOS run, which is the best differential oracle here for anyone
 without a cross-compiler.
 
-Run the five suites before touching anything — they should be 9 / 11 / 9 / 7 / 9, plus 8 for
+Run the five suites before touching anything — they should be 9 / 11 / 9 / 8 / 11, plus 8 for
 `node web/test_node.mjs` if emscripten is around:
 
     sh tests/run_tests.sh    sh tests/run_macho.sh
@@ -178,9 +220,11 @@ against *itself* under two memory modes, which turns out to be a sharp test (see
                                           linked both ways: chained fixups and the older
                                           LC_DYLD_INFO opcode programs
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
-    sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
-    sh tests/run_macos.sh      9 passed   the macOS guests: hello, threads, tls, files,
-                                          and Apple's CPython against the host's sha256
+    sh tests/run_python.sh     8 passed   CPython 3.13, dynamically linked, and a
+                                          child process through fork/exec/pipe/wait
+    sh tests/run_macos.sh     11 passed   the macOS guests: hello, threads, tls, files,
+                                          and Apple's CPython -- its digest against the
+                                          host's, and its threads
     node web/test_node.mjs     8 passed   the same guests under WebAssembly
 
 What works:

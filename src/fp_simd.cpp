@@ -434,16 +434,55 @@ void Cpu::exec_fp_simd(uint32_t insn) {
         const unsigned esize = 1u << size;
         const unsigned lanes = (q ? 16u : 8u) / esize;
         const uint64_t emask = esize == 8 ? ~0ull : ((1ull << (esize * 8)) - 1);
-        if (opcode == 0x09 || opcode == 0x0A) {                 // CMEQ/CMGE/CMGT/CMLE #0
+        // SADDLP/UADDLP (and the accumulating SADALP/UADALP): add each pair of
+        // adjacent elements into one element of twice the width. gcc's cc1 uses
+        // it as the middle of a popcount reduction -- CNT, then this, then ADDV.
+        // size==11 is unallocated: the widest source lane is 32 bits.
+        if ((opcode == 0x02 || opcode == 0x06) && size != 3) {
+            const unsigned out_lanes = lanes / 2;
+            V128 out = (opcode == 0x06) ? vreg[rd] : V128{};
+            if (!q) out.hi = 0;
+            for (unsigned i = 0; i < out_lanes; ++i) {
+                auto wide = [&](uint64_t e) -> uint64_t {
+                    if (u) return e;
+                    const uint64_t s = 1ull << (esize * 8 - 1);
+                    return static_cast<uint64_t>(static_cast<int64_t>((e ^ s) - s));
+                };
+                const uint64_t sum = wide(velem(vreg[rn], esize, 2 * i)) +
+                                     wide(velem(vreg[rn], esize, 2 * i + 1));
+                const uint64_t acc = (opcode == 0x06) ? velem(out, esize * 2, i) : 0;
+                set_velem(out, esize * 2, i, acc + sum);
+            }
+            vreg[rd] = out; return;
+        }
+        // The compares against zero. The opcode/U table, verified against a
+        // disassembler rather than recalled -- an earlier version had 9/U=0 as
+        // CMGE and A/U=0 as CMGT, which are answers to *different questions*:
+        //     opcode 8:  U=0 CMGT   U=1 CMGE
+        //     opcode 9:  U=0 CMEQ   U=1 CMLE
+        //     opcode A:  U=0 CMLT   (U=1 unallocated)
+        if (opcode == 0x08 || opcode == 0x09 || opcode == 0x0A) {
             V128 out{};
             for (unsigned i = 0; i < lanes; ++i) {
                 const uint64_t e = velem(vreg[rn], esize, i);
                 const uint64_t s = 1ull << (esize * 8 - 1);
                 const int64_t se = static_cast<int64_t>((e ^ s) - s);
                 bool t;
-                if (opcode == 0x09) t = u ? (se <= 0) : (se >= 0);               // CMLE / CMGE
-                else                t = u ? (se < 0) : (se > 0);                 // CMLT / CMGT
+                if (opcode == 0x08)      t = u ? (se >= 0) : (se > 0);           // CMGE / CMGT
+                else if (opcode == 0x09) t = u ? (se <= 0) : (se == 0);          // CMLE / CMEQ
+                else                     t = (se < 0);                           // CMLT
                 set_velem(out, esize, i, t ? emask : 0);
+            }
+            vreg[rd] = out; return;
+        }
+        if (opcode == 0x0B) {                                   // ABS / NEG (vector)
+            V128 out{};
+            for (unsigned i = 0; i < lanes; ++i) {
+                const uint64_t e = velem(vreg[rn], esize, i);
+                const uint64_t s = 1ull << (esize * 8 - 1);
+                const int64_t se = static_cast<int64_t>((e ^ s) - s);
+                const int64_t v = u ? -se : (se < 0 ? -se : se);
+                set_velem(out, esize, i, static_cast<uint64_t>(v) & emask);
             }
             vreg[rd] = out; return;
         }
@@ -472,6 +511,67 @@ void Cpu::exec_fp_simd(uint32_t insn) {
             V128 out = {~vreg[rn].lo, ~vreg[rn].hi};
             if (!q) out.hi = 0;
             vreg[rd] = out; return;
+        }
+    }
+
+    // ---- Advanced SIMD scalar three-same: the integer forms ---------------------
+    //
+    // `add d0, d0, d1` -- the tail of cc1's popcount loop, folding two ADDV results.
+    // The vector three-same group above at 0x0E200400 with bit 28 set; the integer
+    // forms are allocated only at size==11, a single 64-bit lane.
+    if ((insn & 0xDF200400u) == 0x5E200400u && ((insn >> 22) & 3) == 3 &&
+        ((insn >> 10) & 1)) {
+        const bool u = (insn >> 29) & 1;
+        const unsigned opcode = (insn >> 11) & 0x1F;
+        const unsigned rm = (insn >> 16) & 0x1F, rn = (insn >> 5) & 0x1F,
+                       rd = insn & 0x1F;
+        const uint64_t x = vreg[rn].lo, y = vreg[rm].lo;
+        const int64_t sx = static_cast<int64_t>(x), sy = static_cast<int64_t>(y);
+        uint64_t r;
+        bool ok = true;
+        switch (opcode) {
+            case 0x10: r = u ? (x - y) : (x + y); break;                 // SUB / ADD
+            case 0x11: r = u ? ((x == y) ? ~0ull : 0)                    // CMEQ
+                             : (((x & y) != 0) ? ~0ull : 0); break;      // CMTST
+            case 0x06: r = (u ? (x > y) : (sx > sy)) ? ~0ull : 0; break; // CMHI / CMGT
+            case 0x07: r = (u ? (x >= y) : (sx >= sy)) ? ~0ull : 0; break; // CMHS / CMGE
+            case 0x08: {                                                 // USHL / SSHL
+                const int8_t sh = static_cast<int8_t>(y & 0xFF);
+                if (sh >= 0) r = (sh >= 64) ? 0 : (x << sh);
+                else {
+                    const unsigned k = static_cast<unsigned>(-sh);
+                    if (u) r = (k >= 64) ? 0 : (x >> k);
+                    else r = static_cast<uint64_t>(sx >> (k >= 64 ? 63 : k));
+                }
+                break;
+            }
+            default: ok = false; r = 0; break;
+        }
+        if (ok) { vreg[rd] = {r, 0}; return; }
+    }
+
+    // ---- Advanced SIMD scalar two-register misc: the integer forms --------------
+    //
+    // `cmge d0, d0, #0` -- gcc's cc1 branches on it inside the C preprocessor's
+    // search loops. Same opcode table as the vector compares above, but scalar,
+    // and only size==11 (a single 64-bit lane) is allocated. Handled *before* the
+    // FP-conversion block below because that one keys on bit 23 being clear, and
+    // these have it set.
+    if ((insn & 0xDF3E0C00u) == 0x5E200800u && ((insn >> 22) & 3) == 3) {
+        const bool u = (insn >> 29) & 1;
+        const unsigned opcode = (insn >> 12) & 0x1F;
+        const unsigned rn = (insn >> 5) & 0x1F, rd = insn & 0x1F;
+        const int64_t se = static_cast<int64_t>(vreg[rn].lo);
+        if (opcode == 0x08 || opcode == 0x09 || (opcode == 0x0A && !u)) {
+            bool t;
+            if (opcode == 0x08)      t = u ? (se >= 0) : (se > 0);   // CMGE / CMGT
+            else if (opcode == 0x09) t = u ? (se <= 0) : (se == 0);  // CMLE / CMEQ
+            else                     t = (se < 0);                   // CMLT
+            vreg[rd] = {t ? ~0ull : 0ull, 0}; return;
+        }
+        if (opcode == 0x0B) {                                        // ABS / NEG
+            vreg[rd] = {static_cast<uint64_t>(u ? -se : (se < 0 ? -se : se)), 0};
+            return;
         }
     }
 

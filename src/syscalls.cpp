@@ -207,7 +207,20 @@ bool Syscalls::svc(uint32_t imm) {
         // ---- files -----------------------------------------------------------
         // AArch64 has no plain open(2): everything is openat with AT_FDCWD, which
         // is why a guest that "never opens anything" is really just calling 56.
-        case 56: r = files.open(guest_str(a1), static_cast<int>(a2), static_cast<int>(a3)); break;
+        case 56: {                                             // openat
+            const std::string path = guest_str(a1);
+            r = files.open(path, static_cast<int>(a2), static_cast<int>(a3));
+            // The path, when tracing. A syscall log of numbers answers "how many
+            // opens" and never "which file", and "which file" is the question every
+            // time a dynamic loader cannot find something.
+            if (trace)
+                std::fprintf(stderr, "[sys]   openat(\"%s\") -> %lld\n", path.c_str(),
+                             static_cast<long long>(r));
+            break;
+        }
+        // unlinkat. gcc removes its temporary files with it, and refusing left a
+        // driver that compiled correctly and then complained it could not clean up.
+        case 35: r = files.unlink(guest_str(a1)); break;
         case 57: r = files.close(static_cast<int>(a0)); break;
         case 61: {                                             // getdents64
             std::vector<uint8_t> tmp(a2);
@@ -289,6 +302,14 @@ bool Syscalls::svc(uint32_t imm) {
             r = 0;
             break;
         }
+        // umask and fchmodat, from ld setting its output executable. There are no
+        // guest permissions to keep: the host filesystem's are what they are.
+        case 166: r = 022; break;
+        case 53: r = 0; break;
+        // getrusage: gcc asks at exit to report time spent. All zeros reads as
+        // "no time at all", which is honest enough -- there is no host rusage
+        // for a guest process. struct rusage is 144 bytes.
+        case 165: mem_.set(a1, 0, 144); r = 0; break;
         case 172: r = 1000; break;                             // getpid
         case 174: case 175: case 176: case 177: r = 1000; break;  // getuid/geteuid/getgid/getegid
         case 160: {                                            // uname

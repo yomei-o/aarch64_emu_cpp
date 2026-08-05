@@ -152,27 +152,46 @@ Every one of these failed *silently*:
 - **A thread is CLONE_VM *and* CLONE_THREAD.** musl's `posix_spawn` passes
   CLONE_VM|CLONE_VFORK, which is not a thread.
 
-### gcc: where it actually stands
+### gcc: works, end to end (2026-08-05, fifth pass)
 
 Alpine's aarch64 packages give a real toolchain with no Mac and no cross-compiler:
 
-    for p in binutils-2.42-r1 gcc-13.2.1_git20240309-r1 musl-dev-1.2.5-r3 musl-1.2.5-r3; do
+    for p in binutils-2.42-r1 gcc-13.2.1_git20240309-r1 musl-dev-1.2.5-r3 \
+             musl-1.2.5-r3 libgcc-13.2.1_git20240309-r1 gmp-6.3.0-r1 mpc1-1.3.1-r1 \
+             mpfr4-4.2.1-r0 zlib-1.3.1-r1 isl26-0.26-r1 zstd-libs-1.5.6-r0 \
+             jansson-2.14-r4; do
       curl -sLO "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/$p.apk"
       tar xzf "$p.apk" -C guests/gccroot
     done
-    ./aarch64emu --root guests/gccroot guests/gccroot/usr/bin/gcc --version
-    gcc (Alpine 13.2.1_git20240309) 13.2.1 20240309
+    # Windows tar writes apk symlinks as nothing at all, so the sonames the
+    # loader asks for (libgmp.so.10, libzstd.so.1, ...) have to be *copies* of
+    # the real files. `ls guests/gccroot/usr/lib` and copy whatever lacks its
+    # unversioned soname.
 
-**`gcc --version` runs, and `gcc -c` gets as far as spawning `cc1`** -- the errors it
-prints are `cc1`'s own `ld.so` reporting libraries the extraction lacks:
+    ./aarch64emu --root guests/gccroot guests/gccroot/usr/bin/gcc /hello.c -o /hello
+    ./aarch64emu --root guests/gccroot guests/gccroot/hello
+    hello from emulated gcc
 
-    Error loading shared library libisl.so.23 ... (needed by .../cc1)
-    Error loading shared library libmpc.so.3, libmpfr.so.6, libgmp.so.10, libz.so.1
+**The whole pipeline runs**: the driver forks and execs cc1, as, collect2 and ld --
+four child processes, pipes, temp files -- and the binary it links *runs under the
+same emulator that built it*. `tests/run_gcc.sh` (3 cases) closes that loop and
+skips itself when the ~120 MB toolchain tree is absent.
 
-which is a *packaging* gap, not an emulator one -- the fork and the exec both worked.
-Fetch `isl`, `mpc`, `mpfr`, `gmp` and `zlib` from the same place and it should get to
-the compiler proper. That is the next thing to try, and it was deliberately stopped
-here rather than half-done.
+Three bugs stood between "spawns cc1" and this, all worth remembering:
+
+- **musl's ld.so tells libraries apart by st_dev/st_ino.** fill_stat answered
+  (1,1) for every file, so the first library loaded stood in for all five and
+  relocation failed with `__gmpz_get_si: symbol not found` against a libgmp that
+  was present and correct. The inode is now an FNV hash of the host path.
+- **cc1 installs a SIGILL handler**, so an unimplemented instruction no longer
+  stops the machine -- it becomes "internal compiler error: Illegal instruction"
+  with no PC. `--trace-sys` prints the `[sig]` delivery line; the faulting PC in
+  it is the instruction to go implement. That is how the three below were found.
+- **The instructions cc1 actually needed**: `uaddlp` (vector pairwise widening
+  add), scalar `cmge/cmgt/cmle/cmeq #0`, scalar `add d0, d0, d1` (three-same,
+  size==11), vector `abs/neg`. All popcount/hash-loop shapes. And the vector
+  zero-compare opcode table was wrong -- opcode 8 is CMGT/CMGE, 9 is CMEQ/CMLE,
+  A is CMLT; the old table answered different questions than were asked.
 
 ### Also still open
 
@@ -189,12 +208,12 @@ Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agr
 byte over the whole macOS run, which is the best differential oracle here for anyone
 without a cross-compiler.
 
-Run the five suites before touching anything — they should be 9 / 11 / 9 / 8 / 12, plus 8 for
-`node web/test_node.mjs` if emscripten is around:
+Run the six suites before touching anything — they should be 9 / 11 / 9 / 8 / 11 / 3, plus 8
+for `node web/test_node.mjs` if emscripten is around:
 
     sh tests/run_tests.sh    sh tests/run_macho.sh
     sh tests/run_busybox.sh  sh tests/run_python.sh
-    sh tests/run_macos.sh
+    sh tests/run_macos.sh    sh tests/run_gcc.sh
 
 `EMU` is overridable, which is how the strict sweep is run and how a second build is
 compared:
@@ -271,9 +290,12 @@ against *itself* under two memory modes, which turns out to be a sharp test (see
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     8 passed   CPython 3.13, dynamically linked, and a
                                           child process through fork/exec/pipe/wait
-    sh tests/run_macos.sh     12 passed   the macOS guests: hello, threads, tls, files,
+    sh tests/run_macos.sh     11 passed   the macOS guests: hello, threads, tls, files,
                                           and Apple's CPython -- its digest against the
                                           host's, its threads, and a child process
+    sh tests/run_gcc.sh        3 passed   Alpine gcc compiles and links a program and
+                                          the emulator runs the result (skips without
+                                          the ~120 MB toolchain tree)
     node web/test_node.mjs     8 passed   the same guests under WebAssembly
 
 What works:

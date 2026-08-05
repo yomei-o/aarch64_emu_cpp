@@ -39,3 +39,5 @@ tests/dylib/expected
 tests/dylib/*.s
 tests/dylib/*.actual
 tests/dylib/cerr3
+# Downloaded Alpine .apk cache for the gcc toolchain (resume.md has the list).
+.gcc/

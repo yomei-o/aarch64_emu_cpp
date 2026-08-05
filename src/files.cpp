@@ -241,13 +241,26 @@ int64_t Files::pread(int fd, void* dst, uint64_t len, uint64_t off) {
 namespace {
 // The AArch64 `struct stat` is 128 bytes with a fixed layout; a guest libc reads it
 // by offset, so the offsets are what matter, not any host struct.
-void fill_stat(void* buf, uint64_t size, bool dir) {
+//
+// The inode is an FNV hash of the host path rather than a constant, and this is not
+// cosmetic: musl's ld.so decides "is this library already loaded?" by comparing
+// st_dev/st_ino. With every file answering (1,1), the first library loaded stood in
+// for all of them -- cc1 loaded libisl, then libmpc/libmpfr/libgmp/libz each
+// "matched" it and were silently skipped, and relocation failed with
+// "__gmpz_get_si: symbol not found" against a libgmp that was sitting right there.
+uint64_t path_ino(const std::string& path) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : path) { h ^= c; h *= 1099511628211ull; }
+    return h ? h : 1;                                  // 0 reads as "no file"
+}
+
+void fill_stat(void* buf, uint64_t size, bool dir, const std::string& path) {
     std::memset(buf, 0, 128);
     auto* p = static_cast<uint8_t*>(buf);
     auto put64 = [&](size_t off, uint64_t v) { std::memcpy(p + off, &v, 8); };
     auto put32 = [&](size_t off, uint32_t v) { std::memcpy(p + off, &v, 4); };
     put64(0, 1);                                       // st_dev
-    put64(8, 1);                                       // st_ino
+    put64(8, path_ino(path));                          // st_ino
     put32(16, dir ? 0040755u : 0100644u);              // st_mode
     put32(20, 1);                                      // st_nlink
     put32(24, 1000); put32(28, 1000);                  // st_uid, st_gid
@@ -284,18 +297,25 @@ int64_t Files::fstat(int fd, void* statbuf) {
     }
     std::error_code ec;
     const auto sz = std::filesystem::file_size(it->second.path, ec);
-    fill_stat(statbuf, ec ? 0 : static_cast<uint64_t>(sz), false);
+    fill_stat(statbuf, ec ? 0 : static_cast<uint64_t>(sz), false, it->second.path);
     return 0;
 }
 
 int64_t Files::stat_path(const std::string& path, void* statbuf) {
     const std::string hp = host_path(path);
     std::error_code ec;
-    if (std::filesystem::is_directory(hp, ec)) { fill_stat(statbuf, 4096, true); return 0; }
+    if (std::filesystem::is_directory(hp, ec)) { fill_stat(statbuf, 4096, true, hp); return 0; }
     const auto sz = std::filesystem::file_size(hp, ec);
     if (ec) return kENOENT;
-    fill_stat(statbuf, static_cast<uint64_t>(sz), false);
+    fill_stat(statbuf, static_cast<uint64_t>(sz), false, hp);
     return 0;
+}
+
+int64_t Files::unlink(const std::string& path) {
+    std::error_code ec;
+    const bool gone = std::filesystem::remove(host_path(path), ec);
+    if (ec) return kEACCES;
+    return gone ? 0 : kENOENT;
 }
 
 int64_t Files::access(const std::string& path) {

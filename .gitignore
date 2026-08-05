@@ -32,3 +32,6 @@ mo/
 tests/dylib/dsc*
 tests/dylib/fake.cache
 tests/dylib/expected
+tests/dylib/*.s
+tests/dylib/*.actual
+tests/dylib/cerr3

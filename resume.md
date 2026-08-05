@@ -40,7 +40,7 @@ Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agr
 byte over the whole macOS run, which is the best differential oracle here for anyone
 without a cross-compiler.
 
-Run the five suites before touching anything — they should be 9 / 10 / 9 / 7 / 4, plus 8 for
+Run the five suites before touching anything — they should be 9 / 11 / 9 / 7 / 4, plus 8 for
 `node web/test_node.mjs` if emscripten is around:
 
     sh tests/run_tests.sh    sh tests/run_macho.sh
@@ -109,7 +109,9 @@ fifth cannot be: no x86 host can run Apple's arm64 libraries, so it checks the m
 against *itself* under two memory modes, which turns out to be a sharp test (see below):
 
     sh tests/run_tests.sh      9 passed   freestanding C, built twice and diffed
-    sh tests/run_macho.sh     10 passed   the same sources as arm64 Mach-O, plus a dylib
+    sh tests/run_macho.sh     11 passed   the same sources as arm64 Mach-O, plus a dylib
+                                          linked both ways: chained fixups and the older
+                                          LC_DYLD_INFO opcode programs
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
     sh tests/run_macos.sh      4 passed   the macOS guest, permissive and --strict

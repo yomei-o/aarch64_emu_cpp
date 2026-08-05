@@ -70,6 +70,48 @@ else
     echo "SKIP macho dylib ($(head -1 dylib/cerr))"
 fi
 
+# ---- the same thing again, said the *old* way --------------------------------
+#
+# Chained fixups are what a Big Sur deployment target emits. Everything older says
+# the same thing as LC_DYLD_INFO byte-code programs, and that is not a legacy
+# curiosity: the stock CPython for macOS, which is what this emulator is aimed at,
+# is built that way. So the opcode reader gets the same differential treatment --
+# same sources, same host oracle, only the linker flag differs.
+#
+# The obstacle is `dyld_stub_binder`. Without chained fixups the linker routes every
+# function import through a lazy stub that calls it, and it lives in libSystem,
+# which is not available off a Mac. Two things make that survivable here:
+#
+#   - a stub dylib exporting the symbol satisfies the link. Defining it *in the
+#     executable* does not -- this lld crashes on that, so the dylib is not a
+#     stylistic choice;
+#   - it is never called, because the emulator binds the lazy program eagerly the
+#     way `-bind_at_load` would. If it ever were, the `ret` would return to a stub
+#     that jumps through an unbound pointer, which is a loud failure rather than a
+#     quiet one.
+printf '.text\n.globl dyld_stub_binder\ndyld_stub_binder:\n    ret\n' > dylib/binder.s
+if $CLANG $MACHO -dynamiclib -Wl,-install_name,@executable_path/libbinder.dylib \
+        -Wl,-fixup_chains -o dylib/libbinder.dylib dylib/binder.s 2>dylib/cerr3 &&
+   $CLANG $MACHO -dynamiclib -Wl,-install_name,@executable_path/libfoo_info.dylib \
+        -Wl,-no_fixup_chains -O2 -Idylib -o dylib/libfoo_info.dylib dylib/lib.c 2>>dylib/cerr3 &&
+   $CLANG $MACHO -Wl,-e,_start -Wl,-no_fixup_chains -DA64_DARWIN -O2 -I. -Idylib \
+        -o dylib/main_info.macho dylib/main.c dylib/libfoo_info.dylib \
+        dylib/libbinder.dylib 2>>dylib/cerr3; then
+    if $EMU --root dylib dylib/main_info.macho > dylib/info.actual 2>dylib/info.err; then
+        if cmp -s dylib/expected dylib/info.actual; then
+            echo "ok   macho dylib (LC_DYLD_INFO opcodes)"; pass=$((pass+1))
+        else
+            echo "FAIL macho dylib LC_DYLD_INFO"
+            diff dylib/expected dylib/info.actual | head -10; fail=$((fail+1))
+        fi
+    else
+        echo "FAIL macho dylib LC_DYLD_INFO (emulator stopped)"
+        sed 's/^/     /' dylib/info.err; fail=$((fail+1))
+    fi
+else
+    echo "SKIP macho dylib LC_DYLD_INFO ($(head -1 dylib/cerr3))"
+fi
+
 
 # ---- the shared-cache extractor, round-tripped -------------------------------
 #

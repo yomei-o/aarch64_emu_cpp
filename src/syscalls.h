@@ -152,6 +152,9 @@ private:
     // fails only if it is zero. Handing out the same one twice would make two
     // different things compare equal.
     uint32_t next_port_ = 0x1103;
+    // Activity ids, which libxpc stamps on messages. Distinctness is the only
+    // property anything checks.
+    uint64_t next_activity_id_ = 0x5000'0001ull;
     // A task's special ports (TASK_BOOTSTRAP_PORT and friends), by `which_port`. The same
     // port every time it is asked for, because that is what it is.
     std::map<uint32_t, uint32_t> special_ports_;

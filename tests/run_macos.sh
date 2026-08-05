@@ -33,7 +33,14 @@ fi
 # What the run costs today. Tolerance is 2%: the count is deterministic on one
 # build, but the two compilers do not have to agree on, say, how many times a
 # libc loop runs when a host-supplied timestamp differs.
-kExpect=199279
+#
+# 199279 -> 192101 when MIG `task_set_special_port` (3410) started succeeding.
+# libxpc stores the bootstrap port back after adding a send right, and a failure
+# there sent it down a reporting path -- os_assumes_log, a sysctl, three dyld
+# slots -- that did seven thousand instructions of work to complain about
+# something that is now simply fine. A count going *down* is the shape a removed
+# failure path has.
+kExpect=192101
 kTolerance=2
 
 pass=0; fail=0

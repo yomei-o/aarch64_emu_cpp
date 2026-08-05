@@ -876,7 +876,12 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
         }
         // Replies that are only a return code: semaphore_destroy, and the restartable
         // range registration libobjc also reaches through MIG rather than the trap.
+        // 3410 is task_set_special_port: libxpc stores the bootstrap port back after
+        // adding a send right to it. Only the return code is read, and refusing it
+        // sends libxpc down a path that ends in "API Misuse" several thousand
+        // instructions later, naming nothing.
         case 8000: case 8001:
+        case 3410:
         case 3419: {
             const uint32_t size = 24 + 8 + 4;
             if (reply_cap && size > reply_cap) return kKernFailure;
@@ -1026,6 +1031,26 @@ bool Syscalls::svc_darwin() {
             case 29: r = 0x10B; break;                     // host_self_trap
             case 47: r = mach_msg2(a0, a1, a2, a3, a4, a5, cpu_.xr(6)); break;   // mach_msg2
             case 61: case 62: r = kKernSuccess; break;     // swtch_pri, thread_switch
+            // host_create_mach_voucher_trap(host, recipes, size, &voucher).
+            //
+            // libdispatch makes one for the task while it starts up, and treats a
+            // failure as fatal rather than as "no vouchers here":
+            //
+            //     _voucher_task_mach_voucher_init: Could not create task mach voucher
+            //
+            // A voucher carries QoS and activity attributes between threads and
+            // processes. Nothing here schedules, so the attributes have no effect and
+            // the voucher only has to be a distinct non-zero port -- which is the same
+            // bargain every other port in this file makes.
+            case 70: mem_.write<uint32_t>(a3, next_port_++); r = kKernSuccess; break;
+            // mach_voucher_extract_attr_recipe_trap: what is *in* a voucher. libxpc
+            // asks so it can copy the caller's attributes into a message. Answering
+            // "the recipe is empty" is true here -- nothing ever put anything in one.
+            case 72: if (a4) mem_.write<uint32_t>(a4, 0); r = kKernSuccess; break;
+            // mach_generate_activity_id(task, count, &id). libxpc stamps its messages
+            // with these; they only have to be distinct.
+            case 50: mem_.write<uint64_t>(a3 ? a3 : a2, next_activity_id_++);
+                     r = kKernSuccess; break;
             case 89: {                                     // mach_timebase_info_trap
                 // numer/denom of 1/1 makes mach_absolute_time() nanoseconds, which
                 // is what the host clock already hands back.
@@ -1164,6 +1189,17 @@ bool Syscalls::svc_darwin() {
         case 75: case 232: r = 0; break;                   // madvise, posix_madvise
         case 20: r = 1000; break;                          // getpid
         case 24: case 25: case 43: case 47: r = 1000; break;  // getuid/geteuid/getgid/getegid
+        // gettid(&uid, &gid): the *audit* identity, which is the one a process had
+        // before it changed identity. CoreFoundation's `__CFGetUGIDs` calls it first
+        // and, when it fails, falls back to asking opendirectoryd over XPC -- which
+        // on a machine with no launchd cannot work, and which ends thousands of
+        // instructions later in libxpc's "API Misuse: Messages must be dictionaries."
+        // Answering here is what keeps CF off that road entirely.
+        case 286:
+            mem_.write<uint32_t>(a0, 1000);
+            mem_.write<uint32_t>(a1, 1000);
+            r = 0;
+            break;
         case 327: r = 0; break;                            // issetugid
         // Signals, and the thread calls that go with them. These *must* succeed: the
         // Linux side learned the same lesson, where refusing rt_sigprocmask took musl's
@@ -1311,13 +1347,22 @@ bool Syscalls::svc_darwin() {
             // assigns them too, out of a private range. Which numbers they are does not
             // matter; that name2oid and the numeric lookup below agree does.
             enum : uint32_t { kOidBootargs = 0x101, kOidOsVariant = 0x102,
-                              kOidEphemeral = 0x103 };
+                              kOidEphemeral = 0x103, kOidProductVersion = 0x104,
+                              kOidSha512 = 0x105, kOidSha3 = 0x106 };
             static const struct { const char* name; uint32_t mib[2]; } kNamed[] = {
                 {"kern.boottime",         {CTL_KERN, 21}},   // these two have real MIBs
                 {"kern.osversion",        {CTL_KERN, 65}},
                 {"kern.bootargs",         {0, kOidBootargs}},
                 {"kern.osvariant_status", {0, kOidOsVariant}},
                 {"hw.ephemeral_storage",  {0, kOidEphemeral}},
+                // CPython reads the product version for `platform.mac_ver()`, and
+                // libcorecrypto asks about the SHA extensions before choosing an
+                // implementation. Both are answered rather than refused because a
+                // refusal is not neutral: corecrypto's fallback for an *unknown*
+                // answer is not the same code as its fallback for "no".
+                {"kern.osproductversion", {0, kOidProductVersion}},
+                {"hw.optional.armv8_2_sha512", {0, kOidSha512}},
+                {"hw.optional.armv8_2_sha3",   {0, kOidSha3}},
             };
             // {0, 3} is name2oid, which is what sysctlbyname(3) is built on: the name
             // comes in as a string in `newp` and the MIB goes back into `oldp`.
@@ -1351,6 +1396,11 @@ bool Syscalls::svc_darwin() {
                     // answer is the same and this way it does not have to.
                     case kOidOsVariant: r = give_int(0xAAAA'AAAA'AAAA'AAAAull, 8); break;
                     case kOidEphemeral: r = give_int(0, 4); break;
+                    case kOidProductVersion: r = give_str("15.7.4"); break;
+                    // SHA-512 and SHA-3 are *not* implemented in crypto.cpp -- only
+                    // SHA-1 and SHA-256 are -- so saying no is the truthful answer
+                    // and it keeps corecrypto on the code this emulator can run.
+                    case kOidSha512: case kOidSha3: r = give_int(0, 4); break;
                     default: goto sysctl_unknown;
                 }
                 break;

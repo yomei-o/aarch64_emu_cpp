@@ -43,6 +43,11 @@ were in the way are done, and the fourth needs a Mac for ten minutes.
 - **Threads work on Darwin.** `bsdthread_create`, `__ulock_wait`/`__ulock_wake`, and
   the run-loop fix that made preemption exist there at all. `guests/macos/threads`
   is the test and its answer is checkable arithmetic.
+- **The filesystem works through Apple's libc**, not just through the syscall table:
+  `getdirentries64`, `fstatfs64`, `getrlimit`. `guests/macos/files` walks a directory
+  and reads a file with opendir/readdir/fopen/fgets, and the host computes the same
+  counts and hashes from the same tree. This is the path CPython walks looking for
+  its standard library.
 - **What is left is the libraries.** The stock CPython for macOS
   (`aarch64-apple-darwin` from python-build-standalone, no Mac needed to download)
   loads far enough to name exactly what it wants and nothing more:
@@ -71,7 +76,7 @@ Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agr
 byte over the whole macOS run, which is the best differential oracle here for anyone
 without a cross-compiler.
 
-Run the five suites before touching anything — they should be 9 / 11 / 9 / 7 / 6, plus 8 for
+Run the five suites before touching anything — they should be 9 / 11 / 9 / 7 / 7, plus 8 for
 `node web/test_node.mjs` if emscripten is around:
 
     sh tests/run_tests.sh    sh tests/run_macho.sh
@@ -147,7 +152,7 @@ against *itself* under two memory modes, which turns out to be a sharp test (see
                                           LC_DYLD_INFO opcode programs
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
-    sh tests/run_macos.sh      6 passed   the macOS guests, permissive and --strict
+    sh tests/run_macos.sh      7 passed   the macOS guests: hello, threads, files
     node web/test_node.mjs     8 passed   the same guests under WebAssembly
 
 What works:

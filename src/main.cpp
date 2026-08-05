@@ -345,6 +345,19 @@ int main(int argc, char** argv) {
         sys.set_prog_header(img.phdr_addr);
         sys.set_cache_range(img.cache_lo, img.cache_hi);
         sys.setup_tlv(img.tlv_images);
+        // The bootstrap port, before the first instruction, because that is when a
+        // real kernel provides it. Measured on a Mac: a plain `__attribute__((
+        // constructor))` already sees `bootstrap_port = 0x807`, so it is there before
+        // any initializer runs -- and several libraries read it long before libxpc's
+        // initializer, which is the only thing in the guest that ever writes it.
+        //
+        // Leaving it zero is not inert. libsystem_info asks libnotify to register for
+        // "com.apple.system.DirectoryService.InvalidateCache", libnotify reads this
+        // global, and `bootstrap_look_up3(0, ...)` sends libxpc down its "we have a
+        // bootstrap" branch and into a pipe it has not created -- a read of address
+        // 0x1C, four million instructions into the stock macOS CPython.
+        if (img.bootstrap_port_addr)
+            mem.write<uint32_t>(img.bootstrap_port_addr, Syscalls::kBootstrapPort);
     }
 
     int rc = 0;
@@ -440,6 +453,11 @@ int main(int argc, char** argv) {
                 if (cpu.halted) break;
 
             }
+            // Every image's `+load`, now that the libraries are up. libobjc handed the
+            // callback over during its own initializer and this is where dyld runs it;
+            // running it there instead put Foundation's `+load` on top of a libSystem
+            // initializer that was still part-way through. See darwin.cpp, `case 107`.
+            if (!cpu.halted) sys.run_objc_load_images();
             cpu.sp = sp0;
             cpu.pc = start_pc ? start_pc : img.entry;
         }
@@ -485,6 +503,31 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "  sp =%016llX pc =%016llX\n",
                      static_cast<unsigned long long>(cpu.sp),
                      static_cast<unsigned long long>(cpu.pc));
+        // The frame chain. AArch64's ABI keeps x29 pointing at { caller's x29,
+        // caller's x30 }, so walking it is two loads per frame -- and it is the
+        // difference between one command and a dozen. Every wall on the macOS side has
+        // been "which library asks for this, and from where", and answering it by
+        // watching one stack slot at a time to follow the chain by hand took eight
+        // round trips the last time.
+        //
+        // Permissive reads on purpose: this runs *after* something already went wrong,
+        // so a frame pointer that is rubbish must print as rubbish rather than fault
+        // again. The walk stops on anything that cannot be a frame.
+        std::fprintf(stderr, "  frames (x29 chain):\n");
+        uint64_t fp = cpu.xr(29);
+        std::fprintf(stderr, "    %012llX  (pc)\n",
+                     static_cast<unsigned long long>(cpu.pc));
+        std::fprintf(stderr, "    %012llX  (x30)\n",
+                     static_cast<unsigned long long>(cpu.xr(30)));
+        for (int depth = 0; depth < 24 && fp > 0x1000; ++depth) {
+            const uint64_t next = mem.read<uint64_t>(fp);
+            const uint64_t ret = mem.read<uint64_t>(fp + 8);
+            if (!ret) break;
+            std::fprintf(stderr, "    %012llX\n", static_cast<unsigned long long>(ret));
+            if (next <= fp) break;              // frames grow upward; anything else is junk
+            fp = next;
+        }
+        std::fprintf(stderr, "  (put these through tools/whichlib.py)\n");
         rc = 1;
     }
     std::fflush(stdout);

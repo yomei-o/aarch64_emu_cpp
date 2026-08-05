@@ -922,6 +922,15 @@ bool macho_link(const std::vector<uint8_t>& main_file, const std::string& exe_pa
         if (a) { out->dyld_gapis = img.slide + a; break; }
     }
 
+    // ...and libsystem_kernel's `bootstrap_port`, which the host fills in before the
+    // guest starts. See the note in main.cpp: on a real Mac the port is already there
+    // when the first constructor runs, and several libraries read it long before
+    // libxpc's initializer -- which is the only thing that ever sets it here.
+    for (const MachoImage& img : images) {
+        const uint64_t a = macho_lookup_symtab(img, "_bootstrap_port");
+        if (a) { out->bootstrap_port_addr = img.slide + a; break; }
+    }
+
     // Where the crt globals live. On a Mac `NXArgc`, `NXArgv`, `environ` and `__progname`
     // are defined in libdyld.dylib, and *dyld* writes them before any initializer runs --
     // libsystem_c's `environ` and Swift's environment reader are binds against this same

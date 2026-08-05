@@ -23,6 +23,11 @@ struct LoadedImage {
     // libdyld is among the images. Real dyld constructs that object; having replaced
     // dyld, the host has to stand in for it.
     uint64_t dyld_gapis = 0;
+    // Mach-O only: libsystem_kernel's `bootstrap_port` global. A real kernel hands a
+    // process its bootstrap port at exec, so the value is already there before any
+    // initializer runs -- measured on a Mac, where a plain constructor sees 0x807.
+    // Nothing in the guest sets it that early, so the host has to.
+    uint64_t bootstrap_port_addr = 0;
     uint64_t objc_opt_ro = 0;
     // The guest's own `exit`, for when an LC_MAIN entry point returns — see the note in
     // macho_dyld.cpp. Without calling it, a program that printed and returned prints

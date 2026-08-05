@@ -70,8 +70,19 @@ public:
     // through a null pointer -- or, in libsystem_c's case, aborts with "thread locals
     // not initialized" before the guest has printed anything.
     void setup_tlv(const std::vector<LoadedImage::TlvImage>& images);
+    // Every image's `+load` methods. libobjc hands the callback over during its own
+    // initializer, but running it there runs guest code that expects the libraries to
+    // be up -- so the host holds it until the initializer list is finished, the way
+    // dyld does.
+    void run_objc_load_images();
     // The address a handler returns to when the guest supplied no restorer.
     static constexpr uint64_t kSigreturnMagic = 0x0000'0000'DEAD'0000ull;
+    // The task's bootstrap port. Fixed rather than handed out from `next_port_`,
+    // because the host writes it into the guest's `bootstrap_port` global before the
+    // first instruction and `task_get_special_port` has to agree with what is already
+    // there. A real Mac's is 0x807 on the machine this was measured on.
+    static constexpr uint32_t kBootstrapPort = 0x807;
+
 
 private:
     bool svc(uint32_t imm);
@@ -152,9 +163,9 @@ private:
     // fails only if it is zero. Handing out the same one twice would make two
     // different things compare equal.
     uint32_t next_port_ = 0x1103;
-    // Activity ids, which libxpc stamps on messages. Distinctness is the only
-    // property anything checks.
-    uint64_t next_activity_id_ = 0x5000'0001ull;
+    // One special reply port per thread, which is what `thread_get_special_reply_port`
+    // is for: a thread receives an XPC reply on its own port and keeps it.
+    std::map<size_t, uint32_t> special_reply_ports_;
     // A task's special ports (TASK_BOOTSTRAP_PORT and friends), by `which_port`. The same
     // port every time it is asked for, because that is what it is.
     std::map<uint32_t, uint32_t> special_ports_;
@@ -176,6 +187,8 @@ private:
     std::unordered_map<std::string, uint64_t> sel_map_;
     static constexpr uint64_t kObjcOptRw = 0x0000'0003'0200'0000ull;
     static constexpr uint64_t kObjcOptRwSize = 1u << 20;
+    uint64_t objc_load_images_ = 0, objc_infos_ = 0;
+    size_t objc_info_count_ = 0;
     std::vector<std::string> objc_image_paths_;
     std::vector<uint64_t> objc_image_headers_;
     std::vector<LoadedImage::ImageSeg> image_segs_;

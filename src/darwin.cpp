@@ -351,6 +351,19 @@ uint64_t Syscalls::tlv_addr(uint64_t descriptor) {
     return it->second + offset;
 }
 
+// The deferred half of the ObjC registration: every image's `+load` methods, run
+// once the libraries are actually up. See `case 107` for why it is not done there.
+void Syscalls::run_objc_load_images() {
+    if (!objc_load_images_ || cpu_.halted) return;
+    constexpr uint64_t kInfoSize = 32;
+    if (trace)
+        std::fprintf(stderr, "[objc] load_images x%zu at %012llX\n", objc_info_count_,
+                     static_cast<unsigned long long>(objc_load_images_));
+    for (size_t j = 0; j < objc_info_count_ && !cpu_.halted; ++j)
+        call_guest(objc_load_images_, objc_infos_ + j * kInfoSize, 0, 0);
+    objc_load_images_ = 0;
+}
+
 // The handler for those stubs. `w16` holds the vtable slot index.
 int64_t Syscalls::dyld_api_stub(uint32_t slot) {
     switch (slot) {
@@ -696,13 +709,26 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
                              static_cast<unsigned long long>(map_images));
             call_guest(map_images, n, infos, block);
 
-            // Then the `init` callback, once per image, which is the rest of what dyld
-            // does at registration: it runs each image's `+load` methods and finishes
-            // whatever `map_images` deferred. Same order, for the same reason.
-            const uint64_t load_images = mem_.read<uint64_t>(p + 16);
-            if (load_images && !cpu_.halted)
-                for (size_t j = 0; j < n && !cpu_.halted; ++j)
-                    call_guest(load_images, infos + j * kInfoSize, 0, 0);
+            // The `init` callback -- each image's `+load` methods -- is **remembered,
+            // not called**. That is the difference between the two halves of this
+            // registration, and it took a backtrace to see.
+            //
+            // `map_images` really does have to run here, re-entrantly, because
+            // `_objc_init` uses classes before it returns. `load_images` does not, and
+            // running it here runs arbitrary `+load` methods while libSystem's own
+            // initializer is still part-way through -- which reached, in order:
+            //
+            //     Foundation +load -> _NSInitializePlatform -> __CFInitialize
+            //       -> __CFStringGetUserDefaultEncoding -> getpwuid_r
+            //       -> libsystem_info's module search -> notify_register_check
+            //       -> bootstrap_look_up3 -> libxpc, whose bootstrap pipe its own
+            //          initializer has not created yet -> a null pipe
+            //
+            // dyld runs `+load` after the libraries are up, and so does this now:
+            // main.cpp calls `run_objc_load_images()` once the initializer list is done.
+            objc_load_images_ = mem_.read<uint64_t>(p + 16);
+            objc_infos_ = infos;
+            objc_info_count_ = n;
             return 0;
         }
         default:
@@ -867,8 +893,12 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
             // genuinely do create something new every call.
             uint32_t name;
             if (msgh_id == 3409) {
-                uint32_t& slot = special_ports_[mem_.read<uint32_t>(data + 32)];
-                if (!slot) slot = next_port_++;
+                const uint32_t which = mem_.read<uint32_t>(data + 32);
+                uint32_t& slot = special_ports_[which];
+                // TASK_BOOTSTRAP_PORT is not invented here: the host has already
+                // written it into the guest's `bootstrap_port` global, the way the
+                // kernel does at exec, and the two have to be the same number.
+                if (!slot) slot = (which == 4) ? kBootstrapPort : next_port_++;
                 name = slot;
             } else {
                 name = next_port_++;
@@ -1059,10 +1089,21 @@ bool Syscalls::svc_darwin() {
             // asks so it can copy the caller's attributes into a message. Answering
             // "the recipe is empty" is true here -- nothing ever put anything in one.
             case 72: if (a4) mem_.write<uint32_t>(a4, 0); r = kKernSuccess; break;
-            // mach_generate_activity_id(task, count, &id). libxpc stamps its messages
-            // with these; they only have to be distinct.
-            case 50: mem_.write<uint64_t>(a3 ? a3 : a2, next_activity_id_++);
-                     r = kKernSuccess; break;
+            // thread_get_special_reply_port(). No arguments; the port comes back in
+            // x0. libxpc needs one per thread to receive an XPC reply on.
+            //
+            // This was guessed at as `mach_generate_activity_id` first, which takes
+            // an out-parameter -- so the handler wrote a fresh id through whatever
+            // happened to be in x2, which was the thread port 0x103, and `--strict`
+            // reported an unmapped write to address 0x103. A trap number is worth
+            // reading out of the library rather than recalling: `mov x16, #-0x32`
+            // sits two instructions above the symbol.
+            case 50: {
+                uint32_t& slot = special_reply_ports_[cur_thread_];
+                if (!slot) slot = next_port_++;
+                r = slot;
+                break;
+            }
             case 89: {                                     // mach_timebase_info_trap
                 // numer/denom of 1/1 makes mach_absolute_time() nanoseconds, which
                 // is what the host clock already hands back.

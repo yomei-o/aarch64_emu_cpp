@@ -475,6 +475,68 @@ void Cpu::exec_fp_simd(uint32_t insn) {
         }
     }
 
+    // ---- Advanced SIMD scalar two-register misc: the FP/integer conversions ----
+    //
+    // `ucvtf d0, d8` -- an integer that is already in a vector register turned into a
+    // double in place. It is not the `ucvtf d0, x8` form (which is the FP/integer
+    // group below and was implemented long ago); the operand never passes through a
+    // general register. CPython emits it converting a 64-bit count to a float.
+    //
+    // Encoding: 01 U 11110 0 sz 10000 opcode 10 Rn Rd. Bit 28 is what keeps the
+    // *vector* two-register-misc group (01110) from matching.
+    if ((insn & 0xDFBE0C00u) == 0x5E200800u) {
+        const bool u = (insn >> 29) & 1, dbl = (insn >> 22) & 1;
+        const unsigned opcode = (insn >> 12) & 0x1F;
+        const unsigned rn = (insn >> 5) & 0x1F, rd = insn & 0x1F;
+        auto put = [&](double v) {
+            if (dbl) { uint64_t b; std::memcpy(&b, &v, 8); vreg[rd] = {b, 0}; }
+            else { const float f = static_cast<float>(v); uint32_t b;
+                   std::memcpy(&b, &f, 4); vreg[rd] = {b, 0}; }
+        };
+        auto get = [&]() -> double {
+            if (dbl) { double d; std::memcpy(&d, &vreg[rn].lo, 8); return d; }
+            float f; const uint32_t b = static_cast<uint32_t>(vreg[rn].lo);
+            std::memcpy(&f, &b, 4);
+            return f;
+        };
+        if (opcode == 0x1D) {                                   // SCVTF / UCVTF
+            if (dbl) {
+                const uint64_t bits = vreg[rn].lo;
+                put(u ? static_cast<double>(bits)
+                      : static_cast<double>(static_cast<int64_t>(bits)));
+            } else {
+                const uint32_t bits = static_cast<uint32_t>(vreg[rn].lo);
+                put(u ? static_cast<double>(bits)
+                      : static_cast<double>(static_cast<int32_t>(bits)));
+            }
+            return;
+        }
+        if (opcode == 0x1B) {                                   // FCVTZS / FCVTZU
+            // Toward zero, and saturating: C++'s conversion of an out-of-range double
+            // to an integer is undefined, where AArch64's is defined to clamp. A guest
+            // that converts a huge float would otherwise get whatever the host's
+            // instruction happened to leave behind.
+            const double v = get();
+            const unsigned bits = dbl ? 64 : 32;
+            if (u) {
+                const double hi = std::ldexp(1.0, static_cast<int>(bits));
+                const uint64_t r = !(v > 0) ? 0
+                                 : (v >= hi ? (bits == 64 ? ~0ull : 0xFFFFFFFFull)
+                                            : static_cast<uint64_t>(v));
+                vreg[rd] = {dbl ? r : (r & 0xFFFFFFFFull), 0};
+            } else {
+                const double hi = std::ldexp(1.0, static_cast<int>(bits - 1));
+                const int64_t r = !(v > -hi - 1) ? (bits == 64 ? INT64_MIN : INT32_MIN)
+                                : (v >= hi ? (bits == 64 ? INT64_MAX : INT32_MAX)
+                                           : static_cast<int64_t>(v));
+                vreg[rd] = {dbl ? static_cast<uint64_t>(r)
+                                : (static_cast<uint64_t>(r) & 0xFFFFFFFFull), 0};
+            }
+            return;
+        }
+        fail("unimplemented scalar two-register misc", insn);
+    }
+
     // ---- Advanced SIMD scalar pairwise: ADDP Dd, Vn.2D and the FP reductions ---
     //
     // The last step of a vectorised reduction: the loop leaves a partial sum in each

@@ -1401,7 +1401,8 @@ bool Syscalls::svc_darwin() {
             // matter; that name2oid and the numeric lookup below agree does.
             enum : uint32_t { kOidBootargs = 0x101, kOidOsVariant = 0x102,
                               kOidEphemeral = 0x103, kOidProductVersion = 0x104,
-                              kOidSha512 = 0x105, kOidSha3 = 0x106 };
+                              kOidSha512 = 0x105, kOidSha3 = 0x106,
+                              kOidSecureKernel = 0x107 };
             static const struct { const char* name; uint32_t mib[2]; } kNamed[] = {
                 {"kern.boottime",         {CTL_KERN, 21}},   // these two have real MIBs
                 {"kern.osversion",        {CTL_KERN, 65}},
@@ -1414,6 +1415,7 @@ bool Syscalls::svc_darwin() {
                 // refusal is not neutral: corecrypto's fallback for an *unknown*
                 // answer is not the same code as its fallback for "no".
                 {"kern.osproductversion", {0, kOidProductVersion}},
+                {"kern.secure_kernel",    {0, kOidSecureKernel}},
                 {"hw.optional.armv8_2_sha512", {0, kOidSha512}},
                 {"hw.optional.armv8_2_sha3",   {0, kOidSha3}},
             };
@@ -1454,6 +1456,7 @@ bool Syscalls::svc_darwin() {
                     // SHA-1 and SHA-256 are -- so saying no is the truthful answer
                     // and it keeps corecrypto on the code this emulator can run.
                     case kOidSha512: case kOidSha3: r = give_int(0, 4); break;
+                    case kOidSecureKernel: r = give_int(0, 4); break;
                     default: goto sysctl_unknown;
                 }
                 break;
@@ -1479,6 +1482,12 @@ bool Syscalls::svc_darwin() {
                     case 59: case 70: r = give_int(kStackTop, 8); break;
                     case 35: r = give_int(kStackTop, 4); break;   // KERN_USRSTACK32
                     case 65: r = give_str("24G84"); break;        // KERN_OSVERSION: build
+                    // KERN_VERSION: the banner `uname -v` prints. `os.uname()` reads
+                    // it, and libc turns a missing sysctl into ENOENT -- which Python
+                    // reports as `FileNotFoundError: No such file or directory` from a
+                    // call that opened no file at all.
+                    case 4: r = give_str("Darwin Kernel Version 24.6.0: "
+                                         "aarch64_emu_cpp"); break;
                     // KERN_BOOTTIME, a struct timeval. Taken once, the first time it is
                     // asked: the guest subtracts it from the current time to get the
                     // uptime, and a boot time that moved between two calls would make
@@ -1504,6 +1513,9 @@ bool Syscalls::svc_darwin() {
                     case 7:  r = give_int(16384, 4); break;        // HW_PAGESIZE
                     case 24: r = give_int(1, 4); break;            // HW_AVAILCPU
                     case 25: r = give_int(8ull << 30, 8); break;   // HW_MEMSIZE
+                    // HW_MACHINE. "arm64" and not "arm64e": the *guest* is arm64,
+                    // and `platform.machine()` is read by code that branches on it.
+                    case 1: r = give_str("arm64"); break;
                     default: goto sysctl_unknown;
                 }
                 break;

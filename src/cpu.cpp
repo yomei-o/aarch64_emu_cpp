@@ -581,6 +581,65 @@ void Cpu::exec_loadstore(uint32_t insn) {
         return;
     }
 
+    // ---- LDAPUR / STLUR: ordered load and store with an unscaled offset ------
+    //
+    // ARMv8.4's FEAT_LRCPC2. They share bits 29..27 with LDR (literal) and differ
+    // only in **bit 24**, which the literal case below did not test -- so
+    //
+    //     stlur wzr, [x19, #0x10]
+    //
+    // decoded as `ldr xzr, [pc + …]`, a load into the zero register: an instruction
+    // that read some unrelated address and threw the result away. Silently. The
+    // store it was supposed to make never happened.
+    //
+    // What that cost is worth writing down, because it is the exact failure this
+    // file's design is meant to prevent. CPython's `create_gil` ends with
+    //
+    //     gil->last_holder = NULL;      // str  -- decoded, and it happened
+    //     gil->locked = 0;              // stlur -- decoded as a load, and it did not
+    //
+    // and `locked` is initialised to -1 meaning "no GIL yet". So the GIL was created
+    // and then still looked uncreated; `take_gil` waited for a holder that could not
+    // exist, timed out forever, and eventually dereferenced a null `last_holder`.
+    // Five million instructions of ObjC, XPC and CoreFoundation start-up were
+    // debugged before this, all of them working correctly.
+    //
+    // The ordering these instructions carry is free here: one interpreter, one thread
+    // at a time, so acquire and release are already satisfied.
+    if (grp == 3 && ((insn >> 24) & 1)) {
+        if ((insn >> 26) & 1) fail("unimplemented SIMD LDAPUR/STLUR", insn);
+        const unsigned size = (insn >> 30) & 3, opc = (insn >> 22) & 3;
+        const unsigned rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
+        const int64_t imm = static_cast<int64_t>(sign_extend((insn >> 12) & 0x1FF, 9));
+        const uint64_t addr = xsp(rn) + static_cast<uint64_t>(imm);
+        if (opc == 0) {                                               // STLUR
+            switch (size) {
+                case 0: mem_.write<uint8_t>(addr, static_cast<uint8_t>(wr(rt))); return;
+                case 1: mem_.write<uint16_t>(addr, static_cast<uint16_t>(wr(rt))); return;
+                case 2: mem_.write<uint32_t>(addr, wr(rt)); return;
+                default: mem_.write<uint64_t>(addr, xr(rt)); return;
+            }
+        }
+        uint64_t v;
+        switch (size) {
+            case 0: v = mem_.read<uint8_t>(addr); break;
+            case 1: v = mem_.read<uint16_t>(addr); break;
+            case 2: v = mem_.read<uint32_t>(addr); break;
+            default: v = mem_.read<uint64_t>(addr); break;
+        }
+        if (opc == 1) {                                               // LDAPUR
+            setreg(rt, size == 3, v);
+            return;
+        }
+        // opc 10 sign-extends to 64 bits, opc 11 to 32. Both are only defined for a
+        // size smaller than the destination, which is why `size == 3` is refused
+        // rather than treated as a wider load that happens to need no extension.
+        if (size == 3 || (opc == 3 && size == 2)) fail("reserved LDAPURS size", insn);
+        const uint64_t s = sign_extend(v, 8u << size);
+        if (opc == 2) setx(rt, s); else setw(rt, static_cast<uint32_t>(s));
+        return;
+    }
+
     if (grp == 3) {                                                   // load register (literal)
         const unsigned opc = (insn >> 30) & 3, rt = insn & 0x1F;
         const bool simd = (insn >> 26) & 1;

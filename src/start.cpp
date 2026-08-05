@@ -160,6 +160,21 @@ int run_image(Cpu& cpu, Memory& mem, Syscalls& sys, const LoadedImage& img,
         if (!cpu.halted) sys.run_objc_load_images();
         cpu.sp = sp0;
         cpu.pc = start_pc ? start_pc : img.entry;
+        // An LC_MAIN entry point *is* `main`, so it is called the way C calls it:
+        // main(argc, argv, envp, apple), in registers. dyld's `start` reads them off
+        // the stack and loads them; the host is standing in for that start.
+        //
+        // Leaving the registers alone worked for `hello`, which ignores its arguments,
+        // and produced a silence that was hard to read for anything that does not:
+        // CPython saw no `-c` and no `-V`, fell through to the REPL, read EOF from a
+        // stdin nobody had typed into, and exited 0 without printing. "Ran to
+        // completion, printed nothing" is a much worse symptom than a crash.
+        if (darwin) {
+            cpu.setx(0, argc_g);
+            cpu.setx(1, argv_g);
+            cpu.setx(2, envp_g);
+            cpu.setx(3, apple_g);
+        }
     }
     // An LC_MAIN entry point is `main`, and dyld's start calls `exit(main(...))`. The
     // host is standing in for that start, so it has to do the same: give `main` a

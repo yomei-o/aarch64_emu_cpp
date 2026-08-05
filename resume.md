@@ -77,22 +77,42 @@ were in the way are done, and the fourth needs a Mac for ten minutes.
   `com.apple.system.notification_center`. Permissive memory reads the zero and
   carries on, which is exactly the failure mode `--strict` exists to catch.
 
-  What is known about it, so the next attempt starts further along:
+  **The whole chain is now known**, and it is one uninitialised global:
 
-  - it happens **inside libSystem's own initializer** (`[init] 1/16`), not in
-    anything CPython does. libSystem brings up libdispatch, libxpc and libnotify,
-    and the ordering inside that is the guest's, not this loader's;
-  - `_xpc_interface_routine` loads the pipe from `[domain + 0x18]` and gets 0. It
-    reached that line by testing `[global + 0x10]` against -1 and finding something
-    else, which is its "we have a bootstrap" branch. The other branch returns 141
-    without touching a pipe, and is presumably what a process with no launchd takes;
-  - `_xpc_create_bootstrap_pipe` *does* eventually store a real pipe there
-    (0x18016DB24 writes it), just **later than the three uses that read zero** --
-    watch `[domain + 0x18]` and the order is plain;
-  - making MIG `task_get_special_port(TASK_BOOTSTRAP_PORT)` answer with the null
-    port was tried and changes **nothing**: the instruction count is identical to
-    the digit, so libxpc has not asked for it by this point and gets its idea of a
-    bootstrap from somewhere else. Finding *that* is the next move.
+      CPython startup
+        -> libsystem_info wants the user database
+        -> dispatch_once -> libnotify, registering for
+           "com.apple.system.DirectoryService.InvalidateCache"
+        -> libnotify reads the global `_bootstrap_port` (libsystem_kernel,
+           0x1EE4188AC) and gets **0**
+        -> bootstrap_look_up3(port = 0, "com.apple.system.notification_center")
+        -> _xpc_interface_routine takes its "we have a bootstrap" branch
+        -> _xpc_pipe_routine(pipe = NULL) -> read of 0x1C
+
+  The measurement that settles it: watch `1EE4188AC`. It is **read as 0 by
+  libnotify** and only **written later, with 0x1108, by `_libxpc_initializer
+  +1076`**. `mach_init_doit` runs (once, from `__libkernel_init +256`) and does
+  *not* set it -- it sets `mach_task_self_` and the page-size globals and nothing
+  else. So on this OS `bootstrap_port` is libxpc's initializer's to set, and
+  something reaches libnotify before it.
+
+  Two things that were tried and did nothing, so they need not be tried again:
+
+  - answering MIG `task_get_special_port(TASK_BOOTSTRAP_PORT)` with the null port:
+    the instruction count came out identical to the digit, so libxpc has not asked
+    by then;
+  - returning `MACH_SEND_INVALID_DEST` for a send to port 0. That is now the
+    behaviour and it is right on its own terms -- the traffic really is XPC to a
+    null port -- but the crash is before any send.
+
+  **The open question is what a real Mac does here**, and it is the kind of
+  question a Mac answers in a minute and disassembly answers in an afternoon:
+
+      lldb .../python3.13 -o 'b bootstrap_look_up3' -o run -o bt -o 'p bootstrap_port'
+
+  Either `bootstrap_port` is non-zero by then (and something sets it earlier than
+  libxpc's initializer -- find what), or libnotify never gets that far because
+  something upstream succeeded that fails here.
 
   The goal is not to make XPC work — CPython does not need it — but to have libxpc
   take the path it has for a process with no launchd. It survives a missing service

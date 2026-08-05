@@ -36,6 +36,11 @@ int main(int argc, char** argv) {
     bool trace_sys = false, stats = false, macho_info = false, strict = false;
     bool dyld_sections = false;
     uint64_t max_insns = 0, sample = 0, watch_lo = 0, watch_hi = 0, pc_watch = 0;
+    // --setenv NAME=VALUE, repeatable. It exists for libobjc's OBJC_PRINT_* family:
+    // the ObjC runtime will explain its own decisions when asked, which beats
+    // reasoning about them from outside. (It parses those through libobjc-env.dylib,
+    // which is not in the current extraction -- so today this is set-up, not a tool.)
+    std::vector<std::string> extra_env;
     // The guest sees this directory as "/". Defaulting to the host cwd means a
     // relative path from the guest lands where a user would expect it to.
     std::string root = ".";
@@ -73,6 +78,7 @@ int main(int argc, char** argv) {
         else if (a == "--max" && i + 1 < argc) max_insns = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--sample" && i + 1 < argc) sample = std::strtoull(argv[++i], nullptr, 0);
         else if (a == "--root" && i + 1 < argc) root = argv[++i];
+        else if (a == "--setenv" && i + 1 < argc) extra_env.push_back(argv[++i]);
         else break;
     }
     if (i >= argc) {
@@ -280,6 +286,7 @@ int main(int argc, char** argv) {
         "PATH=/usr/bin:/bin", "HOME=/", "LANG=C.UTF-8", "TERM=dumb",
         "PYTHONDONTWRITEBYTECODE=1",
     };
+    guest_env.insert(guest_env.end(), extra_env.begin(), extra_env.end());
     guest_argv.push_back(guest_exe);
     for (int k = i + 1; k < argc; ++k) guest_argv.push_back(argv[k]);
 

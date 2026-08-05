@@ -22,25 +22,56 @@ that flushes stdio, and without which the program printed nothing at all.
 
 The macOS milestone is **met**. What is left on that side is breadth rather than a wall.
 
-**Pick up here (2026-08-05).** One command, and it is the live frontier:
+**Pick up here (2026-08-05, second pass).** The goal now has a name: **run the stock
+macOS CPython, and then put it in the browser demo.** Three of the four things that
+were in the way are done, and the fourth needs a Mac for ten minutes.
 
-    ./aarch64emu --dyld-sections --root guests/macos guests/macos/hello
+    ./aarch64emu --root guests/macos guests/macos/threads      # four Darwin threads
+    ./aarch64emu --dyld-sections --root guests/macos guests/macos/hello   # runs now too
+    ./aarch64emu --root guests/macpy/python/bin/python3.13 -c 'print(1)'  # blocked, see below
 
-Without the flag the guest prints and exits cleanly in 199,279 instructions, and `--strict`
-runs the *same* 199,279 — no path through it depends on reading unmapped memory any more.
-With the flag, dyld's section-location API is answered instead of refused, libobjc stops
-walking load commands and starts using the shared cache's preoptimized class layout for
-real, and the run gets 86,000 instructions further before branching through a **null
-function pointer at 285,669 instructions**. Finding what that pointer is, is the next job.
-The full account — including which kind numbers are measured and which are deliberately
-still refused — is item 1 under "Next, in order"; `--trace-sys` prints every section it
-answers with, and `--pcwatch ADDR` prints a guest function's arguments.
+- **`--dyld-sections` completes.** The null function pointer at 285,669 was dyld's
+  `_dyld_objc_mark_image_mutable` **block**, which `map_images` takes as its third
+  argument and which was being passed as zero. libobjc now uses the cache's
+  preoptimized class layout for the whole registration: 666,358 instructions against
+  199,279 for the load-command fallback, same output, identical under `--strict`. It
+  is still off by default only because the fallback is the tested baseline.
+- **LC_DYLD_INFO opcodes are implemented**, which is what a stock macOS binary needs:
+  chained fixups are a Big Sur deployment target, and everything older — CPython
+  included — says the same thing as rebase/bind byte-code programs. `run_macho.sh`
+  builds the dylib test both ways now, so the two readers are held to one oracle.
+- **Threads work on Darwin.** `bsdthread_create`, `__ulock_wait`/`__ulock_wake`, and
+  the run-loop fix that made preemption exist there at all. `guests/macos/threads`
+  is the test and its answer is checkable arithmetic.
+- **What is left is the libraries.** The stock CPython for macOS
+  (`aarch64-apple-darwin` from python-build-standalone, no Mac needed to download)
+  loads far enough to name exactly what it wants and nothing more:
+
+      CoreFoundation, SystemConfiguration, libncurses.5.4, libpanel.5.4,
+      libedit.3, libz.1
+
+  None are in the 48-library extraction. They exist only inside a Mac's dyld shared
+  cache, so getting them is `tools/dsc_extract.c` on a Mac, once. The whole of it:
+
+      cc -O2 -o dsc_extract tools/dsc_extract.c
+      ./dsc_extract -o out --only /usr/lib/           --only /System/Library/Frameworks/ --only /System/Library/PrivateFrameworks/           /System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e           /usr/lib/libSystem.B.dylib /usr/lib/libobjc.A.dylib /usr/lib/libobjc-env.dylib           /usr/lib/libz.1.dylib /usr/lib/libedit.3.dylib           /usr/lib/libncurses.5.4.dylib /usr/lib/libpanel.5.4.dylib           /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation           /System/Library/Frameworks/SystemConfiguration.framework/Versions/A/SystemConfiguration
+
+  The `--only` prefixes are not decoration: CoreFoundation's dependency closure reaches
+  most of the system without them. `/usr/lib/libobjc-env.dylib` is in the list for a
+  different reason — Sequoia's libobjc parses the whole `OBJC_PRINT_*` diagnostic
+  vocabulary through it, so without it `--setenv OBJC_HELP=YES` prints nothing, and the
+  runtime's own account of what it is doing is unavailable.
+
+  Then `python-build-standalone`'s macOS build, which needs no Mac to fetch:
+
+      cd guests && curl -Lo mac-py.tgz         'https://github.com/astral-sh/python-build-standalone/releases/download/20260728/cpython-3.13.14%2B20260728-aarch64-apple-darwin-install_only_stripped.tar.gz'
+      mkdir -p macpy && tar xzf mac-py.tgz -C macpy    # the symlinks fail on Windows; harmless
 
 Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agree byte for
 byte over the whole macOS run, which is the best differential oracle here for anyone
 without a cross-compiler.
 
-Run the five suites before touching anything — they should be 9 / 11 / 9 / 7 / 4, plus 8 for
+Run the five suites before touching anything — they should be 9 / 11 / 9 / 7 / 6, plus 8 for
 `node web/test_node.mjs` if emscripten is around:
 
     sh tests/run_tests.sh    sh tests/run_macho.sh
@@ -71,11 +102,13 @@ compiler-portability change gets checked, since cl.exe and clang must agree.
 
 The tools built for this, all of which take addresses straight out of a trace:
 
-    --trace-sys              syscalls, Mach traps, MIG routines, [init]/[objc]/[call]
+    --trace-sys              syscalls, Mach traps, MIG routines, dyld slots,
+                             [init]/[objc]/[call]/[thr]
     --sample N               print the PC every N instructions
     --watch LO:HI            log every guest access in a range, with the PC
     --pcwatch ADDR           at a guest function's entry, x0..x5 and any string they point at
     --dyld-sections          answer dyld's section-location API (see item 1; off by default)
+    --setenv NAME=VALUE      extra guest environment, repeatable (for OBJC_PRINT_*)
     --macho-info FILE [sym…] what a Mach-O contains; look symbols up in its export trie
     tools/whichlib.py        address -> library and nearest symbol
     tools/dis_macho.py       disassemble at a virtual address in a cache-extracted library
@@ -114,7 +147,7 @@ against *itself* under two memory modes, which turns out to be a sharp test (see
                                           LC_DYLD_INFO opcode programs
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     7 passed   CPython 3.13, dynamically linked
-    sh tests/run_macos.sh      4 passed   the macOS guest, permissive and --strict
+    sh tests/run_macos.sh      6 passed   the macOS guests, permissive and --strict
     node web/test_node.mjs     8 passed   the same guests under WebAssembly
 
 What works:
@@ -160,28 +193,20 @@ What works:
 
    What is left on that side is breadth, not a wall:
 
-   - **A guest that does more than print.** This one is a C hello world. The next
-     interesting ones are a program that uses Foundation (needs CoreFoundation and
-     Foundation extracted, which `dsc_extract` can do), and one that spawns a thread on
-     Darwin (`bsdthread_create` is not implemented; the Linux side's scheduler is).
+   - ✅ **A guest that does more than print, built with no Mac.**
+     `sh guests/macos/build.sh threads` compiles `threads.c` with clang and links it
+     with `lld -flavor darwin` against the extracted libraries in this tree — no Apple
+     SDK, no headers, because the guest declares its own prototypes. Both halves are
+     verified now: an ordinary LLVM release has the AArch64 target (only the
+     emscripten clang does not), and the link names **every** `usr/lib/system/*.dylib`
+     rather than libSystem alone, because lld does not follow libSystem's re-exports
+     out of an extracted tree — `printf` happens to live in libsystem_c and linked,
+     `pthread_mutex_lock` did not. Output is arm64 and not arm64e on purpose: the
+     libraries are arm64e and linking against them is fine, but an arm64e *output*
+     carries `DYLD_CHAINED_PTR_ARM64E` fixups, which are item 2 below.
 
-     **A new macOS guest no longer needs a Mac to build**, which was the reason there was
-     only one. `guests/macos/build.sh NAME` compiles `NAME.c` with clang and links it with
-     `lld -flavor darwin`, against the extracted libraries in this tree — no Apple SDK, and
-     no headers either, because the guest declares its own prototypes.
-     `guests/macos/threads.c` is committed and is the pthread guest `bsdthread_create` will
-     be tested against; it prints a sum the host can check without running anything.
-
-     Two halves, and only one of them is verified here. The **link** half is: `-syslibroot`
-     pointed at `guests/macos` resolves `libSystem.B.dylib` and all seventeen of its
-     re-exports out of `usr/lib/system` — which is the part specific to a cache-extracted
-     tree, since a Mac links against `.tbd` stubs instead — and with no object file the only
-     error left is the missing `_main`. The **compile** half needs a clang with the AArch64
-     target built in, and the emscripten clang this project is otherwise built with has only
-     wasm and x86. `build.sh` stops and says exactly that rather than producing something
-     shaped like a guest. Output is arm64 and not arm64e on purpose: the libraries are
-     arm64e and linking against them is fine, but an arm64e *output* carries
-     `DYLD_CHAINED_PTR_ARM64E` fixups, which are item 2 below.
+     The next interesting guest is one that uses Foundation, which needs
+     CoreFoundation and Foundation extracted.
    - ✅ **`--strict` is clean on this guest.** Permissive and strict now run the *same*
      199,279 instructions, which is the result worth stating: no path through this guest
      depends on reading unmapped memory. Getting there from the one remaining finding — an

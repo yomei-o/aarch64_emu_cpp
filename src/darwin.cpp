@@ -983,6 +983,110 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
     }
 }
 
+// posix_spawn(pid*, path, adesc, argv, envp) -- Darwin syscall 244.
+//
+// This is *simpler* than fork+exec in this emulator, not harder, because the
+// parent is suspended while a child runs anyway: there is no moment between the
+// fork and the exec for a guest to do anything. So there is no saved context, no
+// memory journal, no vfork depth. Decode the arguments, run the child to
+// completion against a **copied** descriptor table, record the status for wait4,
+// write the pid back, done. The child never touches the parent's memory at all --
+// `spawn` gives it its own.
+//
+// The layouts are Apple Libc's (posix_spawn.c), and one of them is deliberately
+// *measured* rather than trusted: the file-actions array is `count` fixed-size
+// records after an 8-byte header, and the record stride is computed as
+// (file_actions_size - 8) / count instead of hard-coding a sizeof. The fields
+// read from each record are at the front, so a stride that is merely *bigger*
+// than expected (a new union member in some future Libc) still decodes.
+int64_t Syscalls::sys_posix_spawn(uint64_t pid_addr, uint64_t path_addr, uint64_t adesc,
+                                  uint64_t argv_addr, uint64_t envp_addr) {
+    const std::string path = guest_str(path_addr);
+    auto read_strv = [&](uint64_t addr) {
+        std::vector<std::string> v;
+        for (size_t i = 0; addr && i < 4096; ++i) {
+            const uint64_t p = mem_.read<uint64_t>(addr + i * 8);
+            if (!p) break;
+            v.push_back(mem_.read_cstr(p));
+        }
+        return v;
+    };
+    std::vector<std::string> argv = read_strv(argv_addr);
+    const std::vector<std::string> envp = read_strv(envp_addr);
+    if (argv.empty()) argv.push_back(path);
+    if (!spawn) {
+        std::fprintf(stderr, "[proc] posix_spawn(%s) but this front end cannot spawn\n",
+                     path.c_str());
+        return -38;                                    // ENOSYS, mapped by bsd_errno
+    }
+
+    // The args-desc struct: {attr_size, attrp, file_actions_size, file_actions, ...}.
+    uint16_t psa_flags = 0;
+    Files child_files = files;                         // the child's, never the parent's
+    if (adesc) {
+        const uint64_t attr = mem_.read<uint64_t>(adesc + 8);
+        if (mem_.read<uint64_t>(adesc + 0) >= 2 && attr)
+            psa_flags = mem_.read<uint16_t>(attr);     // short psa_flags, field one
+        const uint64_t fa_size = mem_.read<uint64_t>(adesc + 16);
+        const uint64_t fa = mem_.read<uint64_t>(adesc + 24);
+        const uint32_t count = (fa && fa_size > 8) ? mem_.read<uint32_t>(fa + 4) : 0;
+        const uint64_t stride = count ? (fa_size - 8) / count : 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint64_t a = fa + 8 + i * stride;
+            const uint32_t type = mem_.read<uint32_t>(a + 0);
+            const int fd = static_cast<int>(mem_.read<uint32_t>(a + 4));
+            switch (type) {
+                case 0: {                              // PSFA_OPEN: oflag, u16 mode, path
+                    const int oflag = static_cast<int>(mem_.read<uint32_t>(a + 8));
+                    const std::string p = mem_.read_cstr(a + 14);
+                    const int64_t nf = child_files.open(p, darwin_oflags_to_linux(oflag),
+                                                        0644);
+                    if (nf < 0) return nf;
+                    child_files.move_fd(static_cast<int>(nf), fd);
+                    if (trace)
+                        std::fprintf(stderr, "[proc]   spawn open %s -> fd %d\n",
+                                     p.c_str(), fd);
+                    break;
+                }
+                case 1: child_files.close(fd); break;  // PSFA_CLOSE
+                case 2: {                              // PSFA_DUP2: dst in the union
+                    const int dst = static_cast<int>(mem_.read<uint32_t>(a + 8));
+                    child_files.dup(fd, dst);
+                    if (trace)
+                        std::fprintf(stderr, "[proc]   spawn dup2 %d -> %d\n", fd, dst);
+                    break;
+                }
+                case 3: break;                         // PSFA_INHERIT: already will
+                case 5: child_files.cwd = mem_.read_cstr(a + 8); break;  // PSFA_CHDIR
+                default:
+                    std::fprintf(stderr, "[proc] posix_spawn file action %u ignored\n",
+                                 type);
+                    break;
+            }
+        }
+    }
+
+    if (trace)
+        std::fprintf(stderr, "[proc] posix_spawn %s (%zu args, flags %04X)\n",
+                     path.c_str(), argv.size(), psa_flags);
+
+    const int st = spawn(path, argv, envp, child_files);
+
+    // POSIX_SPAWN_SETEXEC: "replace me" -- the caller does not continue.
+    if (psa_flags & 0x40) {
+        cpu_.exit_code = st < 0 ? 127 : st;
+        cpu_.halted = true;
+        return 0;
+    }
+    // A program that could not be started is posix_spawn's *return value* -- unlike
+    // fork+exec there is a live caller to tell, which is the whole point of the API.
+    if (st < 0) return -2;                             // ENOENT
+    const int pid = next_pid_++;
+    child_status_[pid] = st << 8;
+    if (pid_addr) mem_.write<uint32_t>(pid_addr, static_cast<uint32_t>(pid));
+    return 0;
+}
+
 // Returns false to stop the machine (only for exit).
 bool Syscalls::svc_darwin() {
     // The number is a *32-bit* value, sign-extended. Reading the whole of x16 turns a
@@ -1149,6 +1253,9 @@ bool Syscalls::svc_darwin() {
         case 199: r = files.lseek(static_cast<int>(a0), static_cast<int64_t>(a1),
                                   static_cast<int>(a2)); break;
         case 33: r = files.access(guest_str(a0)); break;
+        case 136: r = files.mkdir(guest_str(a0)); break;
+        case 137: case 10: r = files.unlink(guest_str(a0)); break;   // rmdir, unlink
+        case 128: r = files.rename(guest_str(a0), guest_str(a1)); break;
         // ---- child processes. The numbers are read out of libsystem_kernel, one
         // `movz x16, #N` per stub, for the same reason the psynch ones are: a wrong
         // number is a syscall that quietly fails.
@@ -1184,6 +1291,15 @@ bool Syscalls::svc_darwin() {
         }
         case 41: r = files.dup(static_cast<int>(a0), -1); break;
         case 90: r = files.dup(static_cast<int>(a0), static_cast<int>(a1)); break;
+        // posix_spawn(pid*, path, adesc, argv, envp): the path a guest that avoids
+        // fork takes -- Apple's clang driver runs ld through it.
+        case 244: {
+            const int64_t rc = sys_posix_spawn(a0, a1, a2, a3, cpu_.xr(4));
+            if (cpu_.halted) return true;              // POSIX_SPAWN_SETEXEC
+            if (rc < 0) { err = bsd_errno(rc); r = 0; break; }
+            r = rc;
+            break;
+        }
         // execve is **59**, the classic BSD number. 147 is `setsid`, and the scan
         // that produced 147 for execve had over-run into the next stub: `_execve`
         // begins with a branch through an interposable slot rather than with

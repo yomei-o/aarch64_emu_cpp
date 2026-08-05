@@ -34,10 +34,16 @@ public:
     bool is_open(int fd) const { return open_.count(fd) != 0; }
     // Remove a file. Returns 0 or -errno.
     int64_t unlink(const std::string& path);
+    int64_t mkdir(const std::string& path);
+    int64_t rename(const std::string& from, const std::string& to);
     // A pipe. Writes the two descriptors into `fds` and returns 0.
     int64_t pipe2(int fds[2]);
     // dup/dup2. `newfd` of -1 means "the lowest free one", which is dup(2).
     int64_t dup(int oldfd, int newfd);
+    // Move an entry to a specific descriptor, ownership and all. What a spawn
+    // file-action's open wants: `dup` leaves the FILE* owned by the old fd, so
+    // dup-then-close closes the file that was just opened.
+    int64_t move_fd(int oldfd, int newfd);
     // Everything an `execve` should keep. Descriptors survive it -- that is how a
     // shell redirects -- so this is what a spawned child inherits.
     Files clone_for_exec() const { return *this; }

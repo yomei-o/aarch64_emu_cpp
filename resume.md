@@ -193,11 +193,53 @@ Three bugs stood between "spawns cc1" and this, all worth remembering:
   zero-compare opcode table was wrong -- opcode 8 is CMGT/CMGE, 9 is CMEQ/CMLE,
   A is CMLT; the old table answered different questions than were asked.
 
+### Next: Apple clang, which would make this a Windows-to-macOS cross-compiler
+
+The idea (2026-08-05, evening): the macOS personality already has the shared
+cache, threads and fork/exec -- so if Apple's clang runs, the emulator compiles
+*and links* arm64 Mach-O on Windows. The plan, none of it started except the
+packaging script:
+
+1. **`tools/pack_clang.sh`** runs on the Mac (a copy is on the share,
+   `\\192.168.14.21\otani.yomei\test`) and produces `macos_clang.tar.gz`:
+   clang + ld from the CommandLineTools, clang's builtin headers, the SDK's
+   `usr/include`, and every `.tbd`. The `.tbd` part is the trick that keeps it
+   small -- ld64 links against *text stubs*, so no dylibs need packaging; the
+   real code is the emulator's shared-cache extraction, same as the python
+   guest. The script also sanity-compiles a hello against only the packaged
+   subset before taring, and prints `clang -###` so the process tree it will
+   want is known in advance.
+2. **Darwin `posix_spawn` (syscall 244) is DONE** -- implemented, tested, and
+   in the macOS suite ("cpython posix_spawn"). It came out *simpler* than
+   fork+exec, as predicted: the parent is suspended anyway, so
+   `sys_posix_spawn` (darwin.cpp) decodes the arguments, runs `spawn()` inline
+   against a **copied** Files table, records the status for wait4, writes the
+   pid back. No context save, no journal. What the implementation learned:
+   - The file-actions record stride is **computed** as
+     (file_actions_size - 8) / count, not hard-coded; the union offsets
+     (open: oflag@8, mode@12, path@14; dup2: dst@8) were verified live via
+     `os.posix_spawn` with file actions, all three types.
+   - An open action must land on its fd via **`Files::move_fd`**, not
+     dup-then-close: `dup` leaves the FILE* owned by the old fd, so the close
+     closed the just-opened file. Exit 120 from a spawned CPython (it could
+     not flush stdout) is that bug's signature.
+   - `Files::write` now **fflushes after every fwrite**. A spawned child's
+     descriptors are never fclosed (the Files copies share raw FILE*s), so
+     stdio-buffered output was simply lost -- the child "wrote nothing" into a
+     file that stayed empty. The guest's libc buffers upstream, so it's cheap.
+   - mkdir (136), rmdir (137), unlink (10) and rename (128) are in -- CPython
+     touches `__pycache__` on this path.
+   - POSIX_SPAWN_SETEXEC (psa_flags & 0x40) is handled as exec-without-fork.
+3. Unpack the clang tree as `guests/macos_clang` and try
+   `clang -isysroot /sdk /hello.c -o /hello`.
+4. Expect another round of unimplemented SIMD instructions in clang's own
+   code. The procedure is established: cc1-style guests install a SIGILL
+   handler, so watch for `[sig]` under `--trace-sys`, read the PC, disassemble
+   the word (capstone is installed on the Windows python).
+
 ### Also still open
 
 - **`sysctl {1,14,1,pid}`** (KERN_PROC_PID, a `kinfo_proc`). Nothing has needed it.
-- **`posix_spawn`** on Darwin (syscall 244) is unimplemented. It is no longer *needed*
-  now that fork works, but it is the path a guest that avoids fork would take.
 - **Speed.** ~15M instructions/sec on the macOS guest against ~41M on Linux ones; the
   difference is the ObjC-heavy start-up, not the core. A decode cache keyed on the PC
   is the standing idea -- measure first.
@@ -208,7 +250,7 @@ Builds with **g++, clang or MSVC** (`CXX=cl sh build.sh`); the two compilers agr
 byte over the whole macOS run, which is the best differential oracle here for anyone
 without a cross-compiler.
 
-Run the six suites before touching anything — they should be 9 / 11 / 9 / 8 / 11 / 3, plus 8
+Run the six suites before touching anything — they should be 9 / 11 / 9 / 8 / 12 / 3, plus 8
 for `node web/test_node.mjs` if emscripten is around:
 
     sh tests/run_tests.sh    sh tests/run_macho.sh
@@ -290,9 +332,10 @@ against *itself* under two memory modes, which turns out to be a sharp test (see
     sh tests/run_busybox.sh    9 passed   Alpine's static aarch64-musl busybox
     sh tests/run_python.sh     8 passed   CPython 3.13, dynamically linked, and a
                                           child process through fork/exec/pipe/wait
-    sh tests/run_macos.sh     11 passed   the macOS guests: hello, threads, tls, files,
+    sh tests/run_macos.sh     12 passed   the macOS guests: hello, threads, tls, files,
                                           and Apple's CPython -- its digest against the
-                                          host's, its threads, and a child process
+                                          host's, its threads, a child process, and
+                                          posix_spawn with file actions
     sh tests/run_gcc.sh        3 passed   Alpine gcc compiles and links a program and
                                           the emulator runs the result (skips without
                                           the ~120 MB toolchain tree)

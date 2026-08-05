@@ -253,5 +253,25 @@ print(r.returncode, r.stdout.decode().strip())"
     check "macos cpython subprocess (fork/exec/pipe/wait)" "0 42" "$got"
 fi
 
+# ---- posix_spawn, the road not through fork -------------------------------------
+#
+# Syscall 244, the route Apple's clang driver takes to run ld -- which is why it
+# exists here at all. The file actions are the part worth testing: their record
+# layout is Apple Libc's private struct, decoded field by field in
+# sys_posix_spawn, and a wrong offset reads a path out of the middle of an oflag.
+# `os.posix_spawn` drives the dup2 and close actions through one child, and the
+# answer comes back through the pipe the actions aimed fd 1 at.
+if [ -f "$P" ]; then
+    code="import os
+r, w = os.pipe()
+fa = [(os.POSIX_SPAWN_DUP2, w, 1), (os.POSIX_SPAWN_CLOSE, r)]
+pid = os.posix_spawn('/install/bin/python3.13', ['python','-c','print(7*8)'], {}, file_actions=fa)
+os.close(w)
+st = os.waitpid(pid, 0)[1]
+print('spawn', st, os.read(r, 100).decode().strip())"
+    got=$($EMU --dyld-sections --root guests/macos_py "$P" -c "$code" 2>/dev/null | tr -d '\015')
+    check "macos cpython posix_spawn (file actions, pipe)" "spawn 0 56" "$got"
+fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

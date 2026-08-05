@@ -143,6 +143,10 @@ private:
     int64_t sys_fork();
     int64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp);
     int64_t sys_wait4(int64_t pid, uint64_t status_addr);
+    // Darwin posix_spawn, in darwin.cpp -- the struct layouts it decodes are
+    // Darwin's, not POSIX's.
+    int64_t sys_posix_spawn(uint64_t pid_addr, uint64_t path, uint64_t adesc,
+                            uint64_t argv, uint64_t envp);
     bool in_vfork_child() const { return vfork_depth_ > 0; }
 public:
     // True when a vfork child has just finished and the parent is waiting to be put

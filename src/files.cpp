@@ -118,6 +118,17 @@ int64_t Files::dup(int oldfd, int newfd) {
     return newfd;
 }
 
+int64_t Files::move_fd(int oldfd, int newfd) {
+    auto it = open_.find(oldfd);
+    if (it == open_.end()) return kEBADF;
+    if (newfd == oldfd) return newfd;
+    close(newfd);                                   // silently replaces, like dup2
+    open_[newfd] = std::move(open_[oldfd]);
+    open_.erase(oldfd);
+    if (newfd >= next_fd_) next_fd_ = newfd + 1;
+    return newfd;
+}
+
 // getdents64: pack linux_dirent64 records until the buffer is full.
 //   struct linux_dirent64 { u64 d_ino; s64 d_off; u16 d_reclen; u8 d_type; char d_name[]; }
 // Records are 8-byte aligned and the name is NUL-terminated. Returning 0 means end
@@ -216,7 +227,15 @@ int64_t Files::write(int fd, const void* src, uint64_t len) {
         return static_cast<int64_t>(len);
     }
     if (!it->second.fp) return kEBADF;
-    return static_cast<int64_t>(std::fwrite(src, 1, len, it->second.fp));
+    const size_t n = std::fwrite(src, 1, len, it->second.fp);
+    // Flushed now, not at fclose -- because for a spawned child's descriptor there
+    // *is* no fclose: the Files copies holding the FILE* go away without one (they
+    // cannot close it; another copy may live on). A child that wrote its output
+    // through stdio buffering that nobody drains looks like a child that wrote
+    // nothing. The guest's own libc buffers upstream of this call, so these writes
+    // arrive in big chunks and the flush costs little.
+    std::fflush(it->second.fp);
+    return static_cast<int64_t>(n);
 }
 
 int64_t Files::lseek(int fd, int64_t off, int whence) {
@@ -316,6 +335,23 @@ int64_t Files::unlink(const std::string& path) {
     const bool gone = std::filesystem::remove(host_path(path), ec);
     if (ec) return kEACCES;
     return gone ? 0 : kENOENT;
+}
+
+int64_t Files::mkdir(const std::string& path) {
+    const std::string hp = host_path(path);
+    std::error_code ec;
+    if (std::filesystem::exists(hp, ec)) return -17;   // EEXIST, same number both sides
+    return std::filesystem::create_directory(hp, ec) && !ec ? 0 : kEACCES;
+}
+
+int64_t Files::rename(const std::string& from, const std::string& to) {
+    std::error_code ec;
+    // POSIX rename replaces an existing target; std::filesystem::rename does too on
+    // POSIX hosts but refuses on Windows, so clear the way first.
+    std::filesystem::remove(host_path(to), ec);
+    ec.clear();
+    std::filesystem::rename(host_path(from), host_path(to), ec);
+    return ec ? kENOENT : 0;
 }
 
 int64_t Files::access(const std::string& path) {

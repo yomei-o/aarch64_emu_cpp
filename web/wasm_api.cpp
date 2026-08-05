@@ -18,6 +18,7 @@
 #include "loader.h"
 #include "memory.h"
 #include "syscalls.h"
+#include "start.h"
 
 #if defined(__EMSCRIPTEN__)
 #include <emscripten.h>
@@ -130,6 +131,16 @@ EMSCRIPTEN_KEEPALIVE int emu_run(const char* path, const char* argz, const char*
     sys.set_mmap_base(kMmapBase);
     sys.exe_path = argv[0];
     sys.files.set_root(root ? root : "");
+    // Everything a real kernel and dyld put in place before the first instruction.
+    // This used to be absent here and present in main.cpp, which is why the browser
+    // build could run a freestanding Mach-O and not a real macOS one -- it simply
+    // stopped somewhere odd, with nothing to say it was missing a commpage.
+    if (darwin) darwin_prepare(cpu, mem, sys, img);
+    // The section-location API, which libobjc needs to read the shared cache's
+    // preoptimized class tables. Off by default on the command line because the
+    // fallback is the tested baseline; on here because the guest that matters in a
+    // browser is the real one, and without it libxpc fails its own type check.
+    sys.dyld_section_info = true;
 
     {
         char buf[160];
@@ -141,8 +152,7 @@ EMSCRIPTEN_KEEPALIVE int emu_run(const char* path, const char* argz, const char*
 
     int rc;
     try {
-        cpu.run();
-        rc = cpu.exit_code;
+        rc = run_image(cpu, mem, sys, img, darwin, start_pc, false);
     } catch (const CpuError& e) {
         g_error = e.what;
         rc = -1;

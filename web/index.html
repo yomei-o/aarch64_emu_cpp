@@ -21,6 +21,7 @@
                      border:1px solid var(--line); background:var(--panel); color:var(--fg); }
   pre { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px;
         overflow:auto; max-height:52vh; margin:12px 0 0; font-size:13px; white-space:pre-wrap; }
+  .mac { border:1px solid var(--line); border-radius:12px; padding:16px; margin:12px 0; }
   .drop { border:2px dashed var(--line); border-radius:12px; padding:22px; text-align:center;
           color:var(--dim); cursor:pointer; }
   .drop.hot { border-color:var(--acc); color:var(--fg); }
@@ -39,6 +40,19 @@
      Nothing is uploaded.</p>
 
   <div id="status">loading the emulator…</div>
+
+  <div class="mac">
+    <b>Or run a real macOS program.</b>
+    <span style="font-size:12.5px;color:var(--dim)">A stock arm64 Mach-O against Apple's own
+    libSystem, libobjc, libxpc, libdispatch and libcorecrypto — 46 libraries extracted from a
+    Mac's dyld shared cache. Apple's dyld cannot be shipped, so the emulator does its job:
+    mapping, chained fixups, symbol binding, initializers in dyld's order, and the
+    <code>exit</code> that flushes stdio. 26 MB, fetched once.</span>
+    <div class="row">
+      <button id="macrun">Run hello from real macOS</button>
+      <span id="macstatus" style="color:var(--dim);font-size:13px"></span>
+    </div>
+  </div>
 
   <div class="drop" id="drop">
     <b>Drop an AArch64 Linux ELF, or an arm64 macOS Mach-O, here</b> or click to choose<br>
@@ -137,6 +151,106 @@ $('file').onchange = e => addFiles(e.target.files);
 ['dragleave','drop'].forEach(t => $('drop').addEventListener(t, e => {
   e.preventDefault(); $('drop').classList.remove('hot'); }));
 $('drop').addEventListener('drop', e => { if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files); });
+
+// ---- the macOS guest -------------------------------------------------------
+//
+// 26 MB of Apple's libraries, gzipped. The browser has `DecompressionStream`, so
+// no decompressor is shipped; the tar reader below is the only format code, and
+// tar is simple enough that a reader is shorter than a dependency.
+function mkdirpAbs(p) {
+  let acc = '';
+  for (const part of p.split('/').filter(Boolean)) { acc += '/' + part; try { M.FS.mkdir(acc); } catch {} }
+}
+function untar(buf) {
+  const str = (o, n) => {
+    let s = '';
+    for (let k = o; k < o + n && buf[k]; k++) s += String.fromCharCode(buf[k]);
+    return s;
+  };
+  let off = 0, files = 0;
+  while (off + 512 <= buf.length) {
+    const name = str(off, 100);
+    if (!name) { off += 512; continue; }          // the two zero blocks at the end
+    // The size is octal, space- and NUL-padded. parseInt with an explicit radix,
+    // because "0644" is not what the default guesses and a wrong size desynchronises
+    // every entry after it.
+    const size = parseInt(str(off + 124, 12).trim() || '0', 8);
+    const type = String.fromCharCode(buf[off + 156] || 48);
+    const prefix = str(off + 345, 155);
+    const full = (prefix ? prefix + '/' : '') + name;
+    off += 512;
+    if (type === '5') {
+      mkdirpAbs(full);
+    } else if (type === '0' || type === ' ' || buf[off - 512 + 156] === 0) {
+      const slash = full.lastIndexOf('/');
+      if (slash > 0) mkdirpAbs(full.slice(0, slash));
+      M.FS.writeFile('/' + full, buf.subarray(off, off + size));
+      files++;
+    }
+    off += Math.ceil(size / 512) * 512;           // entries are 512-byte aligned
+  }
+  return files;
+}
+
+let macReady = false;
+async function fetchMacosGuest() {
+  const res = await fetch('macos-hello.tar.gz');
+  if (!res.ok) throw new Error('cannot fetch macos-hello.tar.gz (' + res.status + ')');
+  const total = Number(res.headers.get('content-length')) || 0;
+  // Read the compressed bytes ourselves rather than piping straight into the
+  // decompressor, so the download has a progress figure: 26 MB with no feedback
+  // looks like nothing is happening.
+  const chunks = [];
+  let got = 0;
+  const reader = res.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    $('macstatus').textContent = total
+      ? `downloading ${(got / 1048576).toFixed(1)} / ${(total / 1048576).toFixed(1)} MB`
+      : `downloading ${(got / 1048576).toFixed(1)} MB`;
+  }
+  $('macstatus').textContent = 'decompressing…';
+  const gz = new Blob(chunks);
+  const stream = gz.stream().pipeThrough(new DecompressionStream('gzip'));
+  const buf = new Uint8Array(await new Response(stream).arrayBuffer());
+  $('macstatus').textContent = 'unpacking…';
+  const n = untar(buf);
+  macReady = true;
+  return n;
+}
+
+$('macrun').onclick = async () => {
+  $('macrun').disabled = true;
+  try {
+    if (!macReady) {
+      const n = await fetchMacosGuest();
+      $('macstatus').textContent = n + ' files in the virtual filesystem';
+    }
+    pending = '';
+    $('macstatus').textContent = 'running…';
+    await new Promise(r => setTimeout(r, 20));
+    const argz = '/hello  ';
+    const nb = M.lengthBytesUTF8(argz) + 1, bp = M._malloc(nb);
+    M.stringToUTF8(argz, bp, nb);
+    const pp = cstr('/hello'), rp = cstr('');
+    const t0 = performance.now();
+    const rc = M._emu_run(pp, bp, rp, 0);
+    const ms = performance.now() - t0;
+    const insns = M._emu_instructions();
+    M._free(bp); M._free(pp); M._free(rp);
+    let text = pending || '(no output)';
+    if (rc !== 0) text += '
+[exit ' + rc + '] ' + M.UTF8ToString(M._emu_error());
+    $('out').textContent = text;
+    $('macstatus').textContent =
+      `${insns.toLocaleString()} instructions of Apple's own arm64 code in ${ms.toFixed(0)} ms`;
+  } catch (e) {
+    $('macstatus').textContent = 'failed: ' + e.message;
+  }
+  $('macrun').disabled = false;
+};
 
 function cstr(s) {
   const n = M.lengthBytesUTF8(s) + 1, p = M._malloc(n);

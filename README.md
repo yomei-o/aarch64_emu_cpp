@@ -30,6 +30,9 @@ Apple Silicon, running instruction by instruction on a machine that is neither.*
 
 No dependencies beyond a C++17 standard library.
 
+**[▶ Try it in a browser](https://yomei-o.github.io/aarch64_emu_cpp/)** — one button runs a
+real macOS binary against Apple's own libraries, in the tab.
+
 ## What runs today
 
 | | status |
@@ -117,6 +120,22 @@ need *two* masks from `DecodeBitMasks`, and approximating them with one is corre
 exactly when `imms >= immr`.)
 
 ## In a browser
+
+### ▶ [Live demo](https://yomei-o.github.io/aarch64_emu_cpp/)
+
+One button runs **`hello from real macOS`** — a stock arm64 Mach-O against Apple's own
+libSystem, libobjc, libxpc, libdispatch and libcorecrypto, 46 libraries out of a Mac's
+dyld shared cache, interpreted instruction by instruction in the tab. Apple's dyld cannot
+be shipped, so the emulator does its job: mapping, chained fixups, symbol binding,
+initializers in dyld's order, and the `exit` that flushes stdio. The libraries are a 26 MB
+fetch, decompressed by the browser's own `DecompressionStream` and unpacked into an
+in-memory filesystem; nothing is uploaded, and the page is static files.
+
+You can also drop your own AArch64 ELF or arm64 Mach-O on it.
+
+The page is `web/index.html`; the root `index.html` is a redirect, because GitHub Pages
+can only be pointed at the repository root or at `/docs`. Enable Pages for this repo
+(Settings → Pages → deploy from `main`, `/`) and the link above works.
 
 `web/` is the same emulator compiled to WebAssembly, in one self-contained
 `aarch64emu.js` (the wasm is embedded), so it serves as static files. Drop an

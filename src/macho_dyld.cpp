@@ -166,6 +166,198 @@ uint64_t macho_lookup_symtab(const MachoImage& img, const std::string& sym) {
     return 0;
 }
 
+// ---- LC_DYLD_INFO: the opcode programs ---------------------------------------
+//
+// What every Mach-O said before chained fixups, and what everything built for a
+// deployment target older than Big Sur still says -- including the stock CPython for
+// macOS, which is the reason this exists. Two byte-code programs, both little stack
+// machines over (segment index, offset):
+//
+//   rebase  add the slide to a pointer the linker wrote as an unslid address
+//   bind    write the address of an imported symbol
+//
+// Three separate bind programs, and running only the first is a trap worth naming:
+// `bind` is the eager one, `weak_bind` handles symbols that may be defined in more
+// than one image, and `lazy_bind` is everything reached through a stub. Real dyld
+// defers the third until first call; binding it now is the same answer sooner, and
+// skipping it leaves every library call pointing at the stub helper.
+//
+// The one structural difference between them: in the lazy program `DONE` separates
+// one symbol's entry from the next rather than ending the blob, so it must not stop
+// the walk. A reader that treats it as terminal binds the first symbol and no others,
+// which looks like it worked.
+namespace {
+
+uint64_t read_uleb(const uint8_t* p, size_t size, size_t& i) {
+    uint64_t v = 0;
+    unsigned shift = 0;
+    while (i < size) {
+        const uint8_t b = p[i++];
+        if (shift < 64) v |= static_cast<uint64_t>(b & 0x7F) << shift;
+        shift += 7;
+        if (!(b & 0x80)) break;
+    }
+    return v;
+}
+
+int64_t read_sleb(const uint8_t* p, size_t size, size_t& i) {
+    int64_t v = 0;
+    unsigned shift = 0;
+    uint8_t b = 0;
+    while (i < size) {
+        b = p[i++];
+        if (shift < 64) v |= static_cast<int64_t>(b & 0x7F) << shift;
+        shift += 7;
+        if (!(b & 0x80)) break;
+    }
+    if (shift < 64 && (b & 0x40)) v |= -(static_cast<int64_t>(1) << shift);
+    return v;
+}
+
+bool apply_rebase(const MachoImage& img, Memory& mem, std::string* err) {
+    if (!img.rebase_size) return true;
+    const uint8_t* p = img.file.data() + img.rebase_off;
+    const size_t size = img.rebase_size;
+    uint64_t addr = 0;
+    unsigned type = 0;
+    size_t i = 0;
+    // Only REBASE_TYPE_POINTER exists on arm64; the two TEXT_* types are 32-bit-only
+    // and refusing them is better than writing 8 bytes where 4 belong.
+    auto one = [&]() -> bool {
+        if (type != 1) { *err = "unsupported rebase type in LC_DYLD_INFO"; return false; }
+        mem.write<uint64_t>(addr, mem.read<uint64_t>(addr) + img.slide);
+        addr += 8;
+        return true;
+    };
+    while (i < size) {
+        const uint8_t byte = p[i++];
+        const uint8_t op = byte & 0xF0, imm = byte & 0x0F;
+        switch (op) {
+            case 0x00: return true;                                  // DONE
+            case 0x10: type = imm; break;                            // SET_TYPE_IMM
+            case 0x20: {                                             // SET_SEGMENT_AND_OFFSET
+                if (imm >= img.seg_vmaddrs.size()) {
+                    *err = "rebase names a segment that does not exist"; return false;
+                }
+                addr = img.slide + img.seg_vmaddrs[imm] + read_uleb(p, size, i);
+                break;
+            }
+            case 0x30: addr += read_uleb(p, size, i); break;          // ADD_ADDR_ULEB
+            case 0x40: addr += static_cast<uint64_t>(imm) * 8; break; // ADD_ADDR_IMM_SCALED
+            case 0x50:                                                // DO_REBASE_IMM_TIMES
+                for (unsigned k = 0; k < imm; ++k) if (!one()) return false;
+                break;
+            case 0x60: {                                              // DO_REBASE_ULEB_TIMES
+                const uint64_t n = read_uleb(p, size, i);
+                for (uint64_t k = 0; k < n; ++k) if (!one()) return false;
+                break;
+            }
+            case 0x70: {                                       // DO_REBASE_ADD_ADDR_ULEB
+                const uint64_t skip = read_uleb(p, size, i);
+                if (!one()) return false;
+                addr += skip;
+                break;
+            }
+            case 0x80: {                            // DO_REBASE_ULEB_TIMES_SKIPPING_ULEB
+                const uint64_t n = read_uleb(p, size, i);
+                const uint64_t skip = read_uleb(p, size, i);
+                for (uint64_t k = 0; k < n; ++k) {
+                    if (!one()) return false;
+                    addr += skip;
+                }
+                break;
+            }
+            default: *err = "unknown rebase opcode in LC_DYLD_INFO"; return false;
+        }
+    }
+    return true;
+}
+
+bool apply_bind(const MachoImage& img, Memory& mem,
+                const std::function<uint64_t(unsigned, const std::string&, bool)>& resolve,
+                uint32_t off, uint32_t size_in, bool lazy, std::string* err) {
+    if (!size_in) return true;
+    const uint8_t* p = img.file.data() + off;
+    const size_t size = size_in;
+    uint64_t addr = 0;
+    int64_t addend = 0;
+    unsigned ordinal = 0, type = 1;
+    bool weak = false;
+    std::string sym;
+    size_t i = 0;
+    auto one = [&]() -> bool {
+        if (type != 1) { *err = "unsupported bind type in LC_DYLD_INFO"; return false; }
+        // A weak import that resolves nowhere is *defined* to be null and the guest
+        // tests for it, so resolve()'s zero is an answer rather than a failure.
+        const uint64_t v = resolve(ordinal, sym, weak);
+        mem.write<uint64_t>(addr, v ? v + static_cast<uint64_t>(addend) : 0);
+        addr += 8;
+        return true;
+    };
+    while (i < size) {
+        const uint8_t byte = p[i++];
+        const uint8_t op = byte & 0xF0, imm = byte & 0x0F;
+        switch (op) {
+            case 0x00:                                               // DONE
+                if (lazy) break;                                     // a separator here
+                return true;
+            case 0x10: ordinal = imm; break;                         // SET_DYLIB_ORDINAL_IMM
+            case 0x20:                                               // SET_DYLIB_ORDINAL_ULEB
+                ordinal = static_cast<unsigned>(read_uleb(p, size, i));
+                break;
+            case 0x30:
+                // SET_DYLIB_SPECIAL_IMM: a sign-extended 4-bit code -- 0 is this image,
+                // -1 the main executable, -2 a flat lookup, -3 the weak-coalescing one.
+                // All of them mean "do not restrict the search", which is what ordinal 0
+                // already tells `resolve`.
+                ordinal = 0;
+                break;
+            case 0x40: {                             // SET_SYMBOL_TRAILING_FLAGS_IMM
+                const char* s = reinterpret_cast<const char*>(p) + i;
+                const size_t n = strnlen(s, size - i);
+                sym.assign(s, n);
+                i += n + 1;
+                weak = (imm & 1) != 0;               // BIND_SYMBOL_FLAGS_WEAK_IMPORT
+                break;
+            }
+            case 0x50: type = imm; break;                            // SET_TYPE_IMM
+            case 0x60: addend = read_sleb(p, size, i); break;         // SET_ADDEND_SLEB
+            case 0x70: {                                             // SET_SEGMENT_AND_OFFSET
+                if (imm >= img.seg_vmaddrs.size()) {
+                    *err = "bind names a segment that does not exist"; return false;
+                }
+                addr = img.slide + img.seg_vmaddrs[imm] + read_uleb(p, size, i);
+                break;
+            }
+            case 0x80: addr += read_uleb(p, size, i); break;          // ADD_ADDR_ULEB
+            case 0x90: if (!one()) return false; break;               // DO_BIND
+            case 0xA0: {                               // DO_BIND_ADD_ADDR_ULEB
+                const uint64_t skip = read_uleb(p, size, i);
+                if (!one()) return false;
+                addr += skip;
+                break;
+            }
+            case 0xB0:                                 // DO_BIND_ADD_ADDR_IMM_SCALED
+                if (!one()) return false;
+                addr += static_cast<uint64_t>(imm) * 8;
+                break;
+            case 0xC0: {                        // DO_BIND_ULEB_TIMES_SKIPPING_ULEB
+                const uint64_t n = read_uleb(p, size, i);
+                const uint64_t skip = read_uleb(p, size, i);
+                for (uint64_t k = 0; k < n; ++k) {
+                    if (!one()) return false;
+                    addr += skip;
+                }
+                break;
+            }
+            default: *err = "unknown bind opcode in LC_DYLD_INFO"; return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 // ---- chained fixups ---------------------------------------------------------
 
 bool macho_apply_fixups(const MachoImage& img, Memory& mem,
@@ -174,18 +366,17 @@ bool macho_apply_fixups(const MachoImage& img, Memory& mem,
                         std::string* err) {
     if (!img.fixups_size) {
         // An image built before chained fixups expresses the same work as byte-code
-        // programs under LC_DYLD_INFO. Those are not implemented -- and "not
-        // implemented" here has to mean *stop*, because the alternative is loading
-        // the image with every pointer left exactly as the linker wrote it: a
-        // rebase that never happened reads as a valid pointer to the wrong place,
-        // and the guest gets a plausible answer instead of a crash. That cost a
-        // debugging cycle the first time, on a dylib built without -fixup_chains.
-        if (img.rebase_size || img.bind_size || img.lazy_bind_size) {
-            *err = "image uses the pre-chained-fixups LC_DYLD_INFO opcodes, "
-                   "which are not implemented (relink with -fixup_chains)";
+        // programs under LC_DYLD_INFO. Running them is the whole of this branch, and
+        // an unknown opcode has to *stop*: the alternative is loading the image with
+        // pointers left exactly as the linker wrote them, and a rebase that never
+        // happened reads as a valid pointer to the wrong place -- a plausible answer
+        // instead of a crash. That cost a debugging cycle the first time.
+        if (!apply_rebase(img, mem, err)) return false;
+        if (!apply_bind(img, mem, resolve, img.bind_off, img.bind_size, false, err))
             return false;
-        }
-        return true;                                       // genuinely nothing to do
+        if (!apply_bind(img, mem, resolve, img.weak_bind_off, img.weak_bind_size, false, err))
+            return false;
+        return apply_bind(img, mem, resolve, img.lazy_bind_off, img.lazy_bind_size, true, err);
     }
     const uint8_t* base = img.file.data() + img.fixups_off;
     const size_t size = img.fixups_size;

@@ -118,11 +118,19 @@ struct MachoImage {
     uint32_t fixups_off = 0, fixups_size = 0;
     uint32_t exports_off = 0, exports_size = 0;
     uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
-    // The pre-chained-fixups tables: byte-code programs for rebasing and binding.
-    // Only their sizes are kept, because they are not implemented -- but an image
-    // that has them must be *refused*, not quietly loaded with its pointers left
-    // as written, which looks like a successful load and is not one.
-    uint32_t rebase_size = 0, bind_size = 0, lazy_bind_size = 0;
+    // The pre-chained-fixups tables: byte-code programs for rebasing and binding,
+    // which is how everything built for a deployment target older than Big Sur says
+    // the same thing chained fixups say. Every third-party macOS binary that was not
+    // relinked has these and no chained fixups at all.
+    uint32_t rebase_off = 0, rebase_size = 0;
+    uint32_t bind_off = 0, bind_size = 0;
+    uint32_t weak_bind_off = 0, weak_bind_size = 0;
+    uint32_t lazy_bind_off = 0, lazy_bind_size = 0;
+    // Every LC_SEGMENT_64's vmaddr **in load-command order, including __PAGEZERO**.
+    // The opcode programs address their target as (segment index, offset), and the
+    // index counts every segment command -- so `segs`, which drops __PAGEZERO because
+    // nothing maps it, is off by one for any executable that has one.
+    std::vector<uint64_t> seg_vmaddrs;
     // The classic indirect-symbol machinery, which a *pre-linked* library still needs
     // for one thing: its __got slots for imported data are left null, and this is what
     // says which symbol each null slot wants. `reserved1` on the section is the index

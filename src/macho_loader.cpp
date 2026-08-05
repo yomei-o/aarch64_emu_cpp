@@ -91,6 +91,9 @@ bool macho_parse(const std::vector<uint8_t>& f, MachoImage* out, std::string* er
                 if (sc.fileoff + sc.filesize > f.size()) {
                     *err = "segment extends past the file"; return false;
                 }
+                // Every segment command, __PAGEZERO included, because that is what the
+                // LC_DYLD_INFO opcodes index by.
+                out->seg_vmaddrs.push_back(sc.vmaddr);
                 if (name != "__PAGEZERO" && sc.vmsize) {
                     out->segs.push_back({name, sc.vmaddr, sc.vmsize, sc.fileoff, sc.filesize});
                     if (sc.vmaddr + sc.vmsize > out->vm_end) out->vm_end = sc.vmaddr + sc.vmsize;
@@ -183,8 +186,13 @@ bool macho_parse(const std::vector<uint8_t>& f, MachoImage* out, std::string* er
                 break;
             case LC_DYLD_INFO_ONLY: {
                 if (cmdsize < 48) break;
+                std::memcpy(&out->rebase_off, f.data() + o + 8, 4);
                 std::memcpy(&out->rebase_size, f.data() + o + 12, 4);
+                std::memcpy(&out->bind_off, f.data() + o + 16, 4);
                 std::memcpy(&out->bind_size, f.data() + o + 20, 4);
+                std::memcpy(&out->weak_bind_off, f.data() + o + 24, 4);
+                std::memcpy(&out->weak_bind_size, f.data() + o + 28, 4);
+                std::memcpy(&out->lazy_bind_off, f.data() + o + 32, 4);
                 std::memcpy(&out->lazy_bind_size, f.data() + o + 36, 4);
                 std::memcpy(&out->exports_off, f.data() + o + 40, 4);
                 std::memcpy(&out->exports_size, f.data() + o + 44, 4);

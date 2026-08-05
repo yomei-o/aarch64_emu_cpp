@@ -54,6 +54,21 @@
     </div>
   </div>
 
+  <div class="mac">
+    <b>Or run Apple's own CPython.</b>
+    <span style="font-size:12.5px;color:var(--dim)">The stock
+    <code>aarch64-apple-darwin</code> build of Python 3.13.14, on Apple's CoreFoundation,
+    Foundation and the 141 libraries under them. It prints a SHA-256 you can check against
+    your own Python. A 95 MB fetch and about ten seconds of interpreting &mdash; every byte
+    of the digest travels through the emulated CPU, so one wrong bit anywhere in seventy
+    million instructions changes the answer.</span>
+    <div class="row">
+      <input type="text" id="pycode" value="import hashlib; print(hashlib.sha256(b'aarch64_emu_cpp').hexdigest())">
+      <button id="pyrun">Run Python</button>
+    </div>
+    <div class="row"><span id="pystatus" style="color:var(--dim);font-size:13px"></span></div>
+  </div>
+
   <div class="drop" id="drop">
     <b>Drop an AArch64 Linux ELF, or an arm64 macOS Mach-O, here</b> or click to choose<br>
     <span style="font-size:12.5px">Static binaries need nothing else. A dynamically linked one also
@@ -169,25 +184,43 @@ function untar(buf) {
   };
   let off = 0, files = 0;
   while (off + 512 <= buf.length) {
-    const name = str(off, 100);
+    const hdr = off;
+    const name = str(hdr, 100);
     if (!name) { off += 512; continue; }          // the two zero blocks at the end
     // The size is octal, space- and NUL-padded. parseInt with an explicit radix,
     // because "0644" is not what the default guesses and a wrong size desynchronises
     // every entry after it.
-    const size = parseInt(str(off + 124, 12).trim() || '0', 8);
-    const type = String.fromCharCode(buf[off + 156] || 48);
-    const prefix = str(off + 345, 155);
-    const full = (prefix ? prefix + '/' : '') + name;
+    const size = parseInt(str(hdr + 124, 12).trim() || '0', 8);
+    // The type byte is '0' for a regular file, but *old* tars wrote a NUL there and
+    // both are in the wild.
+    const type = buf[hdr + 156] === 0 ? '0' : String.fromCharCode(buf[hdr + 156]);
+    const prefix = str(hdr + 345, 155);
+    // `tar -C dir .` writes every name with a leading "./", and MEMFS does not
+    // normalise a path, so "/./install/bin/python3.13" is not the file that
+    // "/install/bin/python3.13" is. Strip it rather than depend on how the archive
+    // was made.
+    let full = (prefix ? prefix + '/' : '') + name;
+    while (full.startsWith('./')) full = full.slice(2);
+    while (full.endsWith('/')) full = full.slice(0, -1);
     off += 512;
+    const skip = () => { off += Math.ceil(size / 512) * 512; };
+    if (!full) { skip(); continue; }
+    const slash = full.lastIndexOf('/');
+    if (slash > 0) mkdirpAbs(full.slice(0, slash));
     if (type === '5') {
       mkdirpAbs(full);
-    } else if (type === '0' || type === '\0' || buf[off - 512 + 156] === 0) {
-      const slash = full.lastIndexOf('/');
-      if (slash > 0) mkdirpAbs(full.slice(0, slash));
-      M.FS.writeFile('/' + full, buf.subarray(off, off + size));
-      files++;
+    } else if (type === '2') {
+      // A symlink, and macOS frameworks are full of them -- `Versions/Current` and
+      // the flat names beside it. Writing the *target* here as a file would put a
+      // file where the directory it points at has to be, which MEMFS answers with
+      // EMLINK several hundred entries later and nowhere near the cause.
+      try { M.FS.symlink(str(hdr + 157, 100), '/' + full); } catch {}
+    } else if (type === '0') {
+      try { M.FS.writeFile('/' + full, buf.subarray(off, off + size)); files++; }
+      catch {}                                     // an entry that collides with a
+                                                   // directory: rare, and not fatal
     }
-    off += Math.ceil(size / 512) * 512;           // entries are 512-byte aligned
+    skip();                                        // entries are 512-byte aligned
   }
   return files;
 }
@@ -249,6 +282,71 @@ $('macrun').onclick = async () => {
     $('macstatus').textContent = 'failed: ' + e.message;
   }
   $('macrun').disabled = false;
+};
+
+// ---- Apple's CPython -------------------------------------------------------
+//
+// Released rather than committed: 95 MB, and a git history keeps everything
+// forever. The same tree is in the repository as xz for command-line use, where
+// xz's better ratio is worth having and the browser cannot decompress it.
+const PY_URL = 'https://github.com/yomei-o/aarch64_emu_cpp/releases/download/' +
+               'web-guests-v1/macos-python-3.13.14-arm64.tar.gz';
+
+let pyReady = false;
+async function fetchGuest(url, status) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('cannot fetch (' + res.status + ')');
+  const total = Number(res.headers.get('content-length')) || 0;
+  const chunks = [];
+  let got = 0;
+  const reader = res.body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value); got += value.length;
+    status.textContent = total
+      ? 'downloading ' + (got / 1048576).toFixed(0) + ' / ' + (total / 1048576).toFixed(0) + ' MB'
+      : 'downloading ' + (got / 1048576).toFixed(0) + ' MB';
+  }
+  status.textContent = 'decompressing\u2026';
+  const stream = new Blob(chunks).stream().pipeThrough(new DecompressionStream('gzip'));
+  const buf = new Uint8Array(await new Response(stream).arrayBuffer());
+  status.textContent = 'unpacking\u2026';
+  return untar(buf);
+}
+
+$('pyrun').onclick = async () => {
+  $('pyrun').disabled = true;
+  try {
+    if (!pyReady) {
+      const n = await fetchGuest(PY_URL, $('pystatus'));
+      $('pystatus').textContent = n + ' files in the virtual filesystem';
+      pyReady = true;
+    }
+    pending = '';
+    $('pystatus').textContent = 'running\u2026';
+    await new Promise(r => setTimeout(r, 20));
+    // NUL-separated argv, so the code can contain spaces and quotes without a parser.
+    const prog = '/install/bin/python3.13';
+    const argz = prog + '\0-c\0' + $('pycode').value + '\0\0';
+    const nb = M.lengthBytesUTF8(argz) + 1, bp = M._malloc(nb);
+    M.stringToUTF8(argz, bp, nb);
+    const pp = cstr(prog), rp = cstr('');
+    const t0 = performance.now();
+    const rc = M._emu_run(pp, bp, rp, 0);
+    const ms = performance.now() - t0;
+    const insns = M._emu_instructions();
+    M._free(bp); M._free(pp); M._free(rp);
+    let text = pending || '(no output)';
+    if (rc !== 0) text += '\n[exit ' + rc + '] ' + M.UTF8ToString(M._emu_error());
+    $('out').textContent = text;
+    $('pystatus').textContent =
+      insns.toLocaleString() + ' instructions in ' + ms.toFixed(0) + ' ms ' +
+      '(' + (insns / ms / 1000).toFixed(1) + 'M/s)';
+  } catch (e) {
+    $('pystatus').textContent = 'failed: ' + e.message;
+  }
+  $('pyrun').disabled = false;
 };
 
 function cstr(s) {

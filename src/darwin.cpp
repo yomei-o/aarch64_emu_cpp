@@ -1048,6 +1048,41 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
             for (int k = 0; k < 8; ++k) mem_.write<uint32_t>(data + 40 + k * 4, tok[k]);
             return kKernSuccess;
         }
+        // mach_port_get_context(task, name, &context) and its setter, routines 28
+        // and 29 of the mach_port subsystem (base 3200).  A port can carry one
+        // 64-bit word of the owner's choosing, and libxpc keeps a pointer to its
+        // own connection object there rather than in a side table - so the two
+        // have to remember what they were told, which is what `port_context_` is.
+        //
+        // Getting this wrong is not quiet: libxpc asserts on the kern_return_t,
+        // and the message reaches libsystem_c as "assertion failed: ...
+        // libxpc.dylib + 248460: 0x5", 5 being KERN_FAILURE - what an
+        // unimplemented routine returns here.
+        //
+        // The reply is 44 bytes, not 48: the 8-byte context follows RetCode with
+        // no alignment padding.  That is read out of the user stub, which compares
+        // the reply's msgh_size against 0x2c before believing it.
+        case 3228: {                                     // mach_port_get_context
+            const uint32_t size = 24 + 8 + 4 + 8;
+            if (reply_cap && size > reply_cap) return kKernFailure;
+            const uint32_t name = mem_.read<uint32_t>(data + 32);
+            uint64_t ctx = 0;
+            auto it = port_context_.find(name);
+            if (it != port_context_.end()) ctx = it->second;
+            reply_header(size);
+            mem_.write<uint32_t>(data + 32, 0);          // RetCode
+            mem_.write<uint64_t>(data + 36, ctx);
+            return kKernSuccess;
+        }
+        case 3229: {                                     // mach_port_set_context
+            const uint32_t size = 24 + 8 + 4;
+            if (reply_cap && size > reply_cap) return kKernFailure;
+            const uint32_t name = mem_.read<uint32_t>(data + 32);
+            port_context_[name] = mem_.read<uint64_t>(data + 36);
+            reply_header(size);
+            mem_.write<uint32_t>(data + 32, 0);          // RetCode
+            return kKernSuccess;
+        }
         // _host_page_size(host, &out).
         case 202: {
             const uint32_t size = 24 + 8 + 4 + 4;
@@ -1061,6 +1096,26 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
             std::fprintf(stderr,
                          "[mac] MIG routine %u (to port %X) is not implemented, at PC %016llX\n",
                          msgh_id, remote, static_cast<unsigned long long>(cpu_.pc - 4));
+            // The printable strings in the body, because a message to the
+            // bootstrap port is a *service lookup* and the name is the whole
+            // question: whether the guest wants something optional - a diagnostics
+            // daemon - or something it cannot do without.
+            if (trace) {
+                const uint32_t len = mem_.read<uint32_t>(data + 4);
+                std::string run;
+                for (uint32_t k = 24; k < len && k < 2048; ++k) {
+                    const uint8_t c = mem_.read<uint8_t>(data + k);
+                    if (c >= 0x20 && c < 0x7F) {
+                        run.push_back(static_cast<char>(c));
+                        continue;
+                    }
+                    if (run.size() >= 4)
+                        std::fprintf(stderr, "[mac]   body: %s\n", run.c_str());
+                    run.clear();
+                }
+                if (run.size() >= 4)
+                    std::fprintf(stderr, "[mac]   body: %s\n", run.c_str());
+            }
             return kKernFailure;
     }
 }

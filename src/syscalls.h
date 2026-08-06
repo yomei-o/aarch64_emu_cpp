@@ -247,6 +247,10 @@ private:
     // fails only if it is zero. Handing out the same one twice would make two
     // different things compare equal.
     uint32_t next_port_ = 0x1103;
+    // A port's context word: one 64-bit value the owner may hang off any port,
+    // set and read back through mach_port_{set,get}_context.  libxpc keeps its
+    // connection object there.
+    std::map<uint32_t, uint64_t> port_context_;
     // One special reply port per thread, which is what `thread_get_special_reply_port`
     // is for: a thread receives an XPC reply on its own port and keeps it.
     std::map<size_t, uint32_t> special_reply_ports_;

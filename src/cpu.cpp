@@ -835,6 +835,33 @@ void Cpu::exec_loadstore(uint32_t insn) {
     if (grp == 7) {                                                   // load/store register
         const unsigned size = (insn >> 30) & 3, simd = (insn >> 26) & 1, opc = (insn >> 22) & 3;
         const unsigned rn = (insn >> 5) & 0x1F, rt = insn & 0x1F;
+
+        // LDRAA/LDRAB -- load, authenticating the *address* first. It has to be taken
+        // before the addressing modes below, which would otherwise read it as a plain
+        // pre- or post-indexed LDR: bit 21 is set and bits 11:10 are 01 or 11, and
+        // nothing in the generic decode distinguishes that from an ordinary index.
+        // It did not fault, it read the wrong address -- **the offset here is scaled
+        // by 8 and ten bits wide**, where the generic path takes an unscaled nine.
+        //
+        // That silent four-byte error is what broke `clang hello.c -o hello`.  The
+        // driver passes `-lto_library`, ld throws a C++ exception on that path, and
+        // libc++abi fetched the personality routine out of the exception object with
+        // one of these.  Four bytes low is the adjacent field, so it branched to
+        // `_Unwind_Exception.exception_class` -- 0x434C4E47432B2B01, which is the
+        // ASCII "CLNGC++" that libc++abi tags its exceptions with, and which spent an
+        // afternoon looking like memory corruption because it is a *valid* value read
+        // from the *wrong* place.
+        //
+        // The authentication itself is the identity, as everywhere else here.
+        if (size == 3 && !simd && !((insn >> 24) & 1) && ((insn >> 21) & 1) &&
+            ((insn >> 10) & 1)) {
+            const uint64_t imm10 = (((insn >> 22) & 1) << 9) | ((insn >> 12) & 0x1FF);
+            const int64_t off = static_cast<int64_t>(sign_extend(imm10, 10)) * 8;
+            const uint64_t addr = xsp(rn) + static_cast<uint64_t>(off);
+            setx(rt, mem_.read<uint64_t>(addr));
+            if ((insn >> 11) & 1) setxsp(rn, addr);                   // W: pre-indexed
+            return;
+        }
         uint64_t addr;
         bool writeback = false, postindex = false;
         int64_t wbimm = 0;

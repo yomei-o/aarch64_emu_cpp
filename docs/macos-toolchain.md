@@ -135,11 +135,12 @@ $ sh tests/run_macos_clang.sh
 ok   macos clang -c (arm64 object, printf->puts)
 ok   macos ld (LC_MAIN, chained fixups, ad-hoc signature)
 ok   macos clang+ld output runs
-3 passed, 0 failed
+ok   macos clang one-shot (driver spawns ld)
+4 passed, 0 failed
 ```
 
-The three stages are checked apart rather than as one `clang hello.c -o hello`,
-because they fail in different ways. The script skips itself with a note when
+The stages are checked apart as well as together, because they fail in different
+ways and one verdict would hide which. The script skips itself with a note when
 `guests/macos_clang` is not there, so it is safe to leave in a normal test run.
 
 ## Using it
@@ -168,17 +169,27 @@ The result is a signed, PIE arm64 Mach-O with `LC_MAIN` and chained fixups —
 `llvm-objdump --macho --all-headers` on it looks exactly like a Mac's output, and
 it will run on a Mac.
 
-**Drive the two stages separately. The driver's own one-shot
-`clang hello.c -o hello` does not work yet** - it goes into infinite recursion
-inside libunwind before it starts any child process, and eventually exhausts
-host memory. `resume.md` has the diagnosis. `-c` and `ld` are unaffected.
+Or let the driver do both, which also works:
+
+```sh
+$EMU guests/macos_clang/usr/bin/clang \
+     -target arm64-apple-macos15 -isysroot /sdk -O2 /hello.c -o /hello
+```
+
+That form is worth knowing is *harder* than the two stages, not easier. The
+driver passes `-lto_library`, which sends `ld` down a path that throws a C++
+exception; `ld` then re-execs itself; and the result is three levels of nested
+guest process, each with its own address space. Everything it needs — unwinding
+through the shared cache's libraries, `LDRAA`, `symlink` — was implemented for
+this and nothing else.
 
 ### Two things to expect
 
 - **About half a minute, most of it fixed cost.** Measured on an 8 GB Windows
-  host: `clang -c` 7.8s and 2.6 GB peak, `ld` 18.8s and 1.1 GB peak. Nearly all
-  of `ld`'s time is libdispatch and the loader starting up, so a bigger program
-  costs little more than a hello world.
+  host: `clang -c` 7.8s and 2.6 GB peak, `ld` 18.8s and 1.1 GB peak, and the
+  one-shot 24.6s and 3.5 GB — less than the two added together, because the
+  driver only starts once. Nearly all of `ld`'s time is libdispatch and the
+  loader starting up, so a bigger program costs little more than a hello world.
 - **`--dyld-sections` is not optional.** Without it libobjc never reads the
   shared cache's preoptimized class tables and libxpc fails its own type check
   long before clang starts.

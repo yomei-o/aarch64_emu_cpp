@@ -259,67 +259,71 @@ Three bugs stood between "spawns cc1" and this, all worth remembering:
   zero-compare opcode table was wrong -- opcode 8 is CMGT/CMGE, 9 is CMEQ/CMLE,
   A is CMLT; the old table answered different questions than were asked.
 
-### Read this first (2026-08-06, end of the session)
+### The one-shot works now, and what it cost (2026-08-06)
 
-Two things from the last hour change what you think you know.
+`clang hello.c -o hello` -- the driver spawning its own linker -- builds and runs.
+`tests/run_macos_clang.sh` is 4/4 and covers it. It took three separate bugs, and
+the middle one is the interesting one.
 
-**1. It is not slow. `ld` links in 18.8 seconds.** Every "this takes a few minutes"
-in this file and in the docs was wrong, and the cause is embarrassing: the
-emulator printed a line to stderr for every call to an unimplemented dyld API
-slot, and one `clang hello.c` wrote **five gigabytes** of them. The writing *was*
-the runtime. Measured on this machine, with that suppressed:
+**Measured, and this replaces every "a few minutes" that used to be in here.** The
+emulator had been printing a line for every call to an unimplemented dyld API slot,
+and one `clang hello.c` wrote *five gigabytes* of them: the writing was the runtime.
+With that suppressed (first three per slot, the rest counted into one line at exit):
 
-    clang -c   7.8s   peak RSS 2,571 MB
-    ld        18.8s   peak RSS 1,121 MB
+    clang -c    7.8s   peak RSS 2,571 MB
+    ld         18.8s   peak RSS 1,121 MB
+    one-shot   24.6s   peak RSS 3,502 MB     <- less than the sum; the driver
+                                                only starts once
 
-Those are real numbers from `Start-Process` + `PeakWorkingSet64`, not
-impressions. The suppression is in `darwin.cpp`: the first three calls per slot
-print, the rest are counted and reported in one line at exit, so nothing goes
-silent. **README.md and docs/macos-toolchain.md still say "a few minutes" and
-"about 190 million instructions" as if that were slow - fix them to the numbers
-above.**
+**Bug 1 -- dyld slot 46, `_dyld_find_unwind_sections`, was not implemented.**
+libunwind's only way to ask where a pc's unwind tables live, and 0 means "that
+address is in no image". The result was not a clean failure: unbounded recursion,
+host memory climbing a perfectly linear 31 MB every five seconds, dead of
+`bad_alloc` after 25 minutes. `image_segs_` already had what it needed -- the same
+address-to-image walk slot 12 does -- plus `guest_find_section` for `__eh_frame`
+and `__unwind_info`.
 
-**2. The one-shot `clang hello.c -o hello` does not work.** The two stages driven
-separately do (`tests/run_macos_clang.sh`, 3/3); the driver form, where clang
-spawns the linker itself, goes into **infinite recursion in libunwind** and dies
-of `std::bad_alloc` after ~25 minutes of climbing memory. This was written up in
-docs/macos-toolchain.md as merely "not covered by the test suite" *before it had
-ever been run once* - which was not honest, and the doc needs correcting to say
-it is broken.
+**Bug 2 -- `LDRAA`/`LDRAB` were not implemented, and did not fault.** This is the
+one to remember. They fell through to the generic pre/post-indexed `LDR` decode,
+which reads bit 21 and bits 11:10 the same way -- so the emulator loaded from
+**Xn + imm9** where the architecture says **Xn + sext(S:imm9) * 8**. Four bytes
+low, silently, for the whole history of the project.
 
-The evidence, all of it pointing the same way:
+What it looked like: `blraa` to `0x434C4E47432B2B01`. That is ASCII `"CLNGC++"`,
+which is libc++abi's `_Unwind_Exception.exception_class` tag -- the field next to
+the one being fetched. It cost an afternoon because it is a *valid value read from
+the wrong place*, which reads as memory corruption and is not. If something branches
+somewhere absurd, check whether the absurd value is a legitimate neighbour.
 
-- Host memory climbs **perfectly linearly, +31 MB every 5 seconds**, never
-  plateauing. A working set does not do that.
-- `A64EMU_SAMPLE=200` shows the frame pointer descending monotonically, about
-  24 MB per 200M instructions: `fp 7FFFFE68F7F0` at 200M, `7FFFDF1FC030` at
-  4000M. It is recursion, and the stack is the leak.
-- **No `[proc] spawn` line is ever printed.** It never reaches the point of
-  starting `clang -cc1`, let alone `ld`. Whatever goes wrong is in the driver
-  planning a *link* job, since `-c` on the same input is fine.
-- The pcs land in libunwind: `/usr/lib/system/libunwind.dylib`, whose `__text`
-  starts at 0x18E697438, and the samples are all 0x18E69xxxx and 0x1804xxxxx.
+**Bug 3 -- syscall 57, `symlink`, was not implemented.** `ld` calls
+`std::filesystem::create_symlink` on the `-lto_library` path and does not catch, so
+ENOSYS was `abort()`. Windows will not make a symlink without Developer Mode, so
+`Files::symlink` tries symlink, then hard link, then a copy -- all three leave the
+contents readable at the path, which is all a toolchain does with one.
 
-**The hypothesis to test first**, because it is cheap and it fits: the three most
-called unimplemented dyld API slots are **85 (x1680), 97 (x363), 86 (x242)** -
-and those are the ones libunwind uses to find a function's unwind info. They
-return 0, which reads as "no unwind section here". A libunwind that cannot find
-an FDE and retries is exactly a monotonic recursion. `tools/dyld_slots.py` names
-slots; start by naming those three and implementing them.
+**Three diagnostics came out of this and are worth keeping:**
 
-**New diagnostics, all of them earned this session and worth keeping:**
-
-    A64EMU_SAMPLE=<n>     pc, lr and fp every n million instructions.  This is
-                          the tool that cracked the above: a guest that has
-                          stopped progressing has usually not stopped running,
-                          and A64EMU_TRACE_RANGE cannot help because it needs to
-                          be told where to look, which is the question.
-    [proc] spawn(<depth>) one line per child process, always on, with the guest
-                          pages it cost on the way out.
+    A64EMU_SAMPLE=<n>     pc, lr and fp every n million instructions.  This is what
+                          cracked bug 1: a guest that stops progressing has usually
+                          not stopped running, and A64EMU_TRACE_RANGE cannot help
+                          because it must be told where to look, which is the question.
+                          A monotonically descending fp is recursion, full stop.
+    [proc] spawn(<depth>) one line per child, always on, with the guest pages it cost.
+                          It showed the one-shot never reached its first child, and
+                          later that `ld` re-execs *itself* -- three levels deep.
     [stall]               every thread's pc and stack when all of them block.
 
-**Uncommitted at reboot:** nothing, if the commit below landed. If `git status`
-is dirty, the changes are the three diagnostics above.
+**The method that worked, since none of the above was found by reading code.**
+Bisecting the driver's own `ld` command line found `-lto_library` in four runs at
+18 seconds each. Mapping the crash frames to libraries by scanning every guest
+dylib's `__TEXT` vmaddr named libunwind and libc++abi. `llvm-nm --numeric-sort` on
+libsystem_kernel turned "unimplemented syscall 57" into `_symlink`, and the same
+trick on libc++ named `__create_symlink` as the caller. Reach for those before
+reading any more disassembly.
+
+**Still unimplemented, and none of it currently blocking:** dyld slots 85, 97 and 86
+(`_dyld_for_each_objc_class` and friends, 1,680 calls in a run and harmless at 0),
+`sysctl machdep.ptrauth_enabled`, and MIG routines 412 and 1073742031.
 
 ### Apple clang and ld: the whole chain works (2026-08-06)
 

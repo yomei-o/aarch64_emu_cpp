@@ -40,6 +40,10 @@ public:
     int64_t unlink(const std::string& path);
     int64_t mkdir(const std::string& path);
     int64_t rename(const std::string& from, const std::string& to);
+    // symlink(target, linkpath). Falls back to copying when the host will not make a
+    // link -- see the note on the implementation for why that is the right answer
+    // here rather than an honest EPERM.
+    int64_t symlink(const std::string& target, const std::string& linkpath);
     // A pipe. Writes the two descriptors into `fds` and returns 0.
     int64_t pipe2(int fds[2]);
     // dup/dup2. `newfd` of -1 means "the lowest free one", which is dup(2).

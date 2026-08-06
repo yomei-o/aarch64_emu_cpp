@@ -444,6 +444,30 @@ int64_t Files::rename(const std::string& from, const std::string& to) {
     return ec ? kENOENT : 0;
 }
 
+// symlink(target, linkpath).  `ld` reaches this on the `-lto_library` path through
+// std::filesystem::create_symlink, which throws when it fails -- and ld does not
+// catch, so a refusal here is not an error the guest reports, it is `abort()`.
+//
+// Windows will not make a symlink without Developer Mode or elevation, and this
+// emulator should not need either.  So: try a real symlink, then a hard link, then
+// a copy.  All three leave the *contents* reachable at `linkpath`, which is the
+// whole of what a toolchain does with one -- it opens it and reads it.  What a copy
+// does not preserve is aliasing (a later write to one is not seen through the other)
+// and lstat saying "this is a link".  Nothing in a compile or a link does either,
+// and the alternative is not working at all.
+int64_t Files::symlink(const std::string& target, const std::string& linkpath) {
+    const std::filesystem::path from = host_path(target), to = host_path(linkpath);
+    std::error_code ec;
+    std::filesystem::create_symlink(from, to, ec);
+    if (!ec) return 0;
+    ec.clear();
+    std::filesystem::create_hard_link(from, to, ec);
+    if (!ec) return 0;
+    ec.clear();
+    std::filesystem::copy_file(from, to, std::filesystem::copy_options::overwrite_existing, ec);
+    return ec ? kENOENT : 0;
+}
+
 int64_t Files::access(const std::string& path) {
     // A missing file is ENOENT, not EACCES: a guest distinguishes "not there"
     // from "forbidden" - gcc probes its search path with access() and treats

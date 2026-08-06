@@ -576,6 +576,48 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
         // search a table that does not exist. `headeropt_ro` is at the opt header's +12
         // offset, holds 2,799 entries of 24 bytes, and entry 0 is libobjc at 0x180078000,
         // which is exactly where the loader put it.
+        // _dyld_find_unwind_sections(void* addr, dyld_unwind_sections* info) -> bool.
+        // libunwind's only way to ask where a pc's unwind tables are, and returning 0
+        // -- "that address is in no image" -- is not a soft failure. The `clang hello.c`
+        // one-shot, where the driver spawns its own linker, went into recursion that
+        // never came back and grew the host's memory by 31 MB every five seconds until
+        // it died; the three calls before the end were this slot, with x2 descending
+        // 0x80 a time, which is a stack marching downwards.
+        //
+        // The signature is read off those same trace lines rather than a header: x1 is
+        // an address inside libunwind and x2 is on the stack, so x1 is the pc being
+        // asked about and x2 the struct to fill. (x0 is `this`; these are virtual.)
+        //
+        // The struct is five words, and both sections may legitimately be absent -- an
+        // image built with only compact unwind has no __eh_frame, and libunwind checks
+        // the lengths. What it must not get is a zeroed `mh` alongside a true return.
+        case 46: {
+            const uint64_t addr = cpu_.xr(1), info = cpu_.xr(2);
+            uint64_t hdr = 0;
+            for (const LoadedImage::ImageSeg& sg : image_segs_)
+                if (addr >= sg.lo && addr < sg.hi) { hdr = sg.header; break; }
+            if (!hdr && addr && prog_header_ && addr >= prog_header_) hdr = prog_header_;
+            if (!hdr || !info || !mem_.is_mapped(info)) return 0;
+
+            uint64_t eh = 0, eh_size = 0, cu = 0, cu_size = 0;
+            guest_find_section(mem_, hdr, "__eh_frame", &eh, &eh_size);
+            guest_find_section(mem_, hdr, "__unwind_info", &cu, &cu_size);
+            mem_.write<uint64_t>(info + 0, hdr);
+            mem_.write<uint64_t>(info + 8, eh);
+            mem_.write<uint64_t>(info + 16, eh_size);
+            mem_.write<uint64_t>(info + 24, cu);
+            mem_.write<uint64_t>(info + 32, cu_size);
+            if (trace)
+                std::fprintf(stderr, "[mac] unwind sections for %012llX -> mh %012llX"
+                             " eh_frame %012llX+%llu unwind_info %012llX+%llu\n",
+                             static_cast<unsigned long long>(addr),
+                             static_cast<unsigned long long>(hdr),
+                             static_cast<unsigned long long>(eh),
+                             static_cast<unsigned long long>(eh_size),
+                             static_cast<unsigned long long>(cu),
+                             static_cast<unsigned long long>(cu_size));
+            return 1;
+        }
         case 118: {
             if (!objc_opt_ro_) return 0;
             const int32_t off = static_cast<int32_t>(mem_.read<uint32_t>(objc_opt_ro_ + 12));
@@ -1489,6 +1531,7 @@ bool Syscalls::svc_darwin() {
         case 136: r = files.mkdir(guest_str(a0)); break;
         case 137: case 10: r = files.unlink(guest_str(a0)); break;   // rmdir, unlink
         case 128: r = files.rename(guest_str(a0), guest_str(a1)); break;
+        case 57: r = files.symlink(guest_str(a0), guest_str(a1)); break;
         // __getcwd(buf, size).  Answering it is not a convenience: without it
         // libsystem_c falls back to *walking up the tree*, opening each parent and
         // comparing (st_dev, st_ino) of every entry against the child's to recover

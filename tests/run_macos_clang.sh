@@ -6,8 +6,8 @@
 # that only exist on a machine where tools/pack_clang*.sh have been run.  It
 # skips quietly when they are not there.
 #
-# The three stages are checked apart rather than as one `clang hello.c -o hello`,
-# because they fail in different ways and a single verdict would hide which:
+# The stages are checked apart *as well as* together, because they fail in
+# different ways and a single verdict would hide which:
 #
 #   1. clang -c   -- the compiler alone, no linker.  Its output is inspected for
 #                    the -O2 printf-to-puts rewrite, so a stage that "worked" but
@@ -18,6 +18,12 @@
 #                    linking.
 #   3. run it     -- the only check that the bytes ld emitted are a real program:
 #                    correct chained fixups, a bound _printf, an ad-hoc signature.
+#   4. one shot   -- `clang hello.c -o hello`, the driver spawning its own linker.
+#                    Worth its own case because it is not stages 1 and 2 in a
+#                    trenchcoat: the driver passes `-lto_library`, which sends ld
+#                    down a path that throws a C++ exception, and ld then re-execs
+#                    *itself*, so this is three levels of nested guest process and
+#                    the only test that exercises any of it.
 #
 # Note the run needs its stdout on a file, not a pipe into head: the guest's libc
 # fully buffers a non-tty and flushes at exit, so the greeting arrives last, after
@@ -91,6 +97,21 @@ if [ -f "$ROOT/hello" ]; then
     got=$(tr -d '\015' < "$out")
     rm -f "$out"
     check "macos clang+ld output runs" "hello from emulated clang" "$got"
+fi
+
+# ---- 4. the driver doing both, and the result running ---------------------------
+rm -f "$ROOT/oneshot"
+$EMU --setenv TMPDIR=/tmp/ --dyld-sections --root "$ROOT" \
+     "$ROOT/usr/bin/clang" -target arm64-apple-macos15 -isysroot /sdk \
+     -O2 /hello.c -o /oneshot >/dev/null 2>&1
+if [ -f "$ROOT/oneshot" ]; then
+    out=$(mktemp)
+    $EMU --dyld-sections --root "$ROOT" "$ROOT/oneshot" >"$out" 2>/dev/null
+    got=$(tr -d '\015' < "$out")
+    rm -f "$out"
+    check "macos clang one-shot (driver spawns ld)" "hello from emulated clang" "$got"
+else
+    check "macos clang one-shot (driver spawns ld)" "hello from emulated clang" "no output"
 fi
 
 echo "$pass passed, $fail failed"

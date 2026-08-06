@@ -299,27 +299,37 @@ copy in both - and the guest needs a `/tmp` plus `--setenv TMPDIR=/tmp/` or the
 driver stops at "unable to make temporary file".
 
 **Where the linker stands.** `ld` loads, initialises, opens and maps `/hello.o`,
-and runs to 84M instructions (from 7.7M) before deadlocking on a ulock with no
-worker to release it.  The reason is visible in `--trace-sys`: libdispatch asks
-for its workers through **`kevent_id` on a workloop**, not through
-`WQOPS_QUEUE_REQTHREADS`, so the request path in `workq_kernreturn` is never
-taken and `spawn_workq_thread` never runs.
+brings up libdispatch's workqueue, runs five worker threads through its parallel
+phases, and stops in **libxpc** - before it writes any output.  The pthread
+workqueue is done (see the commit "workloop workers"); what is left is one XPC
+question.
 
-The next piece is therefore the workloop half of the protocol:
+ld looks up four services through the bootstrap port, and all four are optional
+daemons:
 
-- a `kevent_id(id, changelist, ...)` whose change asks for a wakeup must create a
-  worker, not merely answer 0;
-- that worker enters `_pthread_wqthread` with `WQ_FLAG_THREAD_WORKLOOP`, x3
-  pointing at a `struct kevent_qos_s` (64 bytes) describing the workloop and x5
-  the count, rather than the (NULL, 0) a plain worker gets;
-- `WQOPS_THREAD_WORKLOOP_RETURN` (0x100) is how such a worker asks for more.
+    com.apple.analyticsd
+    com.apple.logd
+    com.apple.system.notification_center
+    com.apple.system.opendirectoryd.libinfo
 
-Everything else is in place: `spawn_workq_thread` already lays down the stack and
-the `struct _pthread` the way the kernel does, and the plain-worker argument
-convention is written out beside it.  Expect the failure mode to be a hang rather
-than a message, because a wrong worker ABI means libdispatch waits rather than
-complains - so check first that a worker is created at all (`--trace-sys` prints
-`[proc] workq worker tid ...`).
+None of them is needed to link, so the blocker is not the missing service - it is
+**how the failure is handled**.  Returning KERN_FAILURE from the MIG layer fails
+the *message send*, and libxpc then queues an async reply on a connection whose
+handler slot (`connection + 0x88`) is null and calls through it:
+`_xpc_connection_reply_callout` jumps to address zero.
+
+The shape of the fix is to answer the lookup the way a machine without that
+service does - a well-formed reply saying "unknown service" - rather than failing
+the send.  These are XPC messages (msgh_id 0x40000324 and 0x400001CF to the
+bootstrap port), not classic `bootstrap_look_up` MIG, so it means understanding
+enough of the XPC dictionary wire format to build a reply.  Worth checking first
+whether libxpc has a cheaper "this connection is dead" path that a different
+kern_return_t would take.
+
+`--trace-sys` now prints the printable strings of any unimplemented MIG message,
+which is how the four names above were read; keep that in mind for the next
+guest, because a message to the bootstrap port is always a service lookup and the
+name is the whole question.
 
 ### The original plan (2026-08-05, evening), kept for the reasoning
 

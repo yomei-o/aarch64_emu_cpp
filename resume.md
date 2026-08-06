@@ -22,9 +22,12 @@ that flushes stdio, and without which the program printed nothing at all.
 
 The macOS milestone is **met**. What is left on that side is breadth rather than a wall.
 
-**Apple clang compiles arm64 Mach-O here now (2026-08-06)** - see "Apple clang:
-it compiles" below for the state and the one protocol still missing before it
-links.
+**Apple's clang *and* ld both run here now (2026-08-06).** The emulator is a
+Windows-hosted macOS cross-compiler: `hello.c` goes through Apple's real clang to
+an object, through Apple's real `ld` to a signed arm64 Mach-O executable, and that
+executable runs. `tests/run_macos_clang.sh` checks all three stages (3/3; it skips
+itself when `guests/macos_clang` is absent, which it is in a fresh clone). See
+"Apple clang and ld" below.
 
 **Where this is (2026-08-05, third pass).** The goal it was aimed at is met:
 
@@ -256,12 +259,15 @@ Three bugs stood between "spawns cc1" and this, all worth remembering:
   zero-compare opcode table was wrong -- opcode 8 is CMGT/CMGE, 9 is CMEQ/CMLE,
   A is CMLT; the old table answered different questions than were asked.
 
-### Apple clang: it compiles (2026-08-06).  The linker is one protocol away.
+### Apple clang and ld: the whole chain works (2026-08-06)
 
-    ./aarch64emu --dyld-sections --root guests/macos_clang         guests/macos_clang/usr/bin/clang -isysroot /sdk -S -O2 /hello.c -o /hello.s
+    sh tests/run_macos_clang.sh
+    ok   macos clang -c (arm64 object, printf->puts)
+    ok   macos ld (LC_MAIN, chained fixups, ad-hoc signature)
+    ok   macos clang+ld output runs
+    3 passed, 0 failed
 
-produces correct arm64 assembly, down to the -O2 printf-to-puts rewrite, and
-`-c` produces a real MH_OBJECT with `_main` and `_printf`.  The seven emulator
+Compiling was the smaller half.  `-c` produces a real MH_OBJECT, and the seven emulator
 bugs it took are in the commit "Apple clang compiles arm64 Mach-O inside the
 emulator"; three were the same species (a hook returning a *plausible success*),
 and the one worth carrying to the next guest is that
@@ -298,38 +304,63 @@ resolves to `/usr/lib/` and *not* `/usr/lib/swift/` - libswiftDemangle needs a
 copy in both - and the guest needs a `/tmp` plus `--setenv TMPDIR=/tmp/` or the
 driver stops at "unable to make temporary file".
 
-**Where the linker stands.** `ld` loads, initialises, opens and maps `/hello.o`,
-brings up libdispatch's workqueue, runs five worker threads through its parallel
-phases, and stops in **libxpc** - before it writes any output.  The pthread
-workqueue is done (see the commit "workloop workers"); what is left is one XPC
-question.
+**How the linker was finished, and the one thing to carry forward.** Everything
+after the XPC blocker was a scheduling question, not a linking one. `ld` is built
+on libdispatch, so the emulator had to model the pthread workqueue properly:
+workers that `WQOPS_THREAD_RETURN` are **parked for reuse**, not destroyed, and
+`kevent_id` on `EVFILT_WORKLOOP` with `NOTE_WL_THREAD_REQUEST` is a thread
+request just as `WQOPS_QUEUE_REQTHREADS` is.
 
-ld looks up four services through the bootstrap port, and all four are optional
-daemons:
+The last bug is the one worth remembering, because nothing about it looked like
+scheduling. `ld` hung with main in `dispatch_group_wait` inside
+`ld::LayoutExecutable::assignAddresses` and its one worker parked with no work.
+The work existed; **the worker was draining the wrong queue.** libdispatch picks
+a root queue from the `pthread_priority_t` libpthread hands its worker function,
+and libpthread builds that word from the flags in x4. Reading
+`__pthread_wqthread` is the only way to know which bit means what - there are
+three encodings and they are not interchangeable:
 
-    com.apple.analyticsd
-    com.apple.logd
-    com.apple.system.notification_center
-    com.apple.system.opendirectoryd.libinfo
+    bit 23 -> 0x040008FF outright     bit 14 -> QoS class from the low byte
+    bit 15 -> 0xFFFF                  bit 20 -> 0x02000000, the event manager
 
-None of them is needed to link, so the blocker is not the missing service - it is
-**how the failure is handled**.  Returning KERN_FAILURE from the MIG layer fails
-the *message send*, and libxpc then queues an async reply on a connection whose
-handler slot (`connection + 0x88`) is null and calls through it:
-`_xpc_connection_reply_callout` jumps to address zero.
+0x040008FF is exactly the value libdispatch passes to `WQOPS_QUEUE_REQTHREADS`,
+so **the request's priority has to travel to the thread that serves it**. Bit 15,
+the one that looks like "the low byte carries a QoS class", yields 0xFFFF - the
+unspecified legacy priority, which matches no root queue at all. A wrong guess
+here does not fail; it hangs.
 
-The shape of the fix is to answer the lookup the way a machine without that
-service does - a well-formed reply saying "unknown service" - rather than failing
-the send.  These are XPC messages (msgh_id 0x40000324 and 0x400001CF to the
-bootstrap port), not classic `bootstrap_look_up` MIG, so it means understanding
-enough of the XPC dictionary wire format to build a reply.  Worth checking first
-whether libxpc has a cheaper "this connection is dead" path that a different
-kern_return_t would take.
+Two syscalls turned up behind it: `ftruncate` (201), which is how `ld` sizes its
+output before writing through a shared mapping, and `umask` (60).
 
-`--trace-sys` now prints the printable strings of any unimplemented MIG message,
-which is how the four names above were read; keep that in mind for the next
-guest, because a message to the bootstrap port is always a service lookup and the
-name is the whole question.
+Still unimplemented and evidently not needed: `sysctl` KERN_PROC_PID, MIG 412.
+
+**Reading the guest's crash message is what made all of this tractable** - both
+the libdispatch "BUG IN..." strings via `__DATA,__crash_info` and, at the end,
+`ld`'s own `ld: ftruncate() failed, errno=78`. When a guest stops, look for the
+sentence it wrote before assuming anything has to be inferred.
+
+One trap when checking the result by hand: the guest's libc fully buffers a
+non-tty and flushes at exit, so `| head` will cut the program's own output off
+after the dyld chatter. Redirect to a file.
+
+`--trace-sys` prints the printable strings of any unimplemented MIG message,
+which is how the four bootstrap service names below were read; keep that in mind
+for the next guest, because a message to the bootstrap port is always a service
+lookup and the name is the whole question.
+
+<details><summary>The XPC blocker, kept for the reasoning</summary>
+
+`ld` looks up four optional daemons through the bootstrap port
+(`com.apple.analyticsd`, `logd`, `notification_center`,
+`opendirectoryd.libinfo`). None is needed to link, so the blocker was never the
+missing service - it was **how the failure is handled**. Returning KERN_FAILURE
+fails the *message send*, and libxpc then queues an async reply on a connection
+whose handler slot (`connection + 0x88`) is null and calls through it:
+`_xpc_connection_reply_callout` jumps to address zero. Answering
+`MACH_SEND_INVALID_DEST` instead - the way a machine without that service answers
+- takes libxpc's dead-connection path and costs no XPC wire format at all.
+
+</details>
 
 ### The original plan (2026-08-05, evening), kept for the reasoning
 

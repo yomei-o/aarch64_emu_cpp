@@ -195,6 +195,22 @@ private:
     // Where `bsdthread_register` said new threads begin: libpthread's `_thread_start`,
     // not the start routine the guest passed to `pthread_create`.
     uint64_t bsdthread_entry_ = 0;
+    // The *other* entry point bsdthread_register names: `_pthread_wqthread`, where a
+    // workqueue worker starts.  A worker differs from a pthread in who owns the
+    // stack - the kernel allocates it, and the `struct _pthread` inside it, before
+    // the thread ever runs - which is why this needs its own creation path rather
+    // than a flag on bsdthread_create.
+    uint64_t wqthread_entry_ = 0;
+    uint64_t pthread_size_ = 0;          // bsdthread_register's third argument
+    // Workers asked for but not yet started.  libdispatch requests threads and
+    // expects them to appear later, so a request is a promise, not a call.
+    int workq_requested_ = 0;
+    int workq_live_ = 0;
+    // Creates one workqueue worker, or returns false if it cannot.
+    bool spawn_workq_thread(bool overcommit);
+    // Starts any workers that have been asked for.  Called where the guest has
+    // just given the scheduler a chance to run something else.
+    void service_workq_requests();
     int64_t sys_futex(uint64_t addr, int op, uint32_t val);
     int64_t sys_sched_yield();
     void thread_exit(int status);

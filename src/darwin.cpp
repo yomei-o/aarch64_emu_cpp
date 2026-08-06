@@ -1625,10 +1625,113 @@ bool Syscalls::svc_darwin() {
         // x0 is `threadstart`, the address a new thread begins at. Remembering it is
         // what makes bsdthread_create possible at all: the start routine the guest
         // passed to pthread_create is an *argument* to that trampoline, not the entry.
-        case 366:
+        // bsdthread_register(thread_start, wqthread, pthsize, ...).  The return
+        // value is a feature bitmask, and libpthread hands it on to libdispatch,
+        // which treats the absence of PTHREAD_FEATURE_KEVENT as fatal rather than
+        // as a reason to use an older path: "BUG IN LIBDISPATCH: Missing Kevent
+        // WORKQ support".  CPython never noticed because libdispatch brings its
+        // root queues up lazily; a parallel linker forces them up immediately.
+        case 366: {
+            constexpr int64_t kDispatchFunc = 0x01, kFinePrio = 0x02, kBsdThreadCtl = 0x04,
+                              kSetSelf = 0x08, kQosMaintenance = 0x10, kKevent = 0x40,
+                              kWorkloop = 0x80, kQosDefault = 0x4000'0000;
             bsdthread_entry_ = a0;
-            r = 0x4000001F;
-            break;                                         // bsdthread_register
+            wqthread_entry_ = a1;
+            pthread_size_ = a2;
+            r = kQosDefault | kQosMaintenance | kSetSelf | kBsdThreadCtl | kFinePrio |
+                kDispatchFunc | kKevent;
+            // WORKLOOP is deliberately *not* advertised.  A workloop worker arrives
+            // through kevent_id_qos with a whole event list to service, which is a
+            // second protocol; claiming it and then not delivering would be the
+            // quiet kind of wrong.  Without the bit libdispatch uses the plain
+            // workqueue, which is the one below.
+            (void)kWorkloop;
+            break;
+        }
+        // workq_open(): the workqueue exists as soon as it is asked for.
+        case 367: r = 0; break;
+        // kevent_qos(kq, changelist, nchanges, eventlist, nevents, data_out,
+        //            data_available, flags).  libdispatch registers its workqueue
+        // through this with KEVENT_FLAG_WORKQ, and reads the *return value* as the
+        // number of events delivered: 0 means "registered, nothing pending", which
+        // is the truth here and what lets initialisation finish.  A negative
+        // return is what it reports as "Failed to initalize workqueue kevent".
+        //
+        // Delivering events is a different matter and deliberately not attempted.
+        // Nothing in a linker's dispatch use waits on a file descriptor or a mach
+        // port; it wants concurrent queues, and those are served by the worker
+        // threads workq_kernreturn asks for.  A guest that did wait on a kevent
+        // would wait forever, and would deserve a real implementation rather than
+        // an invented event.
+        case 374: {                                        // kevent_qos
+            const uint64_t nchanges = cpu_.xr(2), eventlist = cpu_.xr(3),
+                           nevents = cpu_.xr(4);
+            (void)nchanges;
+            // The caller may pass an event buffer even when nothing is pending; it
+            // reads only as many as the return value claims, so leaving it alone is
+            // correct - but zeroing the first entry costs nothing and makes a
+            // caller that peeks anyway see an empty filter rather than stack.
+            if (eventlist && nevents) {
+                uint8_t zero[64] = {};
+                mem_.write_bytes(eventlist, zero, sizeof zero);
+            }
+            r = 0;
+            break;
+        }
+        // kevent_id(id, changelist, nchanges, eventlist, nevents, data_out,
+        //           data_available, flags): the workloop form, keyed by a 64-bit
+        // id rather than a kqueue descriptor.  libdispatch reaches for it even
+        // without PTHREAD_FEATURE_WORKLOOP - a dispatch_queue with a target of its
+        // own becomes a workloop regardless - so answering it is not optional.
+        // Same contract as kevent_qos: the return value is the event count, and
+        // zero is a registration with nothing pending.
+        case 375: {                                        // kevent_id
+            const uint64_t eventlist = cpu_.xr(3), nevents = cpu_.xr(4);
+            if (eventlist && nevents) {
+                uint8_t zero[64] = {};
+                mem_.write_bytes(eventlist, zero, sizeof zero);
+            }
+            r = 0;
+            break;
+        }
+        // __mac_syscall: the sandbox's own entry point.  Nothing here is
+        // sandboxed, and a policy query that fails is read as "not confined",
+        // which is the truth.
+        case 381: err = kBsdENOSYS; break;
+        // workq_kernreturn(options, item, affinity, prio).  Three operations
+        // matter.  REQTHREADS is libdispatch asking for workers - a request, not a
+        // call, so it is recorded and serviced when the scheduler next runs.
+        // THREAD_RETURN is a worker saying it has run out of work, which on Darwin
+        // parks the thread in the kernel; here the thread simply ends, and
+        // libdispatch will ask again when it has more.
+        case 368: {                                        // workq_kernreturn
+            constexpr uint64_t kWqOpsThreadReturn = 0x04, kWqOpsQueueReqthreads = 0x20,
+                               kWqOpsSetEventManagerPriority = 0x10,
+                               kWqOpsThreadReqthreads = 0x40;
+            switch (a0) {
+                case kWqOpsQueueReqthreads:
+                case kWqOpsThreadReqthreads: {
+                    // The count is in the low 16 bits of `affinity` for the queue
+                    // form; anything unreadable means "one".
+                    int want = static_cast<int>(static_cast<int32_t>(a2));
+                    if (want <= 0 || want > 64) want = 1;
+                    workq_requested_ += want;
+                    r = 0;
+                    break;
+                }
+                case kWqOpsThreadReturn:
+                    if (workq_live_ > 0) --workq_live_;
+                    thread_exit(0);
+                    return true;
+                case kWqOpsSetEventManagerPriority:
+                    r = 0;
+                    break;
+                default:
+                    r = 0;
+                    break;
+            }
+            break;
+        }
         case 360:                                          // bsdthread_create
             r = sys_bsdthread_create(a0, a1, a2, a3, cpu_.xr(4));
             if (r < 0) { err = kBsdEINVAL; r = 0; }

@@ -60,6 +60,11 @@ void Syscalls::switch_to(size_t idx) {
 // Round-robin from the one after the current, so a thread that yields does not
 // immediately get picked again. Returns false when nothing else can run.
 bool Syscalls::schedule(bool must_move) {
+    // Workers asked for since the last switch are started here, which is the one
+    // place that is both "the guest has stopped for a moment" and "a new thread
+    // would be picked up".  Starting them inside workq_kernreturn instead would
+    // add a thread to the list while the caller is mid-syscall.
+    service_workq_requests();
     if (threads_.size() < 2) return !must_move;
     const size_t n = threads_.size();
     for (size_t k = 1; k <= n; ++k) {
@@ -288,6 +293,89 @@ int64_t Syscalls::sys_psynch_cvsignal(uint64_t cv, bool broadcast) {
 // points at the TSD array *inside* the pthread structure, 0xE0 bytes past its base,
 // with the header fields at negative offsets. Getting that wrong is not a crash, it
 // is `errno` landing on top of something else.
+// ---------------------------------------------------------------------------
+// The pthread workqueue: where libdispatch's worker threads come from
+// ---------------------------------------------------------------------------
+//
+// libdispatch does not create threads.  It asks the kernel for them through
+// libpthread's workqueue, and the kernel makes one by allocating a stack, laying a
+// `struct _pthread` at the top of it, and entering `_pthread_wqthread` - the
+// second entry point `bsdthread_register` names.  That last part is the whole
+// reason this cannot be a flag on bsdthread_create: for an ordinary pthread,
+// *libpthread* allocates the stack and the struct and the kernel only jumps; for a
+// worker, the kernel owns both.
+//
+// The argument convention, which had to match libpthread's `_pthread_wqthread`
+// exactly:
+//
+//     x0  self         the struct _pthread the kernel laid down
+//     x1  kport        this thread's mach port
+//     x2  stackaddr    the *low* end of the allocation
+//     x3  keventlist   NULL: this is a plain worker, not a kevent one
+//     x4  flags        WQ_FLAG_THREAD_NEWSPI, plus the QoS class
+//     x5  nkevents     0, for the same reason as x3
+//
+// Getting x4 wrong is quiet: libpthread reads the QoS out of the low bits and
+// carries on with a nonsense priority.  Getting the TSD wrong is loud, and
+// usefully so - libpthread stops the process itself with "BUG IN CLIENT OF
+// LIBPTHREAD: Unable to allocate thread port" when tsd[3] is empty, which is the
+// same assertion bsdthread_create had to satisfy.
+bool Syscalls::spawn_workq_thread(bool overcommit) {
+    if (!wqthread_entry_) return false;
+    ensure_main_thread();
+
+    // The kernel's own stack allocation.  512 KiB is what Darwin gives a worker,
+    // and the struct _pthread goes at the top, where libpthread expects to find
+    // it - it computes the usable stack as everything below `self`.
+    constexpr uint64_t kStackSize = 512 * 1024;
+    const uint64_t pth = pthread_size_ ? ((pthread_size_ + 15) & ~15ull) : 0x1000;
+    const uint64_t low = static_cast<uint64_t>(
+        sys_mmap(0, kStackSize + pth, 3 /*RW*/, 0x1002 /*ANON|PRIVATE*/, -1, 0));
+    if (!low || low > 0xFFFF'FFFF'FFFF'0000ull) return false;
+    const uint64_t self = low + kStackSize;        // the struct, above the stack
+
+    Thread w;
+    w.tid = next_tid_++;
+    w.ctx = cpu_.save_context();
+    w.ctx.pc = wqthread_entry_;
+    w.ctx.sp = self;                               // grows down into the stack
+    w.ctx.tpidr_el0 = self + 0xE0;                 // the TSD array, as elsewhere
+    const uint64_t port = next_port_++;
+    mem_.write<uint64_t>(self + 0xE0, self);       // tsd[0]: pthread_self
+    mem_.write<uint64_t>(self + 0xF8, port);       // tsd[3]: the mach port
+
+    constexpr uint64_t kWqFlagNewSpi = 0x0001'0000;
+    constexpr uint64_t kWqFlagOvercommit = 0x0002'0000;
+    constexpr uint64_t kQosDefault = 4;            // QOS_CLASS_DEFAULT
+    w.ctx.x[0] = self;
+    w.ctx.x[1] = port;
+    w.ctx.x[2] = low;
+    w.ctx.x[3] = 0;
+    w.ctx.x[4] = kWqFlagNewSpi | (overcommit ? kWqFlagOvercommit : 0) | kQosDefault;
+    w.ctx.x[5] = 0;
+    w.ctx.x[30] = 0;                               // a worker never returns
+    threads_.push_back(w);
+    ++workq_live_;
+    if (trace)
+        std::fprintf(stderr, "[proc] workq worker tid %llu at %llX, stack %llX\n",
+                     static_cast<unsigned long long>(w.tid),
+                     static_cast<unsigned long long>(wqthread_entry_),
+                     static_cast<unsigned long long>(low));
+    return true;
+}
+
+void Syscalls::service_workq_requests() {
+    // A cap, because a request is a promise and libdispatch will happily ask for
+    // one per available core per queue.  Enough that a parallel phase makes
+    // progress, few enough that a runaway request loop stops.
+    constexpr int kMaxWorkers = 8;
+    while (workq_requested_ > 0 && workq_live_ < kMaxWorkers) {
+        --workq_requested_;
+        if (!spawn_workq_thread(false)) break;
+    }
+    if (workq_requested_ > 0 && workq_live_ >= kMaxWorkers) workq_requested_ = 0;
+}
+
 int64_t Syscalls::sys_bsdthread_create(uint64_t fn, uint64_t arg, uint64_t stack,
                                        uint64_t self, uint64_t flags) {
     if (!bsdthread_entry_) {

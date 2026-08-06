@@ -56,7 +56,8 @@ real macOS binary against Apple's own libraries; another runs Apple's own CPytho
 | **Pointer authentication** (arm64e): the PAC family, RETAA/BRAA/BLRAA | ✅ identity |
 | **Threads** — `clone`, `futex`, a scheduler, a real exclusive monitor | ✅ |
 | **WebAssembly** — the same guests, in a browser tab | ✅ |
-| A real macOS binary against libSystem | ⏳ 35,424 instructions in, at the ObjC runtime |
+| A real macOS binary against libSystem | ✅ |
+| **Apple's clang and ld, hosted on Windows or Linux** — `.c` → signed arm64 Mach-O | ✅ [how to set it up](docs/macos-toolchain.md) |
 
 ## Correctness is a diff, not an opinion
 
@@ -211,6 +212,33 @@ that line out.
 Nothing Apple ships is included: `prebuilt/` is the 48 libraries a hello world needs,
 extracted from a Mac's cache by `tools/dsc_extract.c`. What is *emulated* is everything
 between them and the kernel.
+
+## Building macOS binaries, on a machine that is not a Mac
+
+Apple's own clang and `ld` run here as guests, which makes this a
+Windows- and Linux-hosted macOS cross-compiler:
+
+```console
+$ ./aarch64emu --dyld-sections --root guests/macos_clang guests/macos_clang/hello
+hello from emulated clang
+```
+
+That `hello` is a signed, PIE arm64 Mach-O with `LC_MAIN` and chained fixups,
+compiled by Apple's clang and linked by Apple's `ld` — the same binaries a Mac
+runs, executing the same instructions, with no cross-toolchain anywhere. It runs
+on a Mac too.
+
+Getting there takes one trip to a Mac, because Apple's compiler is not
+redistributable and cannot ship here. The system libraries it loads at run time
+*are* in this repository, so that trip only has to fetch the toolchain itself.
+**[docs/macos-toolchain.md](docs/macos-toolchain.md)** is the full guide: what to
+run on the Mac, how to assemble the guest tree, the four placement details that
+each cost an afternoon, and how to read the guest when something goes wrong.
+
+Linking a hello world is about 190 million emulated instructions — a few minutes,
+nearly all of it `ld` and libdispatch starting up. `sh tests/run_macos_clang.sh`
+checks the compile, the link and the run separately, and skips itself when the
+guest tree is absent.
 
 ## Building
 

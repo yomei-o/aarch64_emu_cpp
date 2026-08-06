@@ -217,6 +217,29 @@ void Cpu::step() {
         }
     }
 
+    // A64EMU_SAMPLE=<n> prints the pc every n million instructions. A guest that
+    // has stopped making progress usually has not stopped *running* -- it is in a
+    // loop -- and the range trace above is the wrong tool for that: it needs to be
+    // told where to look, which is the question. Repeated samples answer it in a
+    // few lines, and the frame pointer names the caller so the loop can be found
+    // without a symbol server.
+    {
+        struct Sampler {
+            uint64_t every = 0;
+            Sampler() {
+                if (const char* s = std::getenv("A64EMU_SAMPLE"))
+                    every = std::strtoull(s, nullptr, 10) * 1000000ull;
+            }
+        };
+        static Sampler sp;
+        if (sp.every && insns % sp.every == 0)
+            std::fprintf(stderr, "[sample] %llu M insns, pc %012llX lr %012llX fp %012llX\n",
+                         static_cast<unsigned long long>(insns / 1000000ull),
+                         static_cast<unsigned long long>(pc),
+                         static_cast<unsigned long long>(xr(30)),
+                         static_cast<unsigned long long>(xr(29)));
+    }
+
     cur_pc_ = pc;
     const uint32_t insn = mem_.read<uint32_t>(pc);
     pc += 4;

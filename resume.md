@@ -259,6 +259,68 @@ Three bugs stood between "spawns cc1" and this, all worth remembering:
   zero-compare opcode table was wrong -- opcode 8 is CMGT/CMGE, 9 is CMEQ/CMLE,
   A is CMLT; the old table answered different questions than were asked.
 
+### Read this first (2026-08-06, end of the session)
+
+Two things from the last hour change what you think you know.
+
+**1. It is not slow. `ld` links in 18.8 seconds.** Every "this takes a few minutes"
+in this file and in the docs was wrong, and the cause is embarrassing: the
+emulator printed a line to stderr for every call to an unimplemented dyld API
+slot, and one `clang hello.c` wrote **five gigabytes** of them. The writing *was*
+the runtime. Measured on this machine, with that suppressed:
+
+    clang -c   7.8s   peak RSS 2,571 MB
+    ld        18.8s   peak RSS 1,121 MB
+
+Those are real numbers from `Start-Process` + `PeakWorkingSet64`, not
+impressions. The suppression is in `darwin.cpp`: the first three calls per slot
+print, the rest are counted and reported in one line at exit, so nothing goes
+silent. **README.md and docs/macos-toolchain.md still say "a few minutes" and
+"about 190 million instructions" as if that were slow - fix them to the numbers
+above.**
+
+**2. The one-shot `clang hello.c -o hello` does not work.** The two stages driven
+separately do (`tests/run_macos_clang.sh`, 3/3); the driver form, where clang
+spawns the linker itself, goes into **infinite recursion in libunwind** and dies
+of `std::bad_alloc` after ~25 minutes of climbing memory. This was written up in
+docs/macos-toolchain.md as merely "not covered by the test suite" *before it had
+ever been run once* - which was not honest, and the doc needs correcting to say
+it is broken.
+
+The evidence, all of it pointing the same way:
+
+- Host memory climbs **perfectly linearly, +31 MB every 5 seconds**, never
+  plateauing. A working set does not do that.
+- `A64EMU_SAMPLE=200` shows the frame pointer descending monotonically, about
+  24 MB per 200M instructions: `fp 7FFFFE68F7F0` at 200M, `7FFFDF1FC030` at
+  4000M. It is recursion, and the stack is the leak.
+- **No `[proc] spawn` line is ever printed.** It never reaches the point of
+  starting `clang -cc1`, let alone `ld`. Whatever goes wrong is in the driver
+  planning a *link* job, since `-c` on the same input is fine.
+- The pcs land in libunwind: `/usr/lib/system/libunwind.dylib`, whose `__text`
+  starts at 0x18E697438, and the samples are all 0x18E69xxxx and 0x1804xxxxx.
+
+**The hypothesis to test first**, because it is cheap and it fits: the three most
+called unimplemented dyld API slots are **85 (x1680), 97 (x363), 86 (x242)** -
+and those are the ones libunwind uses to find a function's unwind info. They
+return 0, which reads as "no unwind section here". A libunwind that cannot find
+an FDE and retries is exactly a monotonic recursion. `tools/dyld_slots.py` names
+slots; start by naming those three and implementing them.
+
+**New diagnostics, all of them earned this session and worth keeping:**
+
+    A64EMU_SAMPLE=<n>     pc, lr and fp every n million instructions.  This is
+                          the tool that cracked the above: a guest that has
+                          stopped progressing has usually not stopped running,
+                          and A64EMU_TRACE_RANGE cannot help because it needs to
+                          be told where to look, which is the question.
+    [proc] spawn(<depth>) one line per child process, always on, with the guest
+                          pages it cost on the way out.
+    [stall]               every thread's pc and stack when all of them block.
+
+**Uncommitted at reboot:** nothing, if the commit below landed. If `git status`
+is dirty, the changes are the three diagnostics above.
+
 ### Apple clang and ld: the whole chain works (2026-08-06)
 
     sh tests/run_macos_clang.sh

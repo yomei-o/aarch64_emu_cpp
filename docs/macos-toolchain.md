@@ -168,17 +168,17 @@ The result is a signed, PIE arm64 Mach-O with `LC_MAIN` and chained fixups —
 `llvm-objdump --macho --all-headers` on it looks exactly like a Mac's output, and
 it will run on a Mac.
 
-Driving the two stages separately is what has been tested. The driver's own
-`clang hello.c -o hello`, where clang `posix_spawn`s `ld` itself, goes through a
-code path the emulator does implement (syscall 244, with its file actions) but
-which is not covered by the test suite.
+**Drive the two stages separately. The driver's own one-shot
+`clang hello.c -o hello` does not work yet** - it goes into infinite recursion
+inside libunwind before it starts any child process, and eventually exhausts
+host memory. `resume.md` has the diagnosis. `-c` and `ld` are unaffected.
 
 ### Two things to expect
 
-- **It is not fast.** Linking a hello world is about 190 million emulated
-  instructions, a few minutes. Almost all of it is `ld` and libdispatch starting
-  up, so it is close to a fixed cost rather than one that scales with your
-  program.
+- **About half a minute, most of it fixed cost.** Measured on an 8 GB Windows
+  host: `clang -c` 7.8s and 2.6 GB peak, `ld` 18.8s and 1.1 GB peak. Nearly all
+  of `ld`'s time is libdispatch and the loader starting up, so a bigger program
+  costs little more than a hello world.
 - **`--dyld-sections` is not optional.** Without it libobjc never reads the
   shared cache's preoptimized class tables and libxpc fails its own type check
   long before clang starts.

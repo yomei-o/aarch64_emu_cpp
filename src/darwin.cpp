@@ -21,6 +21,7 @@
 #include "syscalls.h"
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -821,16 +822,47 @@ int64_t Syscalls::dyld_api_stub(uint32_t slot) {
             // arguments start one along. Printing them is what identifies a slot whose name
             // `tools/dyld_slots.py` did not find — an unnamed slot handed an address is a
             // different question from one handed nothing.
-            std::fprintf(stderr,
-                         "[mac] dyld API vtable slot %u (+0x%X) is not implemented, "
-                         "returning 0; called from %012llX "
-                         "(x1=%llX x2=%llX x3=%llX x4=%llX x5=%llX)\n",
-                         slot, slot * 8, static_cast<unsigned long long>(cpu_.xr(30)),
-                         static_cast<unsigned long long>(cpu_.xr(1)),
-                         static_cast<unsigned long long>(cpu_.xr(2)),
-                         static_cast<unsigned long long>(cpu_.xr(3)),
-                         static_cast<unsigned long long>(cpu_.xr(4)),
-                         static_cast<unsigned long long>(cpu_.xr(5)));
+            //
+            // A few per slot, not all of them. These are called from inside loops:
+            // one `clang hello.c` wrote five gigabytes of this to stderr, which is
+            // slower than the emulation and drowns the one line that matters. The
+            // first few still show the varying arguments the comment above is about,
+            // and the count is reported at exit so a suppressed slot is never a
+            // silent one. The counter is deliberately shared across guest processes -
+            // a compiler driver and the linker it spawns hit the same slots.
+            {
+                constexpr unsigned kShow = 3;
+                // Ordered, and summarised on the way out by its own destructor, so the
+                // tail of a run says how much was hidden and in what proportion.
+                struct SlotCounts : std::map<uint32_t, unsigned long> {
+                    ~SlotCounts() {
+                        unsigned long hidden = 0;
+                        for (const auto& kv : *this)
+                            if (kv.second > kShow) hidden += kv.second - kShow;
+                        if (!hidden) return;
+                        std::fprintf(stderr,
+                                     "[mac] %lu further calls to %zu unimplemented dyld API "
+                                     "slot(s) were not printed:", hidden, size());
+                        for (const auto& kv : *this)
+                            std::fprintf(stderr, " %u(x%lu)", kv.first, kv.second);
+                        std::fprintf(stderr, "\n");
+                    }
+                };
+                static SlotCounts seen;
+                const unsigned long n = ++seen[slot];
+                if (n <= kShow)
+                    std::fprintf(stderr,
+                                 "[mac] dyld API vtable slot %u (+0x%X) is not implemented, "
+                                 "returning 0; called from %012llX "
+                                 "(x1=%llX x2=%llX x3=%llX x4=%llX x5=%llX)%s\n",
+                                 slot, slot * 8, static_cast<unsigned long long>(cpu_.xr(30)),
+                                 static_cast<unsigned long long>(cpu_.xr(1)),
+                                 static_cast<unsigned long long>(cpu_.xr(2)),
+                                 static_cast<unsigned long long>(cpu_.xr(3)),
+                                 static_cast<unsigned long long>(cpu_.xr(4)),
+                                 static_cast<unsigned long long>(cpu_.xr(5)),
+                                 n == kShow ? "  [further calls to this slot are silent]" : "");
+            }
             return 0;
     }
 }

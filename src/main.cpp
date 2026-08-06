@@ -358,6 +358,13 @@ int main(int argc, char** argv) {
         const std::vector<uint8_t> cfile = read_file(host.c_str());
         if (cfile.empty()) return -1;
 
+        // One line per child, always -- not behind --trace-sys. A compiler driver's
+        // process tree is the first thing to check when a build behaves oddly, and
+        // "how many times was the linker started?" should not need a rebuild to
+        // answer. The page count on the way out says what the child cost, so a run
+        // whose memory climbs can be attributed to a guest rather than guessed at.
+        std::fprintf(stderr, "[proc] spawn(%d) %s\n", spawn_depth + 1, prog.c_str());
+
         Memory cmem;
         Cpu ccpu(cmem);
         Syscalls csys(ccpu, cmem);
@@ -420,6 +427,10 @@ int main(int argc, char** argv) {
             cstatus = 127;
         }
         --spawn_depth;
+        std::fprintf(stderr, "[proc] spawn(%d) %s exited %d, %llu MB of guest pages\n",
+                     spawn_depth + 1, prog.c_str(), cstatus,
+                     static_cast<unsigned long long>(cmem.mapped_pages() *
+                                                     Memory::kPageSize / (1024 * 1024)));
         // The parent's descriptor table gets the child's back: the child may have
         // written into a pipe, and the buffer lives in the entry.
         parent_files = csys.files;

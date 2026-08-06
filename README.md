@@ -235,10 +235,10 @@ redistributable and cannot ship here. The system libraries it loads at run time
 run on the Mac, how to assemble the guest tree, the four placement details that
 each cost an afternoon, and how to read the guest when something goes wrong.
 
-Linking a hello world is about 190 million emulated instructions — a few minutes,
-nearly all of it `ld` and libdispatch starting up. `sh tests/run_macos_clang.sh`
-checks the compile, the link and the run separately, and skips itself when the
-guest tree is absent.
+Compiling takes 7.8 seconds and linking 18.8 on an 8 GB Windows host — nearly all
+of the latter is libdispatch and the loader starting up, so a bigger program costs
+little more. `sh tests/run_macos_clang.sh` checks the compile, the link and the run
+separately, and skips itself when the guest tree is absent.
 
 ## Building
 

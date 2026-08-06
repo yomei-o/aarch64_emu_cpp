@@ -206,8 +206,21 @@ private:
     // expects them to appear later, so a request is a promise, not a call.
     int workq_requested_ = 0;
     int workq_live_ = 0;
-    // Creates one workqueue worker, or returns false if it cannot.
-    bool spawn_workq_thread(bool overcommit);
+    // A workloop that has asked for a worker.  libdispatch requests threads for a
+    // concurrent queue through kevent_id rather than workq_kernreturn, so this is
+    // the path a linker actually takes.  Held by id so that re-registering the
+    // same workloop while its worker is still running does not stack up threads.
+    struct WorkloopRequest {
+        uint64_t id = 0;
+        uint8_t event[64] = {};      // the kevent_qos_s to hand the worker
+    };
+    std::vector<WorkloopRequest> workloop_pending_;
+    std::vector<uint64_t> workloop_live_;
+    // Creates one workqueue worker, or returns false if it cannot.  `event` is
+    // null for a plain worker and points at a 64-byte kevent_qos_s for a workloop
+    // one, which is a different entry convention rather than a different flag.
+    bool spawn_workq_thread(bool overcommit, uint64_t workloop_id = 0,
+                            const uint8_t* event = nullptr);
     // Starts any workers that have been asked for.  Called where the guest has
     // just given the scheduler a chance to run something else.
     void service_workq_requests();

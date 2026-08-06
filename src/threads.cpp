@@ -320,7 +320,8 @@ int64_t Syscalls::sys_psynch_cvsignal(uint64_t cv, bool broadcast) {
 // usefully so - libpthread stops the process itself with "BUG IN CLIENT OF
 // LIBPTHREAD: Unable to allocate thread port" when tsd[3] is empty, which is the
 // same assertion bsdthread_create had to satisfy.
-bool Syscalls::spawn_workq_thread(bool overcommit) {
+bool Syscalls::spawn_workq_thread(bool overcommit, uint64_t workloop_id,
+                                  const uint8_t* event) {
     if (!wqthread_entry_) return false;
     ensure_main_thread();
 
@@ -344,15 +345,48 @@ bool Syscalls::spawn_workq_thread(bool overcommit) {
     mem_.write<uint64_t>(self + 0xE0, self);       // tsd[0]: pthread_self
     mem_.write<uint64_t>(self + 0xF8, port);       // tsd[3]: the mach port
 
-    constexpr uint64_t kWqFlagNewSpi = 0x0001'0000;
-    constexpr uint64_t kWqFlagOvercommit = 0x0002'0000;
+    // The flag bits, read out of `_pthread_wqthread` rather than guessed: it
+    // branches on bit 22 for the workloop entry, bit 19 for the kevent one, and
+    // falls through to the plain worker.  Bit 17 means "this thread is being
+    // reused" and *skips* _pthread_wqthread_setup, so a fresh thread must not
+    // carry it; bit 16 becomes the overcommit bit of the priority word.
+    constexpr uint64_t kWqFlagOvercommit = 0x0001'0000;
+    // Bit 21 is this path's "the kernel set the thread pointer" acknowledgement -
+    // the workqueue's equivalent of PTHREAD_START_TSD_BASE_SET, and a different
+    // bit from the 0x1000'0000 bsdthread_create uses.  _pthread_wqthread_setup
+    // tests it (`tbz w3, #0x15`) and stops the process with "BUG IN LIBPTHREAD:
+    // thread_set_tsd_base() wasn't called by the kernel" when it is clear, which
+    // is again a status bit rather than anything wrong with the pointer itself.
+    constexpr uint64_t kWqFlagTsdBaseSet = 0x0020'0000;
+    // ...and bit 15 says the low byte carries a QoS class.  Without either this
+    // or bit 14, _pthread_wqthread stops with "BUG IN LIBPTHREAD: Missing
+    // priority": the priority word is assembled from these bits, and a worker
+    // that arrives without one is a kernel that did not say what it wanted run.
+    constexpr uint64_t kWqFlagHasQos = 0x0000'8000;
+    constexpr uint64_t kWqFlagWorkloop  = 0x0040'0000;
     constexpr uint64_t kQosDefault = 4;            // QOS_CLASS_DEFAULT
     w.ctx.x[0] = self;
     w.ctx.x[1] = port;
     w.ctx.x[2] = low;
     w.ctx.x[3] = 0;
-    w.ctx.x[4] = kWqFlagNewSpi | (overcommit ? kWqFlagOvercommit : 0) | kQosDefault;
+    w.ctx.x[4] = kWqFlagTsdBaseSet | kWqFlagHasQos |
+                 (overcommit ? kWqFlagOvercommit : 0) | kQosDefault;
     w.ctx.x[5] = 0;
+
+    if (event) {
+        // A workloop worker is handed its events, and the workloop's own id sits
+        // *eight bytes in front of them*: libpthread computes the argument it
+        // passes on as `keventlist - 8`.  So the two are laid out together, once,
+        // in guest memory the worker owns.
+        const uint64_t block = static_cast<uint64_t>(
+            sys_mmap(0, 4096, 3 /*RW*/, 0x1002 /*ANON|PRIVATE*/, -1, 0));
+        if (!block || block > 0xFFFF'FFFF'FFFF'0000ull) return false;
+        mem_.write<uint64_t>(block, workloop_id);
+        mem_.write_bytes(block + 8, event, 64);
+        w.ctx.x[3] = block + 8;
+        w.ctx.x[4] |= kWqFlagWorkloop;
+        w.ctx.x[5] = 1;
+    }
     w.ctx.x[30] = 0;                               // a worker never returns
     threads_.push_back(w);
     ++workq_live_;
@@ -374,6 +408,13 @@ void Syscalls::service_workq_requests() {
         if (!spawn_workq_thread(false)) break;
     }
     if (workq_requested_ > 0 && workq_live_ >= kMaxWorkers) workq_requested_ = 0;
+
+    while (!workloop_pending_.empty() && workq_live_ < kMaxWorkers) {
+        const WorkloopRequest req = workloop_pending_.front();
+        workloop_pending_.erase(workloop_pending_.begin());
+        if (!spawn_workq_thread(false, req.id, req.event)) break;
+        workloop_live_.push_back(req.id);
+    }
 }
 
 int64_t Syscalls::sys_bsdthread_create(uint64_t fn, uint64_t arg, uint64_t stack,

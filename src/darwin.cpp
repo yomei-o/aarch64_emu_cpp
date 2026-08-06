@@ -1638,14 +1638,14 @@ bool Syscalls::svc_darwin() {
             bsdthread_entry_ = a0;
             wqthread_entry_ = a1;
             pthread_size_ = a2;
+            // WORKLOOP has to be advertised because libdispatch uses workloops
+            // whether or not it is: a concurrent queue with its own target becomes
+            // one, and the thread request arrives through kevent_id.  What the bit
+            // actually decides is whether libdispatch *registers* its workloop
+            // worker function with libpthread - without it the pointer stays null
+            // and the first worker jumps to address zero.
             r = kQosDefault | kQosMaintenance | kSetSelf | kBsdThreadCtl | kFinePrio |
-                kDispatchFunc | kKevent;
-            // WORKLOOP is deliberately *not* advertised.  A workloop worker arrives
-            // through kevent_id_qos with a whole event list to service, which is a
-            // second protocol; claiming it and then not delivering would be the
-            // quiet kind of wrong.  Without the bit libdispatch uses the plain
-            // workqueue, which is the one below.
-            (void)kWorkloop;
+                kDispatchFunc | kKevent | kWorkloop;
             break;
         }
         // workq_open(): the workqueue exists as soon as it is asked for.
@@ -1687,6 +1687,44 @@ bool Syscalls::svc_darwin() {
         // zero is a registration with nothing pending.
         case 375: {                                        // kevent_id
             const uint64_t eventlist = cpu_.xr(3), nevents = cpu_.xr(4);
+            // EVFILT_WORKLOOP with NOTE_WL_THREAD_REQUEST is libdispatch asking
+            // for a worker.  This - not WQOPS_QUEUE_REQTHREADS - is how a
+            // concurrent queue gets its threads, which is why the workq_kernreturn
+            // request path is never taken by a linker.
+            constexpr int16_t kEvfiltWorkloop = -17;
+            constexpr uint32_t kNoteWlThreadRequest = 0x1;
+            constexpr uint16_t kEvDelete = 0x0002;
+            for (uint64_t k = 0; k < a2 && k < 16; ++k) {
+                const uint64_t e = a1 + k * 64;
+                if (mem_.read<int16_t>(e + 8) != kEvfiltWorkloop) continue;
+                if (!(mem_.read<uint32_t>(e + 24) & kNoteWlThreadRequest)) continue;
+                const uint64_t id = mem_.read<uint64_t>(e);
+                if (mem_.read<uint16_t>(e + 10) & kEvDelete) continue;
+                // One worker per workloop at a time: re-registering while its
+                // worker still runs is an update, not a second request.
+                bool known = false;
+                for (uint64_t live : workloop_live_) if (live == id) known = true;
+                for (const auto& q : workloop_pending_) if (q.id == id) known = true;
+                if (known) continue;
+                WorkloopRequest req;
+                req.id = id;
+                mem_.read_bytes(e, req.event, 64);
+                workloop_pending_.push_back(req);
+            }
+            if (trace && a1 && a2) {
+                for (uint64_t k = 0; k < a2 && k < 4; ++k) {
+                    const uint64_t e = a1 + k * 64;
+                    std::fprintf(stderr,
+                        "[mac]   kevent_id change: ident=%llX filter=%d flags=%04X "
+                        "qos=%X udata=%llX fflags=%08X data=%llX\n",
+                        (unsigned long long)mem_.read<uint64_t>(e),
+                        static_cast<int>(mem_.read<int16_t>(e + 8)),
+                        mem_.read<uint16_t>(e + 10), mem_.read<uint32_t>(e + 12),
+                        (unsigned long long)mem_.read<uint64_t>(e + 16),
+                        mem_.read<uint32_t>(e + 24),
+                        (unsigned long long)mem_.read<uint64_t>(e + 32));
+                }
+            }
             if (eventlist && nevents) {
                 uint8_t zero[64] = {};
                 mem_.write_bytes(eventlist, zero, sizeof zero);
@@ -1707,10 +1745,10 @@ bool Syscalls::svc_darwin() {
         case 368: {                                        // workq_kernreturn
             constexpr uint64_t kWqOpsThreadReturn = 0x04, kWqOpsQueueReqthreads = 0x20,
                                kWqOpsSetEventManagerPriority = 0x10,
-                               kWqOpsThreadReqthreads = 0x40;
+                               kWqOpsThreadKeventReturn = 0x40,
+                               kWqOpsThreadWorkloopReturn = 0x100;
             switch (a0) {
-                case kWqOpsQueueReqthreads:
-                case kWqOpsThreadReqthreads: {
+                case kWqOpsQueueReqthreads: {
                     // The count is in the low 16 bits of `affinity` for the queue
                     // form; anything unreadable means "one".
                     int want = static_cast<int>(static_cast<int32_t>(a2));
@@ -1720,7 +1758,20 @@ bool Syscalls::svc_darwin() {
                     break;
                 }
                 case kWqOpsThreadReturn:
+                case kWqOpsThreadWorkloopReturn:
+                case kWqOpsThreadKeventReturn:
+                    // A worker saying it has run out of work.  On Darwin the
+                    // kernel parks the thread and may hand it back later; here it
+                    // simply ends, and libdispatch asks again when it has more.
+                    // Returning to the caller is not an option - libpthread stops
+                    // the process with "__workq_kernreturn returned", because on a
+                    // real kernel this call never comes back.
                     if (workq_live_ > 0) --workq_live_;
+                    for (size_t k = 0; k < workloop_live_.size(); ++k) {
+                        // The workloop is free to be requested again.
+                        workloop_live_.erase(workloop_live_.begin() + k);
+                        break;
+                    }
                     thread_exit(0);
                     return true;
                 case kWqOpsSetEventManagerPriority:

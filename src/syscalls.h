@@ -75,6 +75,12 @@ public:
     // address" API. A flat list scanned linearly: there are a few hundred of them and it is
     // asked a handful of times.
     void set_image_segs(std::vector<LoadedImage::ImageSeg> segs) { image_segs_ = std::move(segs); }
+    // Prints why the guest trapped, if it left a reason.  Apple's fatal paths -
+    // os_crash, __abort_with_reason, libc's __chk failures, libdispatch's
+    // DISPATCH_CLIENT_CRASH - write a message into their image's
+    // `__DATA,__crash_info` and then execute BRK, so the trap on its own is the
+    // report with the interesting half removed.  Wired to Cpu::on_brk.
+    void report_crash_info();
     // Darwin thread-local storage. Fills in every `tlv_descriptor`'s thunk, which is
     // dyld's job and without which the first reference to a `_Thread_local` calls
     // through a null pointer -- or, in libsystem_c's case, aborts with "thread locals

@@ -46,3 +46,9 @@ tests/dylib/cerr3
 /glibcroot/
 /ours_ld.bin
 /qemu_ld_off.seq
+
+# The Mac-side packaging output.  guests/ is already ignored; these are the
+# tarballs the share carries, and they are hundreds of megabytes of Apple's code.
+macos_clang.tar.gz
+clang_dylibs.tar.gz
+clang_cache_libs.tar.gz

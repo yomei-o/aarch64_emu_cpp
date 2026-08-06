@@ -216,6 +216,7 @@ int main(int argc, char** argv) {
     // An instruction we do not implement is delivered to the guest as SIGILL when it
     // has a handler. OpenSSL's CPU probes depend on exactly that.
     cpu.on_undefined = [&sys](uint32_t, uint64_t at) { return sys.deliver_signal(4, at); };
+    cpu.on_brk = [&sys] { sys.report_crash_info(); };
 
     // Where a PIE and the dynamic loader go. Linux picks addresses like these;
     // nothing depends on the exact values, only that the two do not overlap each
@@ -366,6 +367,7 @@ int main(int argc, char** argv) {
         csys.files.set_root(root);
         csys.spawn = sys.spawn;               // a child may spawn in turn
         ccpu.on_undefined = [&csys](uint32_t, uint64_t at) { return csys.deliver_signal(4, at); };
+        ccpu.on_brk = [&csys] { csys.report_crash_info(); };
 
         LoadedImage cimg;
         std::string cerr_s;

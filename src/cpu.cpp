@@ -386,6 +386,7 @@ void Cpu::exec_branch(uint32_t insn) {
             return;
         }
         if (ll == 0 && ((insn >> 21) & 7) == 1) {                     // BRK
+            if (on_brk) on_brk();
             fail("guest executed BRK", insn);
         }
         fail("unimplemented exception instruction", insn);

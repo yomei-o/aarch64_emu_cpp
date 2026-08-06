@@ -223,6 +223,42 @@ uint64_t Syscalls::image_path_addr(uint64_t header) {
 // the slot up in a table of answers. An unknown slot prints its own index and returns
 // zero, which is how the next one gets identified -- the same bargain the MIG routines
 // make, and the reason neither needs guessing at in advance.
+// `crashreporter_annotations_t`, the struct every Apple library keeps in its own
+// `__DATA,__crash_info` section:
+//
+//     uint64 version; char* message; char* signature; char* backtrace;
+//     char* message2; uint64 reserved[2];
+//
+// A fatal path fills `message` in and traps, expecting the crash reporter to read
+// it out of the core file.  There is no crash reporter here, so this is it: walk
+// every loaded image and print whatever any of them left behind.  Without it an
+// abort inside libdispatch or libsystem_c is a bare BRK several frames from the
+// cause, which is exactly the shape that costs a morning.
+void Syscalls::report_crash_info() {
+    bool any = false;
+    for (size_t i = 0; i < objc_image_headers_.size(); ++i) {
+        const uint64_t mh = objc_image_headers_[i];
+        uint64_t sect = 0, size = 0;
+        if (!guest_find_section(mem_, mh, "__crash_info", &sect, &size)) continue;
+        if (size < 24) continue;
+        const char* kField[] = {"message", "signature", "backtrace", "message2"};
+        for (int f = 0; f < 4; ++f) {
+            const uint64_t at = sect + 8 + static_cast<uint64_t>(f) * 8;
+            if (at + 8 > sect + size) break;
+            const uint64_t p = mem_.read<uint64_t>(at);
+            if (!p) continue;
+            const std::string text = mem_.read_cstr(p);
+            if (text.empty()) continue;
+            const std::string who = i < objc_image_paths_.size() ? objc_image_paths_[i] : "?";
+            std::fprintf(stderr, "[mac] crash %s: %s = %s\n", who.c_str(), kField[f],
+                         text.c_str());
+            any = true;
+        }
+    }
+    if (!any)
+        std::fprintf(stderr, "[mac] no __crash_info message; the trap left no reason\n");
+}
+
 void Syscalls::setup_dyld_apis(uint64_t gapis_addr) {
     if (!gapis_addr) return;
     // Declare the region first. Nothing maps it -- it is invented by the host, not part of
@@ -1872,7 +1908,36 @@ bool Syscalls::svc_darwin() {
             break;
         }
         case 294: err = kBsdEINVAL; break;                 // shared_region_check_np: no cache
-        case 336: err = kBsdEINVAL; break;                 // proc_info
+        // proc_info(callnum, pid, flavor, arg, buffer, buffersize), the syscall
+        // behind proc_pidinfo(3).  libdispatch asks for PROC_PIDUNIQIDENTIFIERINFO
+        // during its own initialisation and treats anything but a full-sized
+        // answer as fatal - "BUG IN LIBDISPATCH: Unable to get the unique pid",
+        // written into __crash_info and then BRK.  Since libdispatch initialises
+        // inside anything that links it, refusing this is refusing the process.
+        //
+        // The identifier only has to be *stable and distinct*, which is what
+        // "unique" means here: it is what dispatch uses to tell one process from
+        // another across a fork.  The pid serves.
+        case 336: {                                        // proc_info
+            constexpr uint32_t kCallPidInfo = 2, kPidUniqIdentifierInfo = 17;
+            constexpr uint64_t kUniqInfoSize = 56;
+            const uint64_t buffer = cpu_.xr(4), bufsize = cpu_.xr(5);
+            if (a0 == kCallPidInfo && a2 == kPidUniqIdentifierInfo && buffer &&
+                bufsize >= kUniqInfoSize) {
+                uint8_t info[kUniqInfoSize];
+                std::memset(info, 0, sizeof info);
+                const uint64_t pid = 1000;                 // the same pid getpid answers
+                std::memcpy(info + 0, &pid, 8);            // p_uuid, first half
+                std::memcpy(info + 16, &pid, 8);           // p_uniqueid
+                const int32_t idversion = 1;
+                std::memcpy(info + 32, &idversion, 4);     // p_idversion
+                mem_.write_bytes(buffer, info, sizeof info);
+                r = static_cast<int64_t>(kUniqInfoSize);
+            } else {
+                err = kBsdEINVAL;
+            }
+            break;
+        }
         // The code-signing status of a process, which libSystem consults before it
         // decides whether library validation, the debugger interfaces or the hardened
         // runtime apply. CS_OPS_STATUS is the only query it needs an answer to; the blob

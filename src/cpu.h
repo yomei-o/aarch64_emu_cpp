@@ -88,6 +88,10 @@ public:
     // not a workaround but the architecturally correct answer for a CPU that does
     // not have the instruction. Returning false lets the emulator stop and print it.
     std::function<bool(uint32_t insn, uint64_t pc)> on_undefined;
+    // Called just before a BRK is reported, so the OS personality can say *why*.
+    // Apple's aborts write their reason into a `__DATA,__crash_info` section and
+    // then trap, so the trap alone is the report with the message torn off.
+    std::function<void()> on_brk;
 
     // Lane accessors on a V128, shared by the interpreter and the SIMD file.
     static uint64_t get_vlane(const V128& v, unsigned esize, unsigned idx) {

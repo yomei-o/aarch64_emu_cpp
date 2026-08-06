@@ -59,6 +59,44 @@ void Syscalls::switch_to(size_t idx) {
 
 // Round-robin from the one after the current, so a thread that yields does not
 // immediately get picked again. Returns false when nothing else can run.
+void Syscalls::report_threads(const char* why) {
+    std::fprintf(stderr, "[stall] %s; %zu thread(s):\n", why, threads_.size());
+    for (size_t i = 0; i < threads_.size(); ++i) {
+        const Thread& t = threads_[i];
+        const uint64_t pc = (i == cur_thread_) ? cpu_.pc : t.ctx.pc;
+        std::fprintf(stderr,
+                     "[stall]   tid %llu%s pc %012llX%s%s%s wait %012llX\n",
+                     static_cast<unsigned long long>(t.tid),
+                     i == cur_thread_ ? " (running)" : "",
+                     static_cast<unsigned long long>(pc),
+                     t.exited ? " exited" : "",
+                     t.parked ? " parked" : (t.waiting ? " blocked" : " runnable"),
+                     t.is_worker ? " worker" : "",
+                     static_cast<unsigned long long>(t.wait_addr));
+        // For an unfair lock the word *is* the owner's thread port, so printing it
+        // turns "blocked on an address" into "waiting for that thread".
+        if (t.wait_addr)
+            std::fprintf(stderr, "[stall]     lock word = %08X\n",
+                         mem_.read<uint32_t>(t.wait_addr));
+        // A few return addresses, so a thread is identified by what it is doing
+        // rather than by the one frame it happens to be stopped in.
+        uint64_t fp = (i == cur_thread_) ? cpu_.xr(29) : t.ctx.x[29];
+        const uint64_t lr = (i == cur_thread_) ? cpu_.xr(30) : t.ctx.x[30];
+        if (lr)
+            std::fprintf(stderr, "[stall]     %012llX (lr)\n",
+                         static_cast<unsigned long long>(lr));
+        for (int depth = 0; depth < 8 && fp > 0x1000; ++depth) {
+            const uint64_t next = mem_.read<uint64_t>(fp);
+            const uint64_t ret = mem_.read<uint64_t>(fp + 8);
+            if (!ret) break;
+            std::fprintf(stderr, "[stall]     %012llX\n",
+                         static_cast<unsigned long long>(ret));
+            if (next <= fp) break;
+            fp = next;
+        }
+    }
+}
+
 bool Syscalls::schedule(bool must_move) {
     // Workers asked for since the last switch are started here, which is the one
     // place that is both "the guest has stopped for a moment" and "a new thread
@@ -321,7 +359,7 @@ int64_t Syscalls::sys_psynch_cvsignal(uint64_t cv, bool broadcast) {
 // LIBPTHREAD: Unable to allocate thread port" when tsd[3] is empty, which is the
 // same assertion bsdthread_create had to satisfy.
 bool Syscalls::spawn_workq_thread(bool overcommit, uint64_t workloop_id,
-                                  const uint8_t* event) {
+                                  const uint8_t* event, uint64_t prio) {
     if (!wqthread_entry_) return false;
     ensure_main_thread();
 
@@ -338,57 +376,14 @@ bool Syscalls::spawn_workq_thread(bool overcommit, uint64_t workloop_id,
     Thread w;
     w.tid = next_tid_++;
     w.ctx = cpu_.save_context();
-    w.ctx.pc = wqthread_entry_;
-    w.ctx.sp = self;                               // grows down into the stack
-    w.ctx.tpidr_el0 = self + 0xE0;                 // the TSD array, as elsewhere
-    const uint64_t port = next_port_++;
+    w.is_worker = true;
+    w.wq_self = self;
+    w.wq_stack = low;
+    w.wq_port = next_port_++;
+    (void)overcommit;
     mem_.write<uint64_t>(self + 0xE0, self);       // tsd[0]: pthread_self
-    mem_.write<uint64_t>(self + 0xF8, port);       // tsd[3]: the mach port
-
-    // The flag bits, read out of `_pthread_wqthread` rather than guessed: it
-    // branches on bit 22 for the workloop entry, bit 19 for the kevent one, and
-    // falls through to the plain worker.  Bit 17 means "this thread is being
-    // reused" and *skips* _pthread_wqthread_setup, so a fresh thread must not
-    // carry it; bit 16 becomes the overcommit bit of the priority word.
-    constexpr uint64_t kWqFlagOvercommit = 0x0001'0000;
-    // Bit 21 is this path's "the kernel set the thread pointer" acknowledgement -
-    // the workqueue's equivalent of PTHREAD_START_TSD_BASE_SET, and a different
-    // bit from the 0x1000'0000 bsdthread_create uses.  _pthread_wqthread_setup
-    // tests it (`tbz w3, #0x15`) and stops the process with "BUG IN LIBPTHREAD:
-    // thread_set_tsd_base() wasn't called by the kernel" when it is clear, which
-    // is again a status bit rather than anything wrong with the pointer itself.
-    constexpr uint64_t kWqFlagTsdBaseSet = 0x0020'0000;
-    // ...and bit 15 says the low byte carries a QoS class.  Without either this
-    // or bit 14, _pthread_wqthread stops with "BUG IN LIBPTHREAD: Missing
-    // priority": the priority word is assembled from these bits, and a worker
-    // that arrives without one is a kernel that did not say what it wanted run.
-    constexpr uint64_t kWqFlagHasQos = 0x0000'8000;
-    constexpr uint64_t kWqFlagWorkloop  = 0x0040'0000;
-    constexpr uint64_t kQosDefault = 4;            // QOS_CLASS_DEFAULT
-    w.ctx.x[0] = self;
-    w.ctx.x[1] = port;
-    w.ctx.x[2] = low;
-    w.ctx.x[3] = 0;
-    w.ctx.x[4] = kWqFlagTsdBaseSet | kWqFlagHasQos |
-                 (overcommit ? kWqFlagOvercommit : 0) | kQosDefault;
-    w.ctx.x[5] = 0;
-
-    if (event) {
-        // A workloop worker is handed its events, and the workloop's own id sits
-        // *eight bytes in front of them*: libpthread computes the argument it
-        // passes on as `keventlist - 8`.  So the two are laid out together, once,
-        // in guest memory the worker owns.
-        const uint64_t block = static_cast<uint64_t>(
-            sys_mmap(0, 4096, 3 /*RW*/, 0x1002 /*ANON|PRIVATE*/, -1, 0));
-        if (!block || block > 0xFFFF'FFFF'FFFF'0000ull) return false;
-        mem_.write<uint64_t>(block, workloop_id);
-        mem_.write_bytes(block + 8, event, 64);
-        w.ctx.x[3] = block + 8;
-        w.ctx.x[4] |= kWqFlagWorkloop;
-        w.ctx.x[5] = 1;
-        w.workloop = workloop_id;
-    }
-    w.ctx.x[30] = 0;                               // a worker never returns
+    mem_.write<uint64_t>(self + 0xF8, w.wq_port);  // tsd[3]: the mach port
+    enter_wqthread(w, false, workloop_id, event, prio);
     threads_.push_back(w);
     ++workq_live_;
     if (trace)
@@ -399,22 +394,114 @@ bool Syscalls::spawn_workq_thread(bool overcommit, uint64_t workloop_id,
     return true;
 }
 
+// The entry convention, read out of `_pthread_wqthread` rather than guessed:
+//
+//     x0  self         the struct _pthread the kernel laid down
+//     x1  kport        this thread's mach port
+//     x2  stackaddr    the *low* end of the allocation
+//     x3  keventlist   NULL for a plain worker; for a workloop, the events - with
+//                      the workloop's id in the eight bytes *in front of them*,
+//                      because libpthread passes `keventlist - 8` on
+//     x4  flags        see below
+//     x5  nkevents
+//
+// The flag bits libpthread branches on: 22 selects the workloop entry, 19 the
+// kevent one, and neither means the plain worker.  Bit 17 says the thread has
+// been through `_pthread_wqthread_setup` already, which is exactly what makes a
+// parked thread reusable, and bit 21 is this path's "the kernel set the thread
+// pointer" acknowledgement - without it libpthread stops with
+// "thread_set_tsd_base() wasn't called by the kernel".
+//
+// The rest of the flags decide the `pthread_priority_t` libpthread hands to
+// libdispatch, and that is not a formality: libdispatch picks the root queue to
+// drain from it, so a worker with the wrong priority drains a queue nobody
+// enqueued to and the program hangs with its work still pending.  Three encodings
+// live in __pthread_wqthread, and reading it is the only way to know which is
+// which (all offsets from its 0x18046FCFC entry in libsystem_pthread):
+//
+//     bit 23  ->  0x040008FF  outright, the value libdispatch itself passes to
+//                 WQOPS_QUEUE_REQTHREADS for its default fallback root queue
+//     bit 14  ->  QoS class from the low byte: 0xFF | (1 << (class + 7)),
+//                 so 0x08FF for QOS_CLASS_DEFAULT
+//     bit 15  ->  0xFFFF, the unspecified legacy priority - which matches no
+//                 root queue at all
+//     bit 20  ->  0x02000000, the event manager
+//
+// So the request's priority has to travel: honour it exactly when it is the one
+// bit 23 produces, and otherwise fall back to naming the QoS class.
+void Syscalls::enter_wqthread(Thread& w, bool reuse, uint64_t workloop_id,
+                              const uint8_t* event, uint64_t prio) {
+    constexpr uint64_t kWqFlagReuse      = 0x0002'0000;
+    constexpr uint64_t kWqFlagTsdBaseSet = 0x0020'0000;
+    constexpr uint64_t kWqFlagQosClass   = 0x0000'4000;
+    constexpr uint64_t kWqFlagFallback   = 0x0080'0000;
+    constexpr uint64_t kWqFlagWorkloop   = 0x0040'0000;
+    constexpr uint64_t kFallbackPrio     = 0x0400'08FF;
+    constexpr uint64_t kQosDefault = 4;            // QOS_CLASS_DEFAULT
+
+    w.ctx.pc = wqthread_entry_;
+    w.ctx.sp = w.wq_self;                          // grows down into the stack
+    w.ctx.tpidr_el0 = w.wq_self + 0xE0;            // the TSD array
+    w.ctx.x[0] = w.wq_self;
+    w.ctx.x[1] = w.wq_port;
+    w.ctx.x[2] = w.wq_stack;
+    w.ctx.x[3] = 0;
+    w.ctx.x[4] = kWqFlagTsdBaseSet | (reuse ? kWqFlagReuse : 0) |
+                 (prio == kFallbackPrio ? kWqFlagFallback
+                                        : kWqFlagQosClass | kQosDefault);
+    w.ctx.x[5] = 0;
+    w.ctx.x[30] = 0;                               // a worker never returns
+    w.workloop = 0;
+
+    if (event) {
+        const uint64_t block = static_cast<uint64_t>(
+            sys_mmap(0, 4096, 3 /*RW*/, 0x1002 /*ANON|PRIVATE*/, -1, 0));
+        if (block && block < 0xFFFF'FFFF'FFFF'0000ull) {
+            mem_.write<uint64_t>(block, workloop_id);
+            mem_.write_bytes(block + 8, event, 64);
+            w.ctx.x[3] = block + 8;
+            w.ctx.x[4] |= kWqFlagWorkloop;
+            w.ctx.x[5] = 1;
+            w.workloop = workloop_id;
+        }
+    }
+}
+
 void Syscalls::service_workq_requests() {
     // A cap, because a request is a promise and libdispatch will happily ask for
     // one per available core per queue.  Enough that a parallel phase makes
     // progress, few enough that a runaway request loop stops.
     constexpr int kMaxWorkers = 8;
+
+    // A parked worker first.  Darwin hands the same thread back rather than
+    // making a new one, and libdispatch counts on it: destroying a worker that
+    // has run out of work leaves its accounting expecting a thread that is gone,
+    // and the next batch of work is never picked up.
+    auto take_parked = [this](uint64_t id, const uint8_t* ev, uint64_t prio) {
+        for (Thread& t : threads_) {
+            if (!t.is_worker || !t.parked || t.exited) continue;
+            enter_wqthread(t, true, id, ev, prio);
+            t.parked = false;
+            t.waiting = false;
+            ++workq_live_;
+            return true;
+        }
+        return false;
+    };
+
     while (workq_requested_ > 0 && workq_live_ < kMaxWorkers) {
         --workq_requested_;
-        if (!spawn_workq_thread(false)) break;
+        if (take_parked(0, nullptr, workq_req_prio_)) continue;
+        if (!spawn_workq_thread(false, 0, nullptr, workq_req_prio_)) break;
     }
     if (workq_requested_ > 0 && workq_live_ >= kMaxWorkers) workq_requested_ = 0;
 
     while (!workloop_pending_.empty() && workq_live_ < kMaxWorkers) {
         const WorkloopRequest req = workloop_pending_.front();
         workloop_pending_.erase(workloop_pending_.begin());
-        if (!spawn_workq_thread(false, req.id, req.event)) break;
-        workloop_live_.push_back(req.id);
+        if (!take_parked(req.id, req.event, 0) &&
+            !spawn_workq_thread(false, req.id, req.event))
+            break;
     }
 }
 
@@ -518,9 +605,11 @@ void Syscalls::thread_exit(int status) {
         bool anyone_blocked = false;
         for (const Thread& t : threads_)
             if (!t.exited && t.waiting) anyone_blocked = true;
-        if (anyone_blocked)
+        if (anyone_blocked) {
+            report_threads("a thread exited while the others are blocked");
             throw CpuError{"a thread exited while the others are blocked: stalled",
                            cpu_.pc, 0};
+        }
         cpu_.exit_code = status;
         cpu_.halted = true;
     }

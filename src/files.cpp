@@ -3,6 +3,11 @@
 #include <cstring>
 #include <filesystem>
 #include <system_error>
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace a64 {
 
@@ -274,6 +279,23 @@ int64_t Files::write(int fd, const void* src, uint64_t len) {
     // arrive in big chunks and the flush costs little.
     std::fflush(it->second.fp);
     return static_cast<int64_t>(n);
+}
+
+int64_t Files::ftruncate(int fd, int64_t len) {
+    auto it = open_.find(fd);
+    if (it == open_.end()) return kEBADF;
+    if (it->second.pipe || it->second.is_directory || !it->second.fp) return kEINVAL;
+    // Through the FILE* rather than around it: anything already buffered belongs
+    // before the new end of file, and on Windows the two layers do not share a
+    // position.
+    std::fflush(it->second.fp);
+#ifdef _WIN32
+    if (_chsize_s(_fileno(it->second.fp), len) != 0) return kEINVAL;
+#else
+    if (::ftruncate(fileno(it->second.fp), static_cast<off_t>(len)) != 0)
+        return kEINVAL;
+#endif
+    return 0;
 }
 
 int64_t Files::lseek(int fd, int64_t off, int whence) {

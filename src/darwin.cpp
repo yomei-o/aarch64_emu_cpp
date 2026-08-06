@@ -1438,6 +1438,11 @@ bool Syscalls::svc_darwin() {
         case 6: case 399: r = files.close(static_cast<int>(a0)); break;
         case 199: r = files.lseek(static_cast<int>(a0), static_cast<int64_t>(a1),
                                   static_cast<int>(a2)); break;
+        case 201: r = files.ftruncate(static_cast<int>(a0),
+                                      static_cast<int64_t>(a1)); break;
+        // umask.  Nothing here consults a mode, so the honest answer is the
+        // default one every process starts with; `ld` only wants to read it back.
+        case 60: r = 0022; break;
         // pread(fd, buf, nbyte, offset).  clang's own file reader uses it rather
         // than lseek+read - it maps or preads every source and header - so the
         // whole front end stops at the first #include without this.
@@ -1787,10 +1792,15 @@ bool Syscalls::svc_darwin() {
                 if (mem_.read<uint16_t>(e + 10) & kEvDelete) continue;
                 // One worker per workloop at a time: re-registering while its
                 // worker still runs is an update, not a second request.
-                bool known = false;
-                for (uint64_t live : workloop_live_) if (live == id) known = true;
-                for (const auto& q : workloop_pending_) if (q.id == id) known = true;
-                if (known) continue;
+                if (workloop_is_live(id)) {
+                    if (trace)
+                        std::fprintf(stderr, "[proc] workloop %llX already live\n",
+                                     static_cast<unsigned long long>(id));
+                    continue;
+                }
+                if (trace)
+                    std::fprintf(stderr, "[proc] workloop %llX requested\n",
+                                 static_cast<unsigned long long>(id));
                 WorkloopRequest req;
                 req.id = id;
                 mem_.read_bytes(e, req.event, 64);
@@ -1839,39 +1849,42 @@ bool Syscalls::svc_darwin() {
                     int want = static_cast<int>(static_cast<int32_t>(a2));
                     if (want <= 0 || want > 64) want = 1;
                     workq_requested_ += want;
+                    workq_req_prio_ = a3;
                     r = 0;
                     break;
                 }
                 case kWqOpsThreadReturn:
                 case kWqOpsThreadWorkloopReturn:
-                case kWqOpsThreadKeventReturn:
-                    // A worker saying it has run out of work.  On Darwin the
-                    // kernel parks the thread and may hand it back later; here it
-                    // simply ends, and libdispatch asks again when it has more.
-                    // Returning to the caller is not an option - libpthread stops
-                    // the process with "__workq_kernreturn returned", because on a
-                    // real kernel this call never comes back.
+                case kWqOpsThreadKeventReturn: {
+                    // A worker saying it has run out of work.  Darwin *parks* the
+                    // thread and hands the same one back on the next request, and
+                    // libdispatch's accounting assumes that - destroying it left
+                    // libdispatch expecting a thread that no longer existed, and
+                    // the next batch of work was simply never picked up.
+                    //
+                    // Returning to the caller is not an option either: on a real
+                    // kernel this call does not come back, and libpthread checks
+                    // ("BUG IN LIBPTHREAD: __workq_kernreturn returned").  So the
+                    // thread blocks here and service_workq_requests() re-enters it
+                    // at `_pthread_wqthread` when there is something to do.
                     if (workq_live_ > 0) --workq_live_;
-                    // *This* worker's workloop becomes requestable again.  Erasing
-                    // whichever entry happened to be first instead - which is what
-                    // the first version did - leaves a workloop marked live
-                    // forever, so libdispatch's next request for it is silently
-                    // dropped and the work it was carrying never runs.  ld then
-                    // exits 0 having written nothing, which is the hardest kind of
-                    // failure to attribute.
                     if (!threads_.empty()) {
-                        const uint64_t mine = threads_[cur_thread_].workloop;
-                        if (mine) {
-                            for (size_t k = 0; k < workloop_live_.size(); ++k) {
-                                if (workloop_live_[k] != mine) continue;
-                                workloop_live_.erase(workloop_live_.begin() +
-                                                     static_cast<long>(k));
-                                break;
-                            }
-                        }
+                        Thread& me = threads_[cur_thread_];
+                        me.workloop = 0;            // free for the next request
+                        me.parked = true;
+                        me.waiting = true;
+                        me.wait_addr = 0;
                     }
-                    thread_exit(0);
+                    cpu_.setx(0, 0);
+                    if (!schedule(true)) {
+                        // Every other thread is blocked and no worker was asked
+                        // for: nothing will ever wake this one.
+                        report_threads("every thread is parked or blocked");
+                        throw CpuError{"every thread is parked or blocked: stalled",
+                                       cpu_.pc, 0};
+                    }
                     return true;
+                }
                 case kWqOpsSetEventManagerPriority:
                     r = 0;
                     break;

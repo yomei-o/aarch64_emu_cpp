@@ -29,6 +29,10 @@ public:
     int64_t read(int fd, void* dst, uint64_t len);
     int64_t write(int fd, const void* src, uint64_t len);
     int64_t lseek(int fd, int64_t off, int whence);
+    // Set the file's length, growing with zeroes. `ld` builds its output by
+    // sizing the file first and then writing through a shared mapping, so
+    // without this there is nothing for the mapping to land in.
+    int64_t ftruncate(int fd, int64_t len);
     // Has this descriptor been opened or redirected here? Descriptors 0..2 are the
     // console by default and are not in the table; a `dup2` onto one puts it there.
     bool is_open(int fd) const { return open_.count(fd) != 0; }

@@ -138,6 +138,14 @@ private:
         // A workqueue worker's workloop, so that when it returns the *right* one
         // becomes requestable again.  Zero for an ordinary thread.
         uint64_t workloop = 0;
+        // A worker that has run out of work is *parked*, not destroyed: Darwin
+        // hands the same thread back on the next request, and libdispatch's
+        // accounting assumes it.  These are what it takes to re-enter
+        // `_pthread_wqthread` on the thread that already exists.
+        bool is_worker = false;
+        bool parked = false;
+        uint64_t wq_self = 0, wq_stack = 0;
+        uint32_t wq_port = 0;
     };
     std::vector<Thread> threads_;       // empty until the first clone
     size_t cur_thread_ = 0;
@@ -209,6 +217,11 @@ private:
     // Workers asked for but not yet started.  libdispatch requests threads and
     // expects them to appear later, so a request is a promise, not a call.
     int workq_requested_ = 0;
+    // The priority libdispatch asked for.  It matters: 0x040008FF is the *event
+    // manager*'s, and a worker that arrives as an ordinary one joins a different
+    // root queue and finds nothing to drain - which looks exactly like a
+    // libdispatch that lost its work.
+    uint64_t workq_req_prio_ = 0;
     int workq_live_ = 0;
     // A workloop that has asked for a worker.  libdispatch requests threads for a
     // concurrent queue through kevent_id rather than workq_kernreturn, so this is
@@ -219,12 +232,33 @@ private:
         uint8_t event[64] = {};      // the kevent_qos_s to hand the worker
     };
     std::vector<WorkloopRequest> workloop_pending_;
-    std::vector<uint64_t> workloop_live_;
+    // Whether a workloop already has a worker is *derived* from the threads, not
+    // kept in a list.  A separate list leaked: a parked worker reused for a plain
+    // request never cleared the workloop it had carried before, so that workloop
+    // stayed "live" forever and every later request for it was deduplicated away -
+    // and the work it was carrying simply never ran.  A fact that can be computed
+    // should not also be stored.
+    bool workloop_is_live(uint64_t id) const {
+        for (const Thread& t : threads_)
+            if (!t.exited && t.workloop == id) return true;
+        for (const WorkloopRequest& q : workloop_pending_)
+            if (q.id == id) return true;
+        return false;
+    }
     // Creates one workqueue worker, or returns false if it cannot.  `event` is
     // null for a plain worker and points at a 64-byte kevent_qos_s for a workloop
     // one, which is a different entry convention rather than a different flag.
     bool spawn_workq_thread(bool overcommit, uint64_t workloop_id = 0,
-                            const uint8_t* event = nullptr);
+                            const uint8_t* event = nullptr, uint64_t prio = 0);
+    // Sends a thread - fresh or parked - into `_pthread_wqthread`.  `reuse` is the
+    // difference libpthread is told about: it skips its own setup for a thread
+    // that has been through it once.
+    void enter_wqthread(Thread& w, bool reuse, uint64_t workloop_id,
+                        const uint8_t* event, uint64_t prio = 0);
+    // Every thread and where it is stopped.  A stall is a statement about the
+    // *set* of threads, so the report has to be one too - the thread that
+    // notices is never the interesting one.
+    void report_threads(const char* why);
     // Starts any workers that have been asked for.  Called where the guest has
     // just given the scheduler a chance to run something else.
     void service_workq_requests();

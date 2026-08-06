@@ -22,6 +22,10 @@ that flushes stdio, and without which the program printed nothing at all.
 
 The macOS milestone is **met**. What is left on that side is breadth rather than a wall.
 
+**Apple clang compiles arm64 Mach-O here now (2026-08-06)** - see "Apple clang:
+it compiles" below for the state and the one protocol still missing before it
+links.
+
 **Where this is (2026-08-05, third pass).** The goal it was aimed at is met:
 
     sh prebuilt/unpack.sh
@@ -252,7 +256,72 @@ Three bugs stood between "spawns cc1" and this, all worth remembering:
   zero-compare opcode table was wrong -- opcode 8 is CMGT/CMGE, 9 is CMEQ/CMLE,
   A is CMLT; the old table answered different questions than were asked.
 
-### Next: Apple clang, which would make this a Windows-to-macOS cross-compiler
+### Apple clang: it compiles (2026-08-06).  The linker is one protocol away.
+
+    ./aarch64emu --dyld-sections --root guests/macos_clang         guests/macos_clang/usr/bin/clang -isysroot /sdk -S -O2 /hello.c -o /hello.s
+
+produces correct arm64 assembly, down to the -O2 printf-to-puts rewrite, and
+`-c` produces a real MH_OBJECT with `_main` and `_printf`.  The seven emulator
+bugs it took are in the commit "Apple clang compiles arm64 Mach-O inside the
+emulator"; three were the same species (a hook returning a *plausible success*),
+and the one worth carrying to the next guest is that
+`linux_stat_to_darwin` dropped st_dev and st_ino, so every file answered (0,0)
+and clang - which de-duplicates its header search list by that pair - threw
+`-isysroot` away as a duplicate directory.
+
+**Read the guest's crash message.  This is the tool of the day.**  Apple's fatal
+paths write into their image's `__DATA,__crash_info` and then BRK, so a trap on
+its own is the report with the reason removed.  `Cpu::on_brk` now prints it, and
+every blocker since has named itself:
+
+    [mac] crash /usr/lib/system/libdispatch.dylib: message =
+          BUG IN LIBDISPATCH: Unable to get the unique pid (error)
+
+**Building the guest tree.** Three tarballs, all made on the Mac and carried over
+the share; `guests/macos_clang` is not in the repo.
+
+1. `tools/pack_clang.sh` - clang, ld, the builtin headers, the SDK's
+   `usr/include`, and every `.tbd` (530 of them).
+2. `tools/pack_clang_dylibs.sh` - the dependencies that are *real files* in the
+   CommandLineTools, found by walking `otool -L` and resolving @rpath: libtapi
+   and libLTO.
+3. `tools/extract_for_clang.sh` - the ones that are not files.  The SDK carrying
+   only a `.tbd` for a library is the tell that its code is in the shared cache;
+   libcodedirectory and libswiftDemangle are pulled out of the cache the same way
+   the Python guest was.
+
+Then the extracted system dylibs from `guests/macos_py` (usr/lib + System) go on
+top - same Mac, same cache - and `libresolv.9.dylib` is a `stub_libs.sh` stub,
+since clang names `res_9_*` and never calls them.  Two placement notes that cost
+time: **ld's only LC_RPATH is `@executable_path/../lib/`**, so `@rpath/...`
+resolves to `/usr/lib/` and *not* `/usr/lib/swift/` - libswiftDemangle needs a
+copy in both - and the guest needs a `/tmp` plus `--setenv TMPDIR=/tmp/` or the
+driver stops at "unable to make temporary file".
+
+**Where the linker stands.** `ld` loads, initialises, opens and maps `/hello.o`,
+and runs to 84M instructions (from 7.7M) before deadlocking on a ulock with no
+worker to release it.  The reason is visible in `--trace-sys`: libdispatch asks
+for its workers through **`kevent_id` on a workloop**, not through
+`WQOPS_QUEUE_REQTHREADS`, so the request path in `workq_kernreturn` is never
+taken and `spawn_workq_thread` never runs.
+
+The next piece is therefore the workloop half of the protocol:
+
+- a `kevent_id(id, changelist, ...)` whose change asks for a wakeup must create a
+  worker, not merely answer 0;
+- that worker enters `_pthread_wqthread` with `WQ_FLAG_THREAD_WORKLOOP`, x3
+  pointing at a `struct kevent_qos_s` (64 bytes) describing the workloop and x5
+  the count, rather than the (NULL, 0) a plain worker gets;
+- `WQOPS_THREAD_WORKLOOP_RETURN` (0x100) is how such a worker asks for more.
+
+Everything else is in place: `spawn_workq_thread` already lays down the stack and
+the `struct _pthread` the way the kernel does, and the plain-worker argument
+convention is written out beside it.  Expect the failure mode to be a hang rather
+than a message, because a wrong worker ABI means libdispatch waits rather than
+complains - so check first that a worker is created at all (`--trace-sys` prints
+`[proc] workq worker tid ...`).
+
+### The original plan (2026-08-05, evening), kept for the reasoning
 
 The idea (2026-08-05, evening): the macOS personality already has the shared
 cache, threads and fork/exec -- so if Apple's clang runs, the emulator compiles

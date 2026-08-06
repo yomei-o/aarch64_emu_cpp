@@ -82,11 +82,29 @@ bool guest_find_section(Memory& mem, uint64_t mh, const char* name,
 // program actually branches on are carried across: the type bits, the permission
 // bits and the size.
 void linux_stat_to_darwin(const uint8_t* lin, uint8_t* dar) {
-    uint32_t mode;
+    uint32_t mode, uid, gid;
     int64_t size;
+    uint64_t dev, ino;
+    std::memcpy(&dev, lin + 0, 8);
+    std::memcpy(&ino, lin + 8, 8);
     std::memcpy(&mode, lin + 16, 4);
+    std::memcpy(&uid, lin + 24, 4);
+    std::memcpy(&gid, lin + 28, 4);
     std::memcpy(&size, lin + 48, 8);
     std::memset(dar, 0, 144);
+    // st_dev and st_ino are not decoration, and leaving them zero is not a
+    // harmless omission: a *pair* of them identifies a file, so with every path
+    // answering (0,0) any two files are the same file.  Files::path_ino already
+    // hashes the path for exactly this reason - the Linux side learned it from
+    // musl's ld.so skipping libraries it thought it had loaded - and this
+    // conversion was throwing the answer away.  clang de-duplicates its header
+    // search list the same way, so `-isysroot` was silently dropped as a
+    // "duplicate directory" and no system header could be found.
+    const int32_t dev32 = static_cast<int32_t>(dev);
+    std::memcpy(dar + 0, &dev32, 4);             // st_dev
+    std::memcpy(dar + 8, &ino, 8);               // st_ino
+    std::memcpy(dar + 16, &uid, 4);              // st_uid
+    std::memcpy(dar + 20, &gid, 4);              // st_gid
     const uint16_t mode16 = static_cast<uint16_t>(mode);
     std::memcpy(dar + 4, &mode16, 2);            // st_mode
     const uint16_t nlink = 1;
@@ -367,6 +385,34 @@ void Syscalls::run_objc_load_images() {
 // The handler for those stubs. `w16` holds the vtable slot index.
 int64_t Syscalls::dyld_api_stub(uint32_t slot) {
     switch (slot) {
+        // _NSGetExecutablePath(buf, bufsize) -- x0 is the APIs object, so the
+        // arguments are in x1 and x2.  Returning 0 here means *success*, so the
+        // default stub was telling every caller "your path is whatever was in
+        // that buffer".  LLVM's getMainExecutable is this call followed by
+        // realpath(), so clang came up with an empty install directory and then
+        // posix_spawn'd the empty string looking for its own -cc1.
+        //
+        // Not found by tools/dyld_slots.py, which scans for the
+        // `mov x17,#off; add; ldr` shape: this one is a pre-indexed
+        // `ldr x3, [x16, #0x50]!`, so the offset never appears as an immediate
+        // in a mov.  It was read out of libdyld by disassembling the export.
+        case 10: {
+            const uint64_t buf = cpu_.xr(1), size_ptr = cpu_.xr(2);
+            const std::string& p = exe_path;
+            const uint32_t need = static_cast<uint32_t>(p.size() + 1);
+            if (size_ptr) {
+                const uint32_t have = mem_.read<uint32_t>(size_ptr);
+                if (have < need) {
+                    // The documented failure: report the size required and -1,
+                    // which callers retry with a bigger buffer.
+                    mem_.write<uint32_t>(size_ptr, need);
+                    return -1;
+                }
+            }
+            if (buf) mem_.write_bytes(buf, reinterpret_cast<const uint8_t*>(p.c_str()), need);
+            if (size_ptr) mem_.write<uint32_t>(size_ptr, need);
+            return 0;
+        }
         // _dyld_get_active_platform. PLATFORM_MACOS is 1; returning 0 would be
         // PLATFORM_UNKNOWN, and libSystem branches on it.
         case 66: return 1;
@@ -1228,6 +1274,20 @@ bool Syscalls::svc_darwin() {
         return true;
     }
 
+    // Resolve a (directory descriptor, path) pair for the *at family. AT_FDCWD is
+    // **-2** on Darwin, not Linux's -100, and a descriptor that is neither that nor
+    // one this process opened yields the path unchanged rather than a guess -- the
+    // caller then gets whatever the plain form would have given, which is wrong in
+    // an obvious way instead of subtly.
+    auto at_path = [this](uint64_t dirfd_arg, uint64_t path_arg) {
+        constexpr int kAtFdCwd = -2;
+        const int dirfd = static_cast<int>(static_cast<int32_t>(dirfd_arg));
+        std::string path = guest_str(path_arg);
+        if (path.empty() || path[0] == '/' || dirfd == kAtFdCwd) return path;
+        const std::string base = files.fd_path(dirfd);
+        return base.empty() ? path : base + "/" + path;
+    };
+
     switch (nr) {
         case 1:                                            // exit
             // A vfork child exiting before it execs -- the `_exit(127)` after a failed
@@ -1249,13 +1309,64 @@ bool Syscalls::svc_darwin() {
             r = files.open(guest_str(a0), darwin_oflags_to_linux(static_cast<int>(a1)),
                            static_cast<int>(a2));
             break;
+        // openat(dirfd, path, oflag, mode).  clang and ld use it in preference to
+        // open, so without it a toolchain gets as far as its first header and
+        // stops - and the failure surfaces as libdispatch aborting, several
+        // frames from the cause.  AT_FDCWD is -2 on Darwin (not Linux's -100);
+        // a real directory descriptor is resolved through the path it was opened
+        // with, which is what Files::fd_path is for.
+        case 463: case 464:                                // openat[_nocancel]
+            r = files.open(at_path(a0, a1), darwin_oflags_to_linux(static_cast<int>(a2)),
+                           static_cast<int>(a3));
+            break;
         case 6: case 399: r = files.close(static_cast<int>(a0)); break;
         case 199: r = files.lseek(static_cast<int>(a0), static_cast<int64_t>(a1),
                                   static_cast<int>(a2)); break;
+        // pread(fd, buf, nbyte, offset).  clang's own file reader uses it rather
+        // than lseek+read - it maps or preads every source and header - so the
+        // whole front end stops at the first #include without this.
+        case 153: case 414: {                              // pread[_nocancel]
+            std::vector<uint8_t> tmp(static_cast<size_t>(a2));
+            const int64_t got = files.pread(static_cast<int>(a0), tmp.data(), a2, a3);
+            if (got > 0) mem_.write_bytes(a1, tmp.data(), static_cast<uint64_t>(got));
+            r = got;
+            break;
+        }
         case 33: r = files.access(guest_str(a0)); break;
         case 136: r = files.mkdir(guest_str(a0)); break;
         case 137: case 10: r = files.unlink(guest_str(a0)); break;   // rmdir, unlink
         case 128: r = files.rename(guest_str(a0), guest_str(a1)); break;
+        // __getcwd(buf, size).  Answering it is not a convenience: without it
+        // libsystem_c falls back to *walking up the tree*, opening each parent and
+        // comparing (st_dev, st_ino) of every entry against the child's to recover
+        // its own name.  That fallback was invisible for as long as every file
+        // answered (0, 0) -- the first entry it looked at "matched" and it stopped
+        // -- and it came to life the moment linux_stat_to_darwin started reporting
+        // real inodes.  A fix that makes an unrelated test fail is usually a fix
+        // that switched a fallback on.
+        case 326: {
+            const std::string& d = files.cwd;
+            if (a1 && a1 < d.size() + 1) { err = 34; break; }        // ERANGE
+            mem_.write_bytes(a0, d.c_str(), d.size() + 1);
+            r = 0;
+            break;
+        }
+        // The *at family.  Darwin numbers them 465..475 and clang uses them in
+        // preference to the plain forms; they all take a directory descriptor that
+        // is either AT_FDCWD (-2 here, not Linux's -100) or a real fd, resolved
+        // through the path it was opened with.
+        case 466: r = files.access(at_path(a0, a1)); break;                    // faccessat
+        case 469: case 470: {                                                  // fstatat[64]
+            uint8_t lin[128], dar[144];
+            // AT_EMPTY_PATH does not exist on Darwin; an empty path is simply an
+            // error, so there is no "stat the fd itself" case to get wrong here.
+            r = files.stat_path(at_path(a0, a1), lin);
+            if (r == 0) { linux_stat_to_darwin(lin, dar); mem_.write_bytes(a2, dar, sizeof dar); }
+            break;
+        }
+        case 471: r = files.unlink(at_path(a0, a1)); break;                    // unlinkat
+        case 475: r = files.mkdir(at_path(a0, a1)); break;                     // mkdirat
+        case 465: r = files.rename(at_path(a0, a1), at_path(a2, a3)); break;   // renameat
         // ---- child processes. The numbers are read out of libsystem_kernel, one
         // `movz x16, #N` per stub, for the same reason the psynch ones are: a wrong
         // number is a syscall that quietly fails.
@@ -1307,7 +1418,7 @@ bool Syscalls::svc_darwin() {
         case 59: r = sys_execve(a0, a1, a2); return true;
         case 147: r = 1000; break;                         // setsid: one session here
         case 362: r = 0; break;                            // kqueue: no events, ever
-        case 7: r = sys_wait4(static_cast<int64_t>(a0), a1); break;
+        case 7: case 400: r = sys_wait4(static_cast<int64_t>(a0), a1); break;  // wait4[_nocancel]
         // poll(fds, n, timeout). Same answer as the Linux ppoll and for the same
         // reason: nothing here runs two processes at once, so by the time a parent
         // polls, the child has finished and everything it wrote is in the buffer.
@@ -1739,7 +1850,27 @@ bool Syscalls::svc_darwin() {
         }
         case 274: err = kBsdENOENT; break;                 // sysctlbyname
         case 54: err = 25; break;                          // ioctl: ENOTTY, we are not a tty
-        case 92: case 406: r = 0; break;                   // fcntl[_nocancel]
+        // fcntl. Most commands are descriptor flags nothing here models, and 0
+        // ("done") is the right answer for those.  F_GETPATH is not one of them:
+        // it is an *out* parameter, and macOS's realpath(3) is built on it - it
+        // opens the file and asks the kernel what the path is.  Answering
+        // "success" while leaving the caller's PATH_MAX buffer untouched made
+        // realpath return whatever was on the stack, which is how clang came to
+        // posix_spawn the empty string: LLVM's getMainExecutable is
+        // _NSGetExecutablePath followed by realpath, so clang did not know where
+        // it was installed and built every tool path from nothing.
+        case 92: case 406: {                               // fcntl[_nocancel]
+            constexpr uint64_t kFGetPath = 50;
+            if (a1 == kFGetPath) {
+                const std::string p = files.fd_path(static_cast<int>(a0));
+                if (p.empty()) { err = kBsdEINVAL; break; }
+                // The buffer is MAXPATHLEN by contract; the caller allocates it.
+                mem_.write_bytes(a2, reinterpret_cast<const uint8_t*>(p.c_str()),
+                                 p.size() + 1);
+            }
+            r = 0;
+            break;
+        }
         case 294: err = kBsdEINVAL; break;                 // shared_region_check_np: no cache
         case 336: err = kBsdEINVAL; break;                 // proc_info
         // The code-signing status of a process, which libSystem consults before it

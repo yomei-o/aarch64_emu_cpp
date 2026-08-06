@@ -83,6 +83,14 @@ uint64_t build_stack(Memory& mem, uint64_t stack_top, const LoadedImage& img,
 
 bool is_macho(const std::vector<uint8_t>& f);
 
+// Reduces a universal ("fat") binary to its arm64 slice, in place; leaves
+// anything else alone.  Apple ships clang, ld and much of the CommandLineTools
+// as two-architecture files, and every reader below assumes the Mach-O header
+// is at offset zero - so this runs once, where files are read, rather than
+// being threaded through the loader as a base offset.  Returns true if it
+// thinned something.
+bool macho_thin_fat(std::vector<uint8_t>& f);
+
 // `slide` is where to place a position-independent image (MH_PIE); a fixed-address
 // executable says where it wants to live and the slide is ignored for it in
 // practice, because its __TEXT vmaddr is absolute.

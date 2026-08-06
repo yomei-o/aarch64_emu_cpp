@@ -57,6 +57,42 @@ std::string lc_string(const uint8_t* f, size_t o, uint32_t cmdsize, size_t at) {
 
 }  // namespace
 
+// A universal binary is a big-endian table of (cputype, offset, size) in front
+// of complete Mach-O files.  Both the 32-bit form (FAT_MAGIC, 32-bit offsets)
+// and the 64-bit one (FAT_MAGIC_64) appear in the wild; clang is the former even
+// though its slices are 64-bit code.
+bool macho_thin_fat(std::vector<uint8_t>& f) {
+    constexpr uint32_t kFatMagic = 0xCAFEBABEu, kFatMagic64 = 0xCAFEBABFu;
+    if (f.size() < 8) return false;
+    auto be32 = [&f](size_t at) -> uint32_t {
+        return (uint32_t(f[at]) << 24) | (uint32_t(f[at + 1]) << 16) |
+               (uint32_t(f[at + 2]) << 8) | uint32_t(f[at + 3]);
+    };
+    auto be64 = [&be32](size_t at) -> uint64_t {
+        return (uint64_t(be32(at)) << 32) | be32(at + 4);
+    };
+    const uint32_t magic = be32(0);
+    if (magic != kFatMagic && magic != kFatMagic64) return false;
+    const bool wide = magic == kFatMagic64;
+    const uint32_t count = be32(4);
+    const size_t stride = wide ? 32 : 20;
+    for (uint32_t i = 0; i < count; ++i) {
+        const size_t at = 8 + size_t(i) * stride;
+        if (at + stride > f.size()) break;
+        if (static_cast<int32_t>(be32(at)) != kCpuArm64) continue;
+        const uint64_t off = wide ? be64(at + 8) : be32(at + 8);
+        const uint64_t size = wide ? be64(at + 16) : be32(at + 12);
+        if (off > f.size() || size > f.size() - off) break;
+        // Copy rather than erase-from-both-ends: the slice is typically half the
+        // file, so one allocation beats shifting a quarter of a gigabyte twice.
+        std::vector<uint8_t> slice(f.begin() + static_cast<ptrdiff_t>(off),
+                                   f.begin() + static_cast<ptrdiff_t>(off + size));
+        f.swap(slice);
+        return true;
+    }
+    return false;
+}
+
 bool is_macho(const std::vector<uint8_t>& f) {
     if (f.size() < sizeof(MachHeader64)) return false;
     uint32_t magic;

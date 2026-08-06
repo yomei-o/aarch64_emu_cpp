@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cstdint>
 
 namespace a64 {
 
@@ -388,6 +389,7 @@ void Cpu::exec_fp_simd(uint32_t insn) {
         // The widening group: the second operand's lanes are half the width of the
         // result's, and `q` selects which half of it to take.
         if (opcode == 0x0 || opcode == 0x1 || opcode == 0x2 || opcode == 0x3 ||
+            opcode == 0x5 || opcode == 0x7 || opcode == 0x8 || opcode == 0xA ||
             opcode == 0xC) {
             const unsigned esize = 1u << size;                  // the *narrow* element
             const unsigned lanes = 8u / esize;
@@ -402,12 +404,24 @@ void Cpu::exec_fp_simd(uint32_t insn) {
                 const uint64_t wide = velem(vreg[rn], esize * 2, i);         // already wide
                 const uint64_t narrow = sxn(velem(vreg[rm], esize, base + i));
                 const uint64_t nn = sxn(velem(vreg[rn], esize, base + i));
+                // The accumulating forms read the destination lane, which is
+                // already the wide width - the same lane `wide` names for the
+                // W-forms, but taken from rd rather than rn.
+                const uint64_t acc = velem(vreg[rd], esize * 2, i);
+                auto absdiff = [&] {
+                    const int64_t d = static_cast<int64_t>(nn) - static_cast<int64_t>(narrow);
+                    return static_cast<uint64_t>(d < 0 ? -d : d);
+                };
                 uint64_t r = 0;
                 switch (opcode) {
                     case 0x0: r = nn + narrow; break;                        // SADDL / UADDL
                     case 0x1: r = wide + narrow; break;                      // SADDW / UADDW
                     case 0x2: r = nn - narrow; break;                        // SSUBL / USUBL
                     case 0x3: r = wide - narrow; break;                      // SSUBW / USUBW
+                    case 0x5: r = acc + absdiff(); break;                    // SABAL / UABAL
+                    case 0x7: r = absdiff(); break;                          // SABDL / UABDL
+                    case 0x8: r = acc + nn * narrow; break;                  // SMLAL / UMLAL
+                    case 0xA: r = acc - nn * narrow; break;                  // SMLSL / UMLSL
                     case 0xC: r = nn * narrow; break;                        // SMULL / UMULL
                     default: r = 0; break;
                 }
@@ -1166,14 +1180,43 @@ void Cpu::exec_fp_simd(uint32_t insn) {
                 wrf(rd, val);
                 return;
             }
-            if ((opcode == 0 || opcode == 1) && rmode == 3) {    // FCVTZS / FCVTZU (toward zero)
+            // FCVT{N,P,M,Z,A}{S,U}: one instruction per rounding mode, which is
+            // why the mode is in the encoding rather than in FPCR.  `rmode`
+            // selects it for opcode 0/1; opcode 4/5 is the "A" form (ties away
+            // from zero) and ignores rmode.  Only the Z pair used to be here,
+            // and clang's own code reaches FCVTPU within five million
+            // instructions - LLVM rounds sizes up all over.
+            if (opcode == 0 || opcode == 1 || opcode == 4 || opcode == 5) {
+                const bool is_signed = (opcode & 1) == 0;
                 const double val = rdf(rn);
-                if (opcode == 0) {
-                    const int64_t iv = static_cast<int64_t>(val);
+                double r;
+                if (opcode >= 4)      r = std::round(val);    // A: ties away from zero
+                else if (rmode == 0)  r = std::nearbyint(val);// N: ties to even
+                else if (rmode == 1)  r = std::ceil(val);     // P: toward +infinity
+                else if (rmode == 2)  r = std::floor(val);    // M: toward -infinity
+                else                  r = std::trunc(val);    // Z: toward zero
+
+                // ARM saturates rather than leaving the result undefined, and
+                // maps NaN to zero.  Doing that here rather than casting keeps
+                // an out-of-range convert from being host-defined behaviour -
+                // which on x86 yields 0x8000000000000000 and looks like data.
+                if (std::isnan(r)) {
+                    if (sf) setx(rd, 0); else setw(rd, 0);
+                } else if (is_signed) {
+                    const double lo = sf ? -9223372036854775808.0 : -2147483648.0;
+                    const double hi = sf ?  9223372036854775808.0 :  2147483648.0;
+                    int64_t iv;
+                    if (r <= lo)      iv = sf ? INT64_MIN : INT32_MIN;
+                    else if (r >= hi) iv = sf ? INT64_MAX : INT32_MAX;
+                    else              iv = static_cast<int64_t>(r);
                     if (sf) setx(rd, static_cast<uint64_t>(iv));
                     else setw(rd, static_cast<uint32_t>(static_cast<int32_t>(iv)));
                 } else {
-                    const uint64_t uv = val <= 0 ? 0 : static_cast<uint64_t>(val);
+                    const double hi = sf ? 18446744073709551616.0 : 4294967296.0;
+                    uint64_t uv;
+                    if (r <= 0)       uv = 0;
+                    else if (r >= hi) uv = sf ? UINT64_MAX : UINT32_MAX;
+                    else              uv = static_cast<uint64_t>(r);
                     if (sf) setx(rd, uv); else setw(rd, static_cast<uint32_t>(uv));
                 }
                 return;

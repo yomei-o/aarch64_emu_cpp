@@ -63,6 +63,20 @@ public:
     bool is_dir(const std::string& path) const;
 
     std::string host_path(const std::string& guest) const;
+    // One absolute, canonical guest path -- see the note in files.cpp. Public
+    // because a syscall layer that composes paths itself (the *at family) has to
+    // compose them in the spelling the inode hash will see.
+    std::string normalize(const std::string& guest) const;
+    // The path a descriptor was opened with, **as the guest spelled it**, or
+    // empty.  Two callers need it and both need the guest's spelling rather than
+    // the host's: fcntl(F_GETPATH), which is how macOS's realpath(3) works and
+    // which hands the answer straight back to the guest, and the *at family, which
+    // feeds it back into open() -- where host_path() would otherwise prepend the
+    // root a second time and look for guests/macos/guests/macos/...
+    std::string fd_path(int fd) const {
+        auto it = open_.find(fd);
+        return it == open_.end() ? std::string() : it->second.guest_path;
+    }
     std::string cwd = "/";
 
 private:
@@ -87,7 +101,8 @@ private:
         // Non-null for a pipe end; `writable` says which end this descriptor is.
         std::shared_ptr<Pipe> pipe;
         bool writable = false;
-        std::string path;
+        std::string path;            // the host path, for the host's own calls
+        std::string guest_path;      // what the guest asked for; see fd_path()
         bool used = false;
         // A directory descriptor holds its listing instead of a file handle. Python's
         // importlib opens every package directory with O_DIRECTORY and reads it with

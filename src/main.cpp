@@ -26,6 +26,11 @@ std::vector<uint8_t> read_file(const char* path) {
     std::vector<uint8_t> v(n > 0 ? static_cast<size_t>(n) : 0);
     if (n > 0 && std::fread(v.data(), 1, static_cast<size_t>(n), fp) != static_cast<size_t>(n)) v.clear();
     std::fclose(fp);
+    // Apple ships clang, ld and much of the toolchain as universal binaries.
+    // Thinning here - the one place every image is read, whether it is the
+    // program, a dependency or a spawned child - keeps the rest of the loader
+    // free of the question.
+    a64::macho_thin_fat(v);
     return v;
 }
 

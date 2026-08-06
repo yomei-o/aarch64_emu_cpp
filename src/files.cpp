@@ -12,17 +12,48 @@ constexpr int64_t kENOENT = -2, kEBADF = -9, kEACCES = -13, kEINVAL = -22, kEISD
 // bits; the rest have to be matched by value, not by the host's <fcntl.h>.
 constexpr int kO_WRONLY = 01, kO_RDWR = 02, kO_CREAT = 0100, kO_TRUNC = 01000,
               kO_APPEND = 02000, kO_DIRECTORY = 0200000;
+
+// Defined further down with fill_stat, which is its other caller.  A directory
+// listing and a stat of the same file have to agree about the inode, so both go
+// through this.
+uint64_t path_ino(const std::string& path);
 }  // namespace
 
-std::string Files::host_path(const std::string& guest) const {
+// Turn whatever the guest said into one absolute, canonical guest path: relative to
+// the cwd if it was relative, with "." dropped and ".." resolved -- and **clamped at
+// the guest root**, because `--root` is a chroot and "/.." is "/" inside one.
+//
+// The lexical resolution is not tidiness. `stat(".")` against `stat("..")` is how
+// libc's getcwd(3) recognises that it has reached the root: it walks upward
+// comparing (st_dev, st_ino) and stops when the two name the same file. Those
+// inodes are hashed from the path here, so without this "guests/macos/." and
+// "guests/macos/.." hash differently, the two are never equal, and getcwd walks out
+// of the sysroot looking for a root it will never reach.
+std::string Files::normalize(const std::string& guest) const {
     std::string p = guest;
-    if (!p.empty() && p[0] != '/') {                       // relative to the guest cwd
-        p = cwd == "/" ? "/" + p : cwd + "/" + p;
+    if (p.empty() || p[0] != '/') p = (cwd == "/" ? std::string("/") : cwd + "/") + p;
+    std::vector<std::string> parts;
+    size_t i = 1;
+    while (i <= p.size()) {
+        size_t j = p.find('/', i);
+        if (j == std::string::npos) j = p.size();
+        const std::string c = p.substr(i, j - i);
+        if (c == "..") { if (!parts.empty()) parts.pop_back(); }
+        else if (!c.empty() && c != ".") parts.push_back(c);
+        i = j + 1;
     }
+    std::string out;
+    for (const std::string& c : parts) { out += '/'; out += c; }
+    return out.empty() ? "/" : out;
+}
+
+std::string Files::host_path(const std::string& guest) const {
+    const std::string p = normalize(guest);
     if (root_.empty()) return p;
     std::string r = root_;
     while (!r.empty() && (r.back() == '/' || r.back() == '\\')) r.pop_back();
-    return r + p;
+    // "/" under a root is the root directory itself, not "root/".
+    return p == "/" ? r : r + p;
 }
 
 bool Files::is_dir(const std::string& path) const {
@@ -44,7 +75,7 @@ int64_t Files::open(const std::string& path, int flags, int mode) {
         // module, so "cannot list a directory" reads as "no such module".
         const int fd = next_fd_++;
         Entry e;
-        e.used = true; e.is_directory = true; e.path = hp;
+        e.used = true; e.is_directory = true; e.path = hp; e.guest_path = normalize(path);
         e.entries.emplace_back(".", true);
         e.entries.emplace_back("..", true);
         for (const auto& d : std::filesystem::directory_iterator(hp, ec))
@@ -65,6 +96,7 @@ int64_t Files::open(const std::string& path, int flags, int mode) {
     Entry e;
     e.fp = fp;
     e.path = hp;
+    e.guest_path = normalize(path);
     e.used = true;
     open_[fd] = std::move(e);
     return fd;
@@ -145,7 +177,10 @@ int64_t Files::getdents64(int fd, void* buf, uint64_t len) {
         const uint64_t reclen = (19 + name.size() + 1 + 7) & ~7ull;
         if (used + reclen > len) break;
         std::memset(out + used, 0, reclen);
-        const uint64_t ino = e.pos + 1;
+        // The same inode stat would report, not a sequence number.  getcwd(3)'s
+        // fallback walk finds a directory's name by listing its parent and
+        // matching inodes, so a listing that invents them cannot be walked.
+        const uint64_t ino = path_ino(e.path + "/" + name);
         const int64_t off = static_cast<int64_t>(e.pos + 1);
         const uint16_t rl = static_cast<uint16_t>(reclen);
         const uint8_t type = e.entries[e.pos].second ? 4 : 8;   // DT_DIR : DT_REG
@@ -180,7 +215,7 @@ int64_t Files::getdirentries64(int fd, void* buf, uint64_t len) {
         const uint64_t reclen = (21 + name.size() + 1 + 7) & ~7ull;
         if (used + reclen > len) break;
         std::memset(out + used, 0, reclen);
-        const uint64_t ino = e.pos + 1, seekoff = e.pos + 1;
+        const uint64_t ino = path_ino(e.path + "/" + name), seekoff = e.pos + 1;
         const uint16_t rl = static_cast<uint16_t>(reclen);
         const uint16_t nl = static_cast<uint16_t>(name.size());
         std::memcpy(out + used + 0, &ino, 8);
@@ -274,9 +309,17 @@ namespace {
 // for all of them -- cc1 loaded libisl, then libmpc/libmpfr/libgmp/libz each
 // "matched" it and were silently skipped, and relocation failed with
 // "__gmpz_get_si: symbol not found" against a libgmp that was sitting right there.
+// Normalised first, because the hash *is* the identity: "root/" and "root/."
+// name one directory and have to answer one inode.  getcwd(3) is what insists on
+// it - the fallback walk compares the cwd's (dev,ino) against the root's to know
+// when to stop, and two spellings of the same directory made it walk forever.
+// Textual normalisation only: the guest trees are extracted, so no path in them
+// is a symlink.
 uint64_t path_ino(const std::string& path) {
+    std::string p = std::filesystem::path(path).lexically_normal().generic_string();
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
     uint64_t h = 1469598103934665603ull;
-    for (unsigned char c : path) { h ^= c; h *= 1099511628211ull; }
+    for (unsigned char c : p) { h ^= c; h *= 1099511628211ull; }
     return h ? h : 1;                                  // 0 reads as "no file"
 }
 

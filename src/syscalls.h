@@ -119,6 +119,7 @@ private:
     int64_t sys_readv(int fd, uint64_t iov, uint64_t cnt);
     int64_t sys_brk(uint64_t addr);
     std::string guest_str(uint64_t addr) { return mem_.read_cstr(addr); }
+    // `shared_file` marks a MAP_SHARED file mapping, which has to be written back.
     int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags, int fd, uint64_t off);
     int64_t sys_rt_sigaction(int sig, uint64_t act, uint64_t oact);
     int64_t sys_rt_sigreturn();
@@ -134,6 +135,9 @@ private:
         uint64_t wait_addr = 0;
         bool waiting = false;           // blocked in futex(WAIT)
         bool exited = false;
+        // A workqueue worker's workloop, so that when it returns the *right* one
+        // becomes requestable again.  Zero for an ordinary thread.
+        uint64_t workloop = 0;
     };
     std::vector<Thread> threads_;       // empty until the first clone
     size_t cur_thread_ = 0;
@@ -241,6 +245,19 @@ private:
     // Set by the host, which owns the address-space layout. The default is only a
     // fallback; main.cpp places it clear of the image, the interpreter and the stack.
     uint64_t mmap_next_ = 0x0000'7F40'0000'0000ull;
+    // A file-backed MAP_SHARED mapping, and the whole reason it is remembered:
+    // a shared mapping is how a program *writes* a file without ever calling
+    // write(2), and ld does exactly that with its output.  The bytes have to go
+    // back when the mapping is dropped or flushed, or the linker exits 0 having
+    // produced nothing - which is precisely what it did.
+    struct SharedMap {
+        uint64_t base = 0, len = 0, off = 0;
+        int fd = -1;
+    };
+    std::vector<SharedMap> shared_maps_;
+    // Copies a shared mapping's bytes back to its file.  `all` writes every
+    // mapping (exit); otherwise only the one covering `base`.
+    void flush_shared_maps(uint64_t base, uint64_t len, bool all);
     uint64_t tid_address_ = 0;
     // Mach port names. Nothing here delivers a message, so a port only has to be a
     // number that is non-zero and distinct: the guest stores it, compares it, and

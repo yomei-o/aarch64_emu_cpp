@@ -1,4 +1,5 @@
 #include "files.h"
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
@@ -63,6 +64,8 @@ bool Files::is_dir(const std::string& path) const {
 
 int64_t Files::open(const std::string& path, int flags, int mode) {
     (void)mode;
+    if (std::getenv("A64EMU_TRACE_OPEN"))
+        std::fprintf(stderr, "[open] %s flags=%o\n", path.c_str(), flags);
     const std::string hp = host_path(path);
     // A directory open has to be refused with the error the guest expects rather
     // than by fopen quietly failing: opendir() asks for O_DIRECTORY and treats an
@@ -297,6 +300,21 @@ int64_t Files::pread(int fd, void* dst, uint64_t len, uint64_t off) {
     const size_t got = std::fread(dst, 1, len, it->second.fp);
     std::fseek(it->second.fp, save, SEEK_SET);
     return static_cast<int64_t>(got);
+}
+
+// The counterpart to pread, and the one a shared file mapping needs: the pages
+// are written back at an offset without disturbing wherever the descriptor's own
+// cursor happens to be.
+int64_t Files::pwrite(int fd, const void* src, uint64_t len, uint64_t off) {
+    auto it = open_.find(fd);
+    if (it == open_.end()) return kEBADF;
+    if (it->second.pipe || !it->second.fp) return -29;  // ESPIPE (see lseek)
+    const long save = std::ftell(it->second.fp);
+    std::fseek(it->second.fp, static_cast<long>(off), SEEK_SET);
+    const size_t put = std::fwrite(src, 1, len, it->second.fp);
+    std::fflush(it->second.fp);
+    std::fseek(it->second.fp, save, SEEK_SET);
+    return static_cast<int64_t>(put);
 }
 
 namespace {

@@ -386,6 +386,7 @@ bool Syscalls::spawn_workq_thread(bool overcommit, uint64_t workloop_id,
         w.ctx.x[3] = block + 8;
         w.ctx.x[4] |= kWqFlagWorkloop;
         w.ctx.x[5] = 1;
+        w.workloop = workloop_id;
     }
     w.ctx.x[30] = 0;                               // a worker never returns
     threads_.push_back(w);
@@ -508,6 +509,18 @@ void Syscalls::thread_exit(int status) {
             if (t.waiting && t.wait_addr == me.clear_child_tid) t.waiting = false;
     }
     if (!schedule(true)) {
+        // Nothing else can run.  If every other thread has *also* exited then this
+        // was the last one and the process is simply over; if any of them is
+        // blocked, it is not - they are waiting for something this thread was
+        // going to do, and ending the process with this thread's status reports a
+        // stall as a clean exit.  That cost an afternoon: ld exited 0 having
+        // written nothing, and the exit code was the emulator's own invention.
+        bool anyone_blocked = false;
+        for (const Thread& t : threads_)
+            if (!t.exited && t.waiting) anyone_blocked = true;
+        if (anyone_blocked)
+            throw CpuError{"a thread exited while the others are blocked: stalled",
+                           cpu_.pc, 0};
         cpu_.exit_code = status;
         cpu_.halted = true;
     }

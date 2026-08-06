@@ -48,6 +48,7 @@ public:
     // shell redirects -- so this is what a spawned child inherits.
     Files clone_for_exec() const { return *this; }
     int64_t pread(int fd, void* dst, uint64_t len, uint64_t off);
+    int64_t pwrite(int fd, const void* src, uint64_t len, uint64_t off);
     // Fills a Linux AArch64 `struct stat` (128 bytes). Returns 0 or -errno.
     int64_t fstat(int fd, void* statbuf);
     // Emits linux_dirent64 records into a host buffer; returns bytes written, 0 at

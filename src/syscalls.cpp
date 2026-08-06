@@ -491,8 +491,30 @@ int64_t Syscalls::sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t 
         std::vector<uint8_t> tmp(len);
         const int64_t got = files.pread(fd, tmp.data(), len, off);
         if (got > 0) mem_.write_bytes(base, tmp.data(), static_cast<uint64_t>(got));
+        // MAP_SHARED on a file is a *writable window onto the file*, and dropping
+        // the window has to put the bytes back.  This is not an exotic case: it is
+        // how ld writes its output - 186 million instructions and not one write(2)
+        // - so without it the linker exits 0 having produced nothing.
+        constexpr uint64_t kMAP_SHARED = 0x01;
+        if (flags & kMAP_SHARED) shared_maps_.push_back({base, len, off, fd});
     }
     return static_cast<int64_t>(base);
+}
+
+void Syscalls::flush_shared_maps(uint64_t base, uint64_t len, bool all) {
+    for (size_t i = 0; i < shared_maps_.size();) {
+        SharedMap& m = shared_maps_[i];
+        // A partial unmap of a mapping still means those bytes are now the file's;
+        // overlap is enough to write the whole window back, which is wasteful and
+        // never wrong.
+        const bool hit = all || (base < m.base + m.len && m.base < base + (len ? len : 1));
+        if (!hit) { ++i; continue; }
+        std::vector<uint8_t> tmp(static_cast<size_t>(m.len));
+        mem_.read_bytes(m.base, tmp.data(), m.len);
+        files.pwrite(m.fd, tmp.data(), m.len, m.off);
+        if (all) { ++i; continue; }              // exit: keep the list intact
+        shared_maps_.erase(shared_maps_.begin() + static_cast<long>(i));
+    }
 }
 
 uint64_t Syscalls::host_nanos() {

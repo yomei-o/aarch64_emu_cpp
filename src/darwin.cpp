@@ -1116,6 +1116,14 @@ int64_t Syscalls::mach_msg2(uint64_t data, uint64_t options, uint64_t bits_size,
                 if (run.size() >= 4)
                     std::fprintf(stderr, "[mac]   body: %s\n", run.c_str());
             }
+            // A message the bootstrap port cannot answer is not a malformed
+            // request, it is a request to a service that is not there - the same
+            // distinction the null-port case above makes, and the same answer.
+            // KERN_FAILURE tells libxpc its *message* was bad, and it then queues
+            // an async reply on a connection whose handler slot is still null and
+            // calls through it; MACH_SEND_INVALID_DEST tells it the peer is gone,
+            // which is a state it has a path for.
+            if (remote == kBootstrapPort) return kMachSendInvalidDest;
             return kKernFailure;
     }
 }
@@ -1307,6 +1315,18 @@ bool Syscalls::svc_darwin() {
             // it, and only fails if it is zero.
             case 16: mem_.write<uint32_t>(a2, next_port_++); r = kKernSuccess; break;
             case 24: mem_.write<uint32_t>(a3, next_port_++); r = kKernSuccess; break;
+            // mach_port_destruct(task, name, srdelta, guard): the other half of
+            // construct, and libxpc calls them in pairs - it builds a reply port
+            // per request and tears it down after.  Failing the teardown is not a
+            // leak, it is an error the caller acts on: libxpc abandoned the reply
+            // context half-built and then ran its async-reply block with a null
+            // handler, several thousand instructions later and nowhere near here.
+            // Ports are numbers that are never reused, so there is nothing to undo
+            // beyond forgetting any context word hung off this one.
+            case 25:
+                port_context_.erase(static_cast<uint32_t>(a1));
+                r = kKernSuccess;
+                break;
             case 18: case 19: case 21: case 22: r = kKernSuccess; break;
             case 26: r = next_port_++; break;              // mach_reply_port
             case 27: r = 0x103; break;                     // thread_self_trap
@@ -1381,6 +1401,11 @@ bool Syscalls::svc_darwin() {
 
     switch (nr) {
         case 1:                                            // exit
+            // Shared file mappings the guest never unmapped are still the file's
+            // contents: exiting is as much a commit as munmap is, and a program
+            // that maps its output and simply returns - ld does - would otherwise
+            // leave it empty.
+            flush_shared_maps(0, 0, true);
             // A vfork child exiting before it execs -- the `_exit(127)` after a failed
             // exec. The parent has to come back rather than the whole run ending.
             if (in_vfork_child()) {
@@ -1631,7 +1656,12 @@ bool Syscalls::svc_darwin() {
             r = sys_mmap(a0, a1, a2, lflags, static_cast<int>(cpu_.xr(4)), cpu_.xr(5));
             break;
         }
-        case 73: r = 0; break;                             // munmap: the arena never shrinks
+        // munmap: the arena never shrinks, but a *shared file mapping* has to be
+        // written back first - dropping the window is how a program says "the
+        // file is now what the memory says".
+        case 73: flush_shared_maps(a0, a1, false); r = 0; break;
+        // msync: the same write-back without dropping the mapping.
+        case 65: flush_shared_maps(a0, a1, false); r = 0; break;
         case 74: r = 0; break;                             // mprotect: no protection modelled
         case 75: case 232: r = 0; break;                   // madvise, posix_madvise
         case 20: r = 1000; break;                          // getpid
@@ -1822,10 +1852,23 @@ bool Syscalls::svc_darwin() {
                     // the process with "__workq_kernreturn returned", because on a
                     // real kernel this call never comes back.
                     if (workq_live_ > 0) --workq_live_;
-                    for (size_t k = 0; k < workloop_live_.size(); ++k) {
-                        // The workloop is free to be requested again.
-                        workloop_live_.erase(workloop_live_.begin() + k);
-                        break;
+                    // *This* worker's workloop becomes requestable again.  Erasing
+                    // whichever entry happened to be first instead - which is what
+                    // the first version did - leaves a workloop marked live
+                    // forever, so libdispatch's next request for it is silently
+                    // dropped and the work it was carrying never runs.  ld then
+                    // exits 0 having written nothing, which is the hardest kind of
+                    // failure to attribute.
+                    if (!threads_.empty()) {
+                        const uint64_t mine = threads_[cur_thread_].workloop;
+                        if (mine) {
+                            for (size_t k = 0; k < workloop_live_.size(); ++k) {
+                                if (workloop_live_[k] != mine) continue;
+                                workloop_live_.erase(workloop_live_.begin() +
+                                                     static_cast<long>(k));
+                                break;
+                            }
+                        }
                     }
                     thread_exit(0);
                     return true;

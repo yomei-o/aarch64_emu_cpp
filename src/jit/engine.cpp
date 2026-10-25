@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "native_host.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -30,6 +31,14 @@ Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
 #ifdef __EMSCRIPTEN__
     wasm_on = true;
 #endif
+#if defined(JIT_NATIVE_X64) || defined(JIT_NATIVE_A64)
+    native_on = true;
+#endif
+    if (const char* v = std::getenv(JIT_ENV("JIT_NATIVE"))) native_on = native_on && v[0] != '0';
+    if (const char* v = std::getenv(JIT_ENV("JIT_NATIVE_HOT"))) {
+        native_hot = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+        if (native_hot < 1) native_hot = 1;
+    }
     if (const char* v = std::getenv(JIT_ENV("JIT_WASM"))) wasm_on = v[0] != '0';
     if (const char* v = std::getenv(JIT_ENV("JIT_WASM_HOT"))) {
         wasm_hot = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
@@ -40,6 +49,7 @@ Engine::Engine(Cpu& c, Memory& m) : cpu(c), mem(m) {
 
 Engine::~Engine() {
     mem.set_code_observer(nullptr);
+    native_shutdown();
     if (std::getenv(JIT_ENV("JIT_STATS"))) print_stats();
     if (g_stats_engine == this) g_stats_engine = nullptr;
 }
@@ -79,7 +89,7 @@ void Engine::print_profile() {
 
 void Engine::print_stats() {
     if (profile) print_profile();
-    if (wasm_on || n_wasm_blocks)
+    if (wasm_on || n_wasm_blocks || native_on)
     {
         std::fprintf(stderr, "[jit] wasm tier: %llu blocks in %llu modules; ops left to the threaded handlers:",
                      (unsigned long long)n_wasm_blocks, (unsigned long long)n_wasm_modules);
@@ -90,6 +100,8 @@ void Engine::print_stats() {
             if (generic_calls[k]) std::fprintf(stderr, " #%zu x%llu", k, (unsigned long long)generic_calls[k]);
         std::fprintf(stderr, "\n");
     }
+    if (native_on || n_native_blocks)
+        std::fprintf(stderr, "[jit] native tier: %llu blocks of machine code\n", (unsigned long long)n_native_blocks);
     std::fprintf(stderr,
                  "[jit] translated %llu blocks, ran %llu (%llu native insns, %llu interpreted), invalidated %llu, stub hits %llu\n",
                  (unsigned long long)n_translated, (unsigned long long)n_blocks_run,
@@ -130,9 +142,9 @@ Block* Engine::translate(uint64_t pc) {
         IrBlock ir;
         if (translate_block(cpu, slots, pc, ir)) {
             compile_threaded(*this, ir, *blk);
-            if (wasm_on) {
+            if (wasm_on || native_on) {
                 // An op that jumps forward inside the block (A32Skip) only exists as a threaded
-                // handler; such a block is never compiled to WebAssembly.
+                // handler; such a block is never compiled to WebAssembly or machine code.
                 bool ok = true;
                 for (const Op& o : ir.ops) ok = ok && o.kind != OpKind::A32Skip;
                 if (ok) blk->ir_ops = ir.ops;
@@ -228,6 +240,31 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
             ctx.cur = nullptr;
             if (profile) ++b->hits;
             uint32_t done;
+            // The exit that left machine code last time (if one did) was heading here: when this
+            // block has machine code too, it can jump straight to it from now on.
+            uintptr_t* const npend = ctx.npending;
+            ctx.npending = nullptr;
+            if (native_on && !b->nat && !b->nat_failed && ++b->heat >= native_hot) native_compile(b);
+            if (b->nat) {
+                // Machine code: runs this block and then whichever ones its exits lead to.
+                if (npend) {
+                    *npend = reinterpret_cast<uintptr_t>(b->nat);
+                    nlinked_cells_.push_back(npend);
+                }
+                ctx.fault_rip = 0;
+                const uint64_t left = deadline > Glue::icount(cpu) ? deadline - Glue::icount(cpu) : 1;
+                const bool ok = native_run(b, ctx, left, &done);
+                Glue::add_icount(cpu, done);
+                n_insns_native += done;
+                any = true;
+                if (!ok) {
+                    std::exception_ptr e = nexc_;
+                    nexc_ = nullptr;
+                    std::rethrow_exception(e);
+                }
+                if (Glue::halted(cpu) || (yield && *yield) || Glue::icount(cpu) >= deadline) break;
+                continue;
+            }
             if (b->wasm_fn) {
                 // The block a static exit was heading for has now been found: next time
                 // that exit goes straight there.
@@ -284,9 +321,19 @@ bool Engine::run_plain(Block* b) {
     Ctx ctx{Glue::env(cpu), &cpu, &mem, this, epoch, -1, false, nullptr, false, -1, nullptr, 0};
     ++depth_;
     if (!b->wasm_fn && wasm_on && ++b->heat == wasm_hot && !b->wasm_queued) wasm_queue(b);
+    if (native_on && !b->nat && !b->nat_failed && !b->wasm_fn && ++b->heat >= native_hot) native_compile(b);
     const Uop* u = b->code.data();
     try {
-        if (b->wasm_fn) {
+        if (b->nat) {
+            // limit 1: run this block, and not whatever it would chain to.
+            uint32_t d;
+            if (!native_run(b, ctx, 1, &d)) {
+                std::exception_ptr e = nexc_;
+                nexc_ = nullptr;
+                std::rethrow_exception(e);
+            }
+            ctx.partial = static_cast<int>(d);
+        } else if (b->wasm_fn) {
             // limit 1: run this block, and not whatever it would chain to.
             ctx.partial = reinterpret_cast<ChainFn>(static_cast<uintptr_t>(wasm_chain_fn))(ctx.env, &ctx, b->wasm_fn, 1);
         } else {

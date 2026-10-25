@@ -54,6 +54,8 @@ public:
             it = pages_.emplace(vpn, std::move(p)).first;
         }
         cache_vpn_ = vpn; cache_ = it->second.get();
+        TlbEntry& e = tlb_[vpn & (kTlbSize - 1)];
+        e.page = vpn; e.host = cache_;
         return cache_;
     }
 
@@ -73,9 +75,22 @@ public:
     // Declares that translations were made from this granule.  Writes to it are
     // reported from now on (until the first one, which also ends the declaration).
     bool mark_code_page(uint64_t granule) {
-        if (code_granules_.insert(granule).second) ++code_filter_[granule & kFilterMask];
+        if (code_granules_.insert(granule).second) {
+            ++code_filter_[granule & kFilterMask];
+            // A page with translated code in it is not written through the page cache: stores
+            // must come back here to be noticed.
+            const uint64_t vpn = granule >> (kPageBits - 12);
+            ++code_pages_[vpn];
+            TlbEntry& e = tlbw_[vpn & (kTlbSize - 1)];
+            if (e.page == vpn) { e.page = kTlbNone; e.host = nullptr; }
+        }
         return true;
     }
+    // The page caches the translated code probes inline (see jit/glue.h).  Entries are
+    // {page number, host address}; the write cache never holds a page with translated
+    // code, and nothing while an undo log is open.
+    const void* tlb_read_base() const { return tlb_; }
+    const void* tlb_write_base() const { return tlbw_; }
     // The bytes of a page (index = address >> kPageBits), for the verifier.
     uint8_t* page_ptr(uint64_t vpn) { return page(vpn << kPageBits); }
     // A host pointer to code, and where its page ends, for the frontend.
@@ -88,7 +103,7 @@ public:
     // first, so the JIT can run a block twice - translated, then interpreted - from
     // the same starting memory.  (Separate from the undo logs `fork` uses below.)
     using Journal = std::unordered_map<uint64_t, std::unique_ptr<std::array<uint8_t, kPageSize>>>;
-    void journal_begin() { vjournal_.clear(); vjournal_on_ = true; }
+    void journal_begin() { vjournal_.clear(); vjournal_on_ = true; flush_write_tlb(); }
     void journal_end() { vjournal_on_ = false; }
     Journal& journal() { return vjournal_; }
 
@@ -115,7 +130,15 @@ public:
                 }
             }
         }
-        return page(addr);
+        uint8_t* p = page(addr);
+        if (!vjournal_on_ && journals_.empty()) {
+            const uint64_t vpn = addr >> kPageBits;
+            if (!code_pages_.count(vpn)) {
+                TlbEntry& e = tlbw_[vpn & (kTlbSize - 1)];
+                e.page = vpn; e.host = p;
+            }
+        }
+        return p;
     }
 
     // Undo logs, for `fork`.
@@ -132,7 +155,7 @@ public:
     // saved into *every* open journal rather than only the innermost, so an inner
     // rollback and an inner discard are both correct without the outer one knowing
     // which happened.
-    void begin_journal() { journals_.emplace_back(); }
+    void begin_journal() { journals_.emplace_back(); flush_write_tlb(); }
     void rollback_journal() {
         if (journals_.empty()) return;
         for (auto& kv : journals_.back()) {
@@ -140,6 +163,7 @@ public:
             else pages_.erase(kv.first);
         }
         journals_.pop_back();
+        flush_tlb();                                 // pages were erased and replaced
         cache_ = nullptr;                            // the one-entry lookup cache may
         cache_vpn_ = ~0ull;                          // point at a page just erased
         // Pages were put back behind the translator's back.
@@ -258,14 +282,31 @@ private:
         for (uint64_t g = a >> 12, last = (a + n - 1) >> 12; g <= last; ++g)
             if (code_filter_[g & kFilterMask] && code_granules_.erase(g)) {
                 --code_filter_[g & kFilterMask];
+                { auto it = code_pages_.find(g >> (kPageBits - 12)); if (it != code_pages_.end() && --it->second == 0) code_pages_.erase(it); }
                 code_obs_->on_code_write(g);
             }
     }
     void forget_code() {
         code_granules_.clear();
+        code_pages_.clear();
         for (auto& f : code_filter_) f = 0;
         code_obs_->on_code_flush_all();
     }
+    static constexpr int kTlbBits = 10;
+    static constexpr int kTlbSize = 1 << kTlbBits;
+    static constexpr uint64_t kTlbNone = ~uint64_t(0);
+    struct TlbEntry {
+        uint64_t page = kTlbNone;
+        uint8_t* host = nullptr;
+    };
+    void flush_write_tlb() { for (auto& e : tlbw_) { e.page = kTlbNone; e.host = nullptr; } }
+    void flush_tlb() {
+        for (auto& e : tlb_) { e.page = kTlbNone; e.host = nullptr; }
+        flush_write_tlb();
+    }
+    TlbEntry tlb_[kTlbSize];
+    TlbEntry tlbw_[kTlbSize];
+    std::unordered_map<uint64_t, uint32_t> code_pages_;   // page -> how many of its 4 KiB granules hold translations
     CodeObserver* code_obs_ = nullptr;
     uint16_t code_filter_[kFilterMask + 1] = {};
     std::unordered_set<uint64_t> code_granules_;

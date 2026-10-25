@@ -26,8 +26,8 @@ using GFault = a64::CpuError;
 
 // Translations are tracked, and invalidated, in units of 2^kCodeBits bytes.
 constexpr int kCodeBits = 12;
-// This guest has no direct-mapped page cache for the wasm tier to probe inline; the
-// numbers are only here so the shared code compiles.
+// The page cache that the wasm and native tiers probe inline: 2^kTlbBits direct mapped
+// entries of {page number, host address}, indexed by (addr >> kTlbPageBits) & mask.
 constexpr int kTlbPageBits = 16;
 constexpr int kTlbBits = 10;
 
@@ -40,6 +40,7 @@ struct GuestSlots {
     int32_t ntmp = 0;      // how many temporaries
     int32_t sp = 0;        // the stack pointer (register 31 as a base)
     int32_t tpidr = 0;     // TPIDR_EL0
+    int32_t fl_n = 0, fl_z = 0, fl_c = 0, fl_v = 0;   // the NZCV flags, a byte each
 };
 
 // A guest's machine state as the verifier compares it.
@@ -84,8 +85,8 @@ struct Glue {
     static void wr64(GMemory& m, uint64_t a, uint64_t v) { m.write<uint64_t>(a, v); }
 
     // The page cache the wasm tier probes inline; null where the guest has none.
-    static const void* tlb_read_base(const GMemory&) { return nullptr; }
-    static const void* tlb_write_base(const GMemory&) { return nullptr; }
+    static const void* tlb_read_base(const GMemory& m) { return m.tlb_read_base(); }
+    static const void* tlb_write_base(const GMemory& m) { return m.tlb_write_base(); }
 
     // The verifier.
     static void take(const GCpu& c, GuestState& s);

@@ -8,6 +8,7 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
@@ -37,6 +38,8 @@ struct Ctx {
     int32_t cur_pc;    // (unused)
     uint32_t* pending_cell;   // wasm tier: a static exit that found no successor ready; C++ fills it in
     uint64_t fault_rip;       // wasm tier: guest address of the instruction in a slow memory access, or 0
+    int nfault;               // native tier: a helper called from generated code caught an exception (Engine::nexc_)
+    uintptr_t* npending;      // native tier: like pending_cell
 };
 
 struct Uop {
@@ -68,6 +71,11 @@ struct Block {
     uint32_t wasm_fn = 0;
     bool wasm_queued = false;
     std::unique_ptr<uint32_t[]> cells;   // wasm tier: one word per static exit, see backend_wasm.cpp
+    // The native tier (backend_native.cpp): the machine code, once there is some, and the
+    // words its static exits jump through.
+    const uint8_t* nat = nullptr;
+    bool nat_failed = false;
+    std::unique_ptr<uintptr_t[]> ncells;
 };
 
 class Engine : public GObserver {
@@ -118,6 +126,8 @@ public:
     void unlink_all() {
         for (uint32_t* c : linked_cells_) *c = 0;
         linked_cells_.clear();
+        for (uintptr_t* c : nlinked_cells_) *c = 0;
+        nlinked_cells_.clear();
     }
     // batches, into WebAssembly modules built at run time.
     void wasm_queue(Block* b);
@@ -125,6 +135,20 @@ public:
     bool wasm_on = false;
     uint32_t wasm_hot = 20000;   // below this, V8 runs the new code in its baseline tier, which loses to the threaded handlers
     uint32_t wasm_batch = 32;
+    // The native tier: blocks that have run `native_hot` times get machine code, where the
+    // host has a backend for it (x86-64 so far).
+    bool native_on = false;
+    uint32_t native_hot = 30;
+    uint64_t n_native_blocks = 0;
+    std::vector<uintptr_t*> nlinked_cells_;
+    std::exception_ptr nexc_;     // what a helper called from generated code caught
+    bool native_init();
+    void native_compile(Block* b);
+    void native_reset();          // forget all machine code (the arena is full)
+    void native_shutdown();
+    bool native_run(Block* b, Ctx& ctx, uint64_t limit, uint32_t* done);
+    struct NativeState;
+    NativeState* nat_ = nullptr;
     std::vector<Block*> wasm_pending_;
     uint64_t n_wasm_blocks = 0, n_wasm_modules = 0;
     uint64_t wasm_fallbacks[128] = {};   // ops the wasm tier runs through their threaded handler, by kind

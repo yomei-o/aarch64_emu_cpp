@@ -283,6 +283,12 @@ sh tests/run_tests.sh
   personality, including the loader that stands in for Apple's dyld. Not a fork of
   the first: the same CPU, the same memory, the same file layer, reached through
   `svc #0x80` instead of `svc #0`.
+- `src/jit/` — the same block-translating JIT as x86_emu_cpp and arm_emu_cpp (shared files
+  plus an A64 front end, `frontend_a64.cpp`): threaded handlers, native machine code for
+  x86-64 and AArch64 hosts, and a WebAssembly tier. On by default; `A64EMU_JIT=0` turns it
+  off, `A64EMU_JIT_VERIFY=1` runs every block twice (translated, then interpreted) and stops
+  at the first difference, `A64EMU_JIT_NATIVE=0` keeps the machine-code tier off. A pure
+  Python loop in macOS's CPython runs 2.9x faster than interpreted (ARM64 host).
 - `src/threads.cpp` — `clone`, `futex`, and a scheduler. One emulated CPU running
   one guest thread at a time, switched at futex/yield/exit and preempted every
   20,000 instructions so a spin loop cannot keep the CPU.

@@ -23,7 +23,7 @@ echo "== building web/aarch64emu.js"
     -sSINGLE_FILE=1 -sALLOW_MEMORY_GROWTH=1 \
     -sMAXIMUM_MEMORY=2GB \
     -sEXPORTED_FUNCTIONS='["_emu_run","_emu_error","_emu_instructions","_malloc","_free"]' \
-    -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","HEAPU8","FS","stringToUTF8","lengthBytesUTF8"]' \
+    -sEXPORTED_RUNTIME_METHODS='["ccall","cwrap","HEAPU8","FS","stringToUTF8","lengthBytesUTF8","wasmTable","wasmMemory"]' -sALLOW_TABLE_GROWTH=1 \
     -sFORCE_FILESYSTEM=1 -sENVIRONMENT=web,worker,node --no-entry
 ls -l web/aarch64emu.js
 echo done

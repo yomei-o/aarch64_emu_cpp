@@ -31,8 +31,10 @@ using Fn = const Uop* (*)(Ctx*, const Uop*);
 // handler returns the next op and run() loops.
 #if defined(JIT_NO_MUSTTAIL) || !(defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 15))
 #define NEXT() return u + 1
+#define JUMP(p) return (p)
 #else
 #define NEXT() [[gnu::musttail]] return (u + 1)->fn(c, u + 1)
+#define JUMP(p) [[gnu::musttail]] return (p)->fn(c, p)
 #endif
 
 template <int SZ> constexpr uint64_t mask_of() {

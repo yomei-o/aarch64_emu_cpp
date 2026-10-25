@@ -59,6 +59,8 @@ struct Glue {
     static void fill_slots(GuestSlots& s, GCpu& c);
 
     static uint64_t pc(const GCpu& c) { return c.pc; }
+    // Whether the program counter has reached the address a bounded run stops at.
+    static bool is_stop(uint64_t pc, uint64_t stop) { return pc == stop; }
     static void set_pc(GCpu& c, uint64_t v) { c.pc = v; }
     static uint64_t icount(const GCpu& c) { return c.insns; }
     static void add_icount(GCpu& c, uint64_t n) { c.insns += n; }

@@ -130,7 +130,13 @@ Block* Engine::translate(uint64_t pc) {
         IrBlock ir;
         if (translate_block(cpu, slots, pc, ir)) {
             compile_threaded(*this, ir, *blk);
-            if (wasm_on) blk->ir_ops = ir.ops;
+            if (wasm_on) {
+                // An op that jumps forward inside the block (A32Skip) only exists as a threaded
+                // handler; such a block is never compiled to WebAssembly.
+                bool ok = true;
+                for (const Op& o : ir.ops) ok = ok && o.kind != OpKind::A32Skip;
+                if (ok) blk->ir_ops = ir.ops;
+            }
             blk->insns = ir.insns;
             blk->effects = ir.effects;
             blk->guest_bytes = ir.guest_bytes;
@@ -198,7 +204,7 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
     if (verify) {
         // One block at a time, each checked against the interpreter.
         const uint64_t pc = Glue::pc(cpu);
-        if (pc == stop_pc || Glue::in_hook(cpu, pc)) return false;
+        if (Glue::is_stop(pc, stop_pc) || Glue::in_hook(cpu, pc)) return false;
         return run_block();
     }
     reclaim();
@@ -210,7 +216,7 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
     try {
         for (;;) {
             const uint64_t pc = Glue::pc(cpu);
-            if (pc == stop_pc || Glue::in_hook(cpu, pc)) break;
+            if (Glue::is_stop(pc, stop_pc) || Glue::in_hook(cpu, pc)) break;
             b = lookup(pc);
             if (!b) b = translate(pc);
             if (b->stub) {

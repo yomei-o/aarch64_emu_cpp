@@ -67,6 +67,22 @@ namespace jit {
 //     operand in d.
 //   A64Sbfm / A64Bfm / A64Ubfm: the bitfield moves: imm = wmask, imm2 = tmask,
 //     c = immr, cc = imms.
+// ARM (ops_arm.cpp), registers are 32-bit values in 64-bit cells:
+//   A32Dp / A32DpI: a data-processing instruction, cc = the opcode (AND..MVN as in
+//     the A32 encoding), b a slot or (A32DpI) imm; kFlagEager also sets NZCV; for
+//     the logical opcodes imm2 is the carry the operand produced (-1: C unchanged).
+//     Compares write their result to d, a scratch cell.
+//   A32Jcc: B<cond>: rip = cond(cc) ? imm : imm2.
+//   A32ExitIf: leave the block, rip = imm, if cond(cc) does NOT hold (the
+//     conditional instructions that follow are skipped).
+//   A32Bx: interworking branch to slot a (bit 0 selects Thumb).
+//   A32Shift: d = a shifted by the low byte of slot b; cc = 0 LSL, 1 LSR, 2 ASR, 3 ROR.
+//   A32Skip: if cond(cc) does NOT hold, continue imm ops further on (an IT block's
+//     conditional instruction).  A block holding one is never compiled to WebAssembly.
+//   A32Ldm / A32Stm: load / store the registers r0..r14 in the list imm, from
+//     consecutive words starting at slot a + the offset c.  A32Ldm also loads the
+//     word for R15 into slot d when bit 15 of the list is set.  A32Stm with kFlagChk
+//     leaves the block, rip = imm2, if translated code was invalidated.
 #define JIT_OP_KINDS(X) \
     X(Nop) X(Mov) X(MovI) X(Add) X(AddI) X(Sub) X(SubI) X(And) X(AndI) X(Or) X(OrI) X(Xor) X(XorI) \
     X(Bin) X(BinI) X(Un) X(Lea) X(Ext) X(Put) X(GetH) X(Ld) X(LdS) X(St) X(Sel) \
@@ -74,7 +90,8 @@ namespace jit {
     X(SetFl) X(JccFl) X(Alu) X(AluI) X(IncDec) X(ShlI) X(ShrI) X(SarI) X(Shift) X(ShiftI) X(ShiftSlow) \
     X(Imul) X(ImulI) X(Group3) X(CcSet) X(CcSetI) X(CcMat) X(CcClear) X(JccCmp) X(JccCmpI) \
     X(Push) X(PushI) X(Pop) X(Ret) X(Call) \
-    X(A64BinS) X(A64BinSI) X(A64Csel) X(A64Jcc) X(A64Ccmp) X(A64CcmpI) X(A64Sbfm) X(A64Bfm) X(A64Ubfm)
+    X(A64BinS) X(A64BinSI) X(A64Csel) X(A64Jcc) X(A64Ccmp) X(A64CcmpI) X(A64Sbfm) X(A64Bfm) X(A64Ubfm) \
+    X(A32Dp) X(A32DpI) X(A32Jcc) X(A32ExitIf) X(A32Bx) X(A32Shift) X(A32Ldm) X(A32Stm) X(A32Skip)
 
 enum class OpKind : uint8_t {
 #define JIT_X(n) n,

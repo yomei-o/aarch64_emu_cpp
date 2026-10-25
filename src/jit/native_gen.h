@@ -86,6 +86,22 @@ struct NativeGen {
         a.alu_ri(x64::ADD, true, x64::R13, ni);
         a.jmp_abs(leave);
     }
+    // rip is set and the target is in rax: jump to its machine code if the engine has put it in
+    // the indirect branch table, else leave.
+    void leave_indirect(int ni) {
+        a.alu_ri(x64::ADD, true, x64::R13, ni);
+        a.alu_rr(x64::CMP, true, x64::R13, x64::R14);
+        a.jcc_abs(x64::GE, leave);
+        a.mov_rr32(x64::RCX, x64::RAX);
+        a.alu_ri(x64::AND, false, x64::RCX, 4095);
+        a.shift_i(x64::SHL, false, x64::RCX, 4);
+        a.movi(x64::RDX, static_cast<int64_t>(reinterpret_cast<uintptr_t>(eng.ind_.data())));
+        a.alu_rr(x64::ADD, true, x64::RDX, x64::RCX);
+        a.alu_rm(x64::CMP, true, x64::RAX, x64::RDX, 0);
+        a.jcc_abs(x64::NE, leave);
+        a.load64(x64::RAX, x64::RDX, 8);
+        a.jmp_r(x64::RAX);
+    }
     // rip = target, then on to the block for it if it has run; otherwise back to the engine,
     // which finds (or translates) it and fills in `cell` for next time.
     void exit_static(uint64_t target, int ni) {

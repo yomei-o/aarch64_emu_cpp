@@ -256,6 +256,11 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
                     nlinked_cells_.push_back(npend);
                 }
                 ctx.fault_rip = 0;
+                {
+                    uintptr_t* e = &ind_[(b->start & 4095) * 2];
+                    e[0] = static_cast<uintptr_t>(b->start);
+                    e[1] = reinterpret_cast<uintptr_t>(b->nat);
+                }
                 const uint64_t left = deadline > Glue::icount(cpu) ? deadline - Glue::icount(cpu) : 1;
                 const bool ok = native_run(b, ctx, left, &done);
                 Glue::add_icount(cpu, done);

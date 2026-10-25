@@ -128,6 +128,7 @@ public:
         linked_cells_.clear();
         for (uintptr_t* c : nlinked_cells_) *c = 0;
         nlinked_cells_.clear();
+        for (size_t i = 0; i < ind_.size(); i += 2) ind_[i] = ~uintptr_t(0);
     }
     // batches, into WebAssembly modules built at run time.
     void wasm_queue(Block* b);
@@ -140,6 +141,9 @@ public:
     bool native_on = false;
     uint32_t native_hot = 30;
     uint64_t n_native_blocks = 0;
+    // Indirect branches (returns, computed jumps) from machine code look the target up here:
+    // 4096 direct mapped entries of {guest address, code}; the engine fills them in.
+    std::vector<uintptr_t> ind_ = std::vector<uintptr_t>(8192, ~uintptr_t(0));
     uint64_t native_gen = 0;      // counts the times all machine code was thrown away
     std::vector<uintptr_t*> nlinked_cells_;
     std::exception_ptr nexc_;     // what a helper called from generated code caught

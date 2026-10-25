@@ -556,7 +556,7 @@ void Engine::native_compile(Block* b) {
                 break;
             case OpKind::ExitInd:
                 g.ld(RAX, o.a); g.st(s.rip, RAX);
-                g.leave_with(insns);
+                g.leave_indirect(insns);
                 break;
             case OpKind::JccGen: case OpKind::JccGenI: {
                 const Cond cond = static_cast<Cond>(o.cc);

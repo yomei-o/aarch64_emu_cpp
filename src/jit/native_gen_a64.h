@@ -85,6 +85,20 @@ struct NativeGenA {
         if (n < 4096) a.add_imm(true, ra::COUNT, ra::COUNT, static_cast<uint32_t>(n));
         else { a.mov_imm(16, static_cast<uint64_t>(n)); a.alu(a64::ADD, true, ra::COUNT, ra::COUNT, 16); }
     }
+    // rip is set and the target is in x0: jump to its machine code if the engine has put it in
+    // the indirect branch table, else leave.
+    void leave_indirect(int ni) {
+        add_count(ni);
+        a.cmp(true, ra::COUNT, ra::LIMIT);
+        b_cond_leave(a64::GE);
+        a.ubfm(true, 1, 0, 0, 11);
+        a.mov_imm(2, reinterpret_cast<uintptr_t>(eng.ind_.data()));
+        a.alu(a64::ADD, true, 2, 2, 1, a64::LSL, 4);
+        a.ldp(3, 4, 2, 0);
+        a.cmp(true, 0, 3);
+        b_cond_leave(a64::NE);
+        a.br(4);
+    }
     // rip = target, then on to the block for it if it has run; otherwise back to the engine,
     // which finds (or translates) it and fills in the word for next time.
     void exit_static(uint64_t target, int ni) {

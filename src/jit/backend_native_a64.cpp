@@ -94,7 +94,15 @@ struct WriteScope {   // Apple silicon: JIT memory is writable or executable per
     }
 };
 
-constexpr size_t kArena = 64u << 20;
+// The size of the code arena: 64 MiB, or JIT_NATIVE_ARENA_KB (for testing the path that starts
+// over when the arena fills up).
+size_t arena_size() {
+    if (const char* v = std::getenv(JIT_ENV("JIT_NATIVE_ARENA_KB"))) {
+        const size_t kb = static_cast<size_t>(std::strtoull(v, nullptr, 10));
+        if (kb >= 2048) return kb << 10;
+    }
+    return size_t(64) << 20;
+}
 
 }  // namespace
 
@@ -137,6 +145,17 @@ int native_generic_helper(Ctx* c, const Uop* u, uint64_t start) {
     }
 }
 
+// Compares the offset in the page (x3) with the last offset an access of `size` bytes fits at.
+void cmp_page_limit(Asm& a, int size) {
+    const uint32_t limit = (1u << kTlbPageBits) - static_cast<uint32_t>(size);
+    if (limit < 4096) {
+        a.cmp_imm(true, 3, limit);
+    } else {
+        a.mov_imm(16, limit);
+        a.cmp(true, 3, 16);
+    }
+}
+
 void NativeGenA::mem_read(int size, uint64_t rip) {
     const uint64_t meta = (rip << 8) | static_cast<uint64_t>(size);
     auto slow_call = [this, meta] {
@@ -158,7 +177,7 @@ void NativeGenA::mem_read(int size, uint64_t rip) {
     a.cmp(true, 1, 3);
     a.b_cond(NE, *slow);
     a.ubfm(true, 3, 0, 0, kTlbPageBits - 1);               // x3 = offset in the page
-    a.cmp_imm(true, 3, (1u << kTlbPageBits) - static_cast<uint32_t>(size));
+    cmp_page_limit(a, size);
     a.b_cond(HI, *slow);                                   // straddles the page
     a.ldr64(2, 2, 8);                                      // x2 = host base
     switch (size) {
@@ -197,7 +216,7 @@ void NativeGenA::mem_write(int size, uint64_t rip) {
     a.cmp(true, 1, 3);
     a.b_cond(NE, *slow);
     a.ubfm(true, 3, 0, 0, kTlbPageBits - 1);
-    a.cmp_imm(true, 3, (1u << kTlbPageBits) - static_cast<uint32_t>(size));
+    cmp_page_limit(a, size);
     a.b_cond(HI, *slow);
     a.ldr64(2, 2, 8);
     switch (size) {
@@ -216,11 +235,11 @@ void NativeGenA::mem_write(int size, uint64_t rip) {
 
 bool Engine::native_init() {
     if (nat_) return true;
-    uint8_t* mem_base = alloc_exec(kArena);
+    uint8_t* mem_base = alloc_exec(arena_size());
     if (!mem_base) return false;
     nat_ = new NativeState;
     nat_->base = mem_base;
-    nat_->cap = kArena;
+    nat_->cap = arena_size();
     Asm a(mem_base);
     a.stp_pre(FP, LR, SP, -96);
     a.stp(19, 20, SP, 16);
@@ -266,6 +285,7 @@ void Engine::native_shutdown() {
 
 void Engine::native_reset() {
     if (!nat_) return;
+    ++native_gen;
     unlink_all();
     for (auto& b : all_) {
         b->nat = nullptr;
@@ -574,6 +594,12 @@ void Engine::native_compile(Block* b) {
         std::memcpy(where, a.w.data(), a.bytes());
     }
     sync_code(where, a.bytes());
+    if (const char* dir = std::getenv(JIT_ENV("JIT_NATIVE_DUMP"))) {   // for the disassembler: one file per block
+        char path[512];
+        std::snprintf(path, sizeof path, "%s/blk_%04llu_%llx.bin", dir, (unsigned long long)n_native_blocks,
+                      (unsigned long long)b->start);
+        if (std::FILE* f = std::fopen(path, "wb")) { std::fwrite(a.w.data(), 1, a.bytes(), f); std::fclose(f); }
+    }
     b->nat = where;
     nat_->used += (a.bytes() + 15) & ~size_t(15);
     ++n_native_blocks;

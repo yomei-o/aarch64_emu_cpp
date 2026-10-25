@@ -242,9 +242,13 @@ bool Engine::run(uint64_t deadline, uint64_t stop_pc, const bool* yield) {
             uint32_t done;
             // The exit that left machine code last time (if one did) was heading here: when this
             // block has machine code too, it can jump straight to it from now on.
-            uintptr_t* const npend = ctx.npending;
+            uintptr_t* npend = ctx.npending;
             ctx.npending = nullptr;
-            if (native_on && !b->nat && !b->nat_failed && ++b->heat >= native_hot) native_compile(b);
+            if (native_on && !b->nat && !b->nat_failed && ++b->heat >= native_hot) {
+                const uint64_t gen = native_gen;
+                native_compile(b);
+                if (native_gen != gen) npend = nullptr;   // the words that exit pointed through are gone
+            }
             if (b->nat) {
                 // Machine code: runs this block and then whichever ones its exits lead to.
                 if (npend) {

@@ -140,6 +140,7 @@ public:
     bool native_on = false;
     uint32_t native_hot = 30;
     uint64_t n_native_blocks = 0;
+    uint64_t native_gen = 0;      // counts the times all machine code was thrown away
     std::vector<uintptr_t*> nlinked_cells_;
     std::exception_ptr nexc_;     // what a helper called from generated code caught
     bool native_init();

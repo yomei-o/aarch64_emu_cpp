@@ -3,6 +3,7 @@
 // bits 28..25 pick the group, then each group sub-decodes on its own fields.
 #include "cpu.h"
 #include <cstdio>
+#include <cstdlib>
 
 namespace a64 {
 

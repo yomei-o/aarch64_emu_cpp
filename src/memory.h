@@ -20,10 +20,23 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <array>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace a64 {
+
+// Told when translated code may have gone stale.  The JIT (src/jit) registers
+// itself here; see Memory::mark_code_page.
+struct CodeObserver {
+    virtual ~CodeObserver() = default;
+    // A guest write is about to land in a 4 KiB granule that holds translated code.
+    virtual void on_code_write(uint64_t granule) = 0;
+    // The address space was changed wholesale (a vfork child rolled back): drop everything.
+    virtual void on_code_flush_all() = 0;
+    virtual void on_code_unmap(uint64_t granule) = 0;
+};
 
 class Memory {
 public:
@@ -47,7 +60,47 @@ public:
     // The page a *write* is about to land on. Identical to `page()` except that it
     // records the page's previous contents in every open journal, which is what makes
     // `fork` honest -- see begin_journal().
+    // ---- translated code ---------------------------------------------------------
+    //
+    // Translations are tracked in 4 KiB granules, finer than this class's pages: a
+    // 64 KiB page that holds a program's code and its data would otherwise have its
+    // translations thrown away by every store to a variable.
+    //
+    // Every guest write goes through page_for_write, so that is where a write to a
+    // granule with translations is noticed.  A byte-per-slot filter keeps the common
+    // case - a store to data - down to one load and a compare.
+    void set_code_observer(CodeObserver* o) { code_obs_ = o; }
+    // Declares that translations were made from this granule.  Writes to it are
+    // reported from now on (until the first one, which also ends the declaration).
+    bool mark_code_page(uint64_t granule) {
+        if (code_granules_.insert(granule).second) ++code_filter_[granule & kFilterMask];
+        return true;
+    }
+    // The bytes of a page (index = address >> kPageBits), for the verifier.
+    uint8_t* page_ptr(uint64_t vpn) { return page(vpn << kPageBits); }
+    // A host pointer to code, and where its page ends, for the frontend.
+    const uint8_t* code_window(uint64_t addr, const uint8_t** end) {
+        uint8_t* p = page(addr) + (addr & kPageMask);
+        *end = p + (kPageSize - (addr & kPageMask));
+        return p;
+    }
+    // While a verify journal is open every page written for the first time is copied
+    // first, so the JIT can run a block twice - translated, then interpreted - from
+    // the same starting memory.  (Separate from the undo logs `fork` uses below.)
+    using Journal = std::unordered_map<uint64_t, std::unique_ptr<std::array<uint8_t, kPageSize>>>;
+    void journal_begin() { vjournal_.clear(); vjournal_on_ = true; }
+    void journal_end() { vjournal_on_ = false; }
+    Journal& journal() { return vjournal_; }
+
     uint8_t* page_for_write(uint64_t addr) {
+        if (vjournal_on_) {
+            const uint64_t vpn = addr >> kPageBits;
+            if (!vjournal_.count(vpn)) {
+                auto copy = std::make_unique<std::array<uint8_t, kPageSize>>();
+                std::memcpy(copy->data(), page(addr), kPageSize);
+                vjournal_.emplace(vpn, std::move(copy));
+            }
+        }
         if (!journals_.empty()) {
             const uint64_t vpn = addr >> kPageBits;
             const bool existed = pages_.find(vpn) != pages_.end();
@@ -89,6 +142,8 @@ public:
         journals_.pop_back();
         cache_ = nullptr;                            // the one-entry lookup cache may
         cache_vpn_ = ~0ull;                          // point at a page just erased
+        // Pages were put back behind the translator's back.
+        if (code_obs_) forget_code();
     }
     void discard_journal() { if (!journals_.empty()) journals_.pop_back(); }
 
@@ -148,6 +203,7 @@ public:
             on_watch(a, sizeof(T), as_u64, true);
         }
         if (((a & kPageMask) + sizeof(T)) <= kPageSize) {
+            note_write(a, sizeof(T));
             std::memcpy(page_for_write(a) + (a & kPageMask), &v, sizeof(T)); return;
         }
         write_bytes(a, &v, sizeof(T));
@@ -167,6 +223,7 @@ public:
         while (n) {
             const uint64_t off = a & kPageMask;
             const uint64_t k = std::min(n, kPageSize - off);
+            note_write(a, k);
             std::memcpy(page_for_write(a) + off, s, k);
             a += k; s += k; n -= k;
         }
@@ -175,6 +232,7 @@ public:
         while (n) {
             const uint64_t off = a & kPageMask;
             const uint64_t k = std::min(n, kPageSize - off);
+            note_write(a, k);
             std::memset(page_for_write(a) + off, byte, k);
             a += k; n -= k;
         }
@@ -193,6 +251,26 @@ public:
     uint64_t mapped_pages() const { return pages_.size(); }
 
 private:
+    static constexpr uint64_t kFilterMask = 4095;
+    // A write is about to cover [a, a + n): tell the observer if it touches code.
+    void note_write(uint64_t a, uint64_t n) {
+        if (!code_obs_) return;
+        for (uint64_t g = a >> 12, last = (a + n - 1) >> 12; g <= last; ++g)
+            if (code_filter_[g & kFilterMask] && code_granules_.erase(g)) {
+                --code_filter_[g & kFilterMask];
+                code_obs_->on_code_write(g);
+            }
+    }
+    void forget_code() {
+        code_granules_.clear();
+        for (auto& f : code_filter_) f = 0;
+        code_obs_->on_code_flush_all();
+    }
+    CodeObserver* code_obs_ = nullptr;
+    uint16_t code_filter_[kFilterMask + 1] = {};
+    std::unordered_set<uint64_t> code_granules_;
+    bool vjournal_on_ = false;
+    Journal vjournal_;
     std::unordered_map<uint64_t, std::unique_ptr<uint8_t[]>> pages_;
     // One undo log per open journal; see begin_journal().  A list, not a
     // vector: growing a vector moves the maps, and MSVC 19.31 resolves

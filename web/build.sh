@@ -13,7 +13,7 @@ command -v "$EMCC" >/dev/null 2>&1 || { echo "emcc not found; set EMCC=/path/to/
 
 # Everything in src/ except the command-line front end, which web/wasm_api.cpp
 # replaces. Globbing keeps this from going stale when a source file is added.
-SOURCES=$(ls src/*.cpp | grep -v '/main\.cpp$')
+SOURCES=$(ls src/*.cpp src/jit/*.cpp | grep -v '/main\.cpp$')
 
 echo "== building web/aarch64emu.js"
 "$EMCC" -std=c++17 -O2 -Isrc \

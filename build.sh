@@ -18,12 +18,12 @@ case "$(basename "$CXX")" in
         # -utf-8 because the sources are UTF-8 and cl.exe otherwise reads them in the
         # system code page; NOMINMAX and _CRT_SECURE_NO_WARNINGS for the usual reasons.
         "$CXX" -nologo -std:c++17 -O2 -EHsc -utf-8 -W3 -DNOMINMAX \
-               -D_CRT_SECURE_NO_WARNINGS -Isrc src/*.cpp -Fe:aarch64emu.exe
+               -D_CRT_SECURE_NO_WARNINGS -Isrc src/*.cpp src/jit/*.cpp -Fe:aarch64emu.exe
         echo "built aarch64emu.exe"
         ;;
     *)
         CXXFLAGS=${CXXFLAGS:--std=c++17 -O2 -Wall -Wextra}
-        $CXX $CXXFLAGS -Isrc -o aarch64emu src/*.cpp
+        $CXX $CXXFLAGS -Isrc -o aarch64emu src/*.cpp src/jit/*.cpp
         echo "built aarch64emu"
         ;;
 esac
